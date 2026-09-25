@@ -14,6 +14,11 @@ interface WorldSummary {
   bot_pos?: { x: number; y: number; z: number };
 }
 
+interface ChunkPos {
+  x: number;
+  z: number;
+}
+
 type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed";
 type InstructionKind =
   | "Explore"
@@ -183,25 +188,75 @@ function renderViewer(status: ConnectionStatus, world: WorldSummary) {
     `
         : `<span class="pct mono">${world.chunks_explored} chunks vistos</span>`;
 
-    // Leitura crua de coordenadas — o marcador do bot posicionado de verdade
-    // no grid depende do sistema de câmera/mapeamento de mundo real, que
-    // ainda não existe (ver README "O que falta"). Isso só mostra que o
-    // dado chegou.
-    let posReadout = $<HTMLElement>("#position-readout");
-    if (!posReadout) {
-      posReadout = document.createElement("div");
-      posReadout.id = "position-readout";
-      posReadout.className = "status-pill position-readout";
-      $("#viewer-canvas").appendChild(posReadout);
-    }
-    posReadout.innerHTML = world.bot_pos
-      ? `<span class="dot"></span><span class="mono">${world.bot_pos.x}, ${world.bot_pos.y}, ${world.bot_pos.z}</span>`
-      : `<span class="dot"></span><span>aguardando posição...</span>`;
   } else {
     empty.classList.remove("hidden");
     endpoint.textContent = "socket: aguardando implementação do addon Java";
-    $<HTMLElement>("#position-readout")?.remove();
+    $("#chunk-grid").innerHTML = "";
   }
+}
+
+/* ---------- Grade de chunks: posições reais, sem framework ----------
+   Não é o renderer 3D real (wgpu/greedy meshing/atlas de textura) do spec —
+   isso continua não implementado. É a grade 2D de "chunk explorado ou não"
+   descrita em "Identidade visual", com o marcador do bot posicionado de
+   verdade pelas coordenadas que vêm do addon. */
+
+const CELL_PX = 32; // tamanho de um chunk (16x16 blocos) na tela
+const SCALE = CELL_PX / 16; // px por bloco
+
+/** Posição em tela relativa ao centro do container, a partir de coordenadas
+ * de mundo (bloco) e do centro da câmera (também em coordenadas de bloco). */
+function worldToScreen(wx: number, wz: number, cameraX: number, cameraZ: number) {
+  return { x: (wx - cameraX) * SCALE, y: (wz - cameraZ) * SCALE };
+}
+
+function renderChunkGrid(world: WorldSummary, chunks: ChunkPos[]) {
+  const container = $<HTMLElement>("#chunk-grid");
+
+  if (chunks.length === 0 && !world.bot_pos) {
+    container.innerHTML = "";
+    return;
+  }
+
+  const canvas = $("#viewer-canvas");
+  const centerX = canvas.clientWidth / 2;
+  const centerY = canvas.clientHeight / 2;
+
+  // Câmera centrada no bot; sem posição ainda, centra no meio dos chunks
+  // já vistos — sempre dado real, nunca um valor inventado.
+  let cameraX: number;
+  let cameraZ: number;
+  if (world.bot_pos) {
+    cameraX = world.bot_pos.x;
+    cameraZ = world.bot_pos.z;
+  } else {
+    cameraX = (chunks.reduce((sum, c) => sum + c.x, 0) / chunks.length) * 16 + 8;
+    cameraZ = (chunks.reduce((sum, c) => sum + c.z, 0) / chunks.length) * 16 + 8;
+  }
+
+  const halfW = canvas.clientWidth / 2 + CELL_PX;
+  const halfH = canvas.clientHeight / 2 + CELL_PX;
+
+  const cellsHtml = chunks
+    .map((c) => {
+      const p = worldToScreen(c.x * 16, c.z * 16, cameraX, cameraZ);
+      if (p.x < -halfW || p.x > halfW || p.y < -halfH || p.y > halfH) return ""; // fora da tela
+      return `<div class="chunk-cell" style="left:${centerX + p.x}px; top:${centerY + p.y}px; width:${CELL_PX}px; height:${CELL_PX}px;"></div>`;
+    })
+    .join("");
+
+  const markerHtml = world.bot_pos
+    ? (() => {
+        const p = worldToScreen(world.bot_pos!.x, world.bot_pos!.z, cameraX, cameraZ);
+        return `
+          <div class="bot-marker" style="left:${centerX + p.x - 6}px; top:${centerY + p.y - 6}px;">
+            <span class="label mono">${world.bot_pos!.x}, ${world.bot_pos!.y}, ${world.bot_pos!.z}</span>
+          </div>
+        `;
+      })()
+    : "";
+
+  container.innerHTML = cellsHtml + markerHtml;
 }
 
 /* ---------- HUD de vitais ---------- */
@@ -261,15 +316,17 @@ function renderHud(vitals: Vitals | null) {
 /* ---------- Bootstrap ---------- */
 
 async function refreshState() {
-  const [status, world, queue, totals, vitals] = await Promise.all([
+  const [status, world, chunks, queue, totals, vitals] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
+    invoke<ChunkPos[]>("world_chunks"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
   ]);
 
   renderViewer(status, world);
+  if (status.connected) renderChunkGrid(world, chunks);
   renderHud(vitals);
   renderQueueInto("queue-list", "queue-count", queue);
   renderQueueInto("queue-list-full", "queue-count-full", queue);

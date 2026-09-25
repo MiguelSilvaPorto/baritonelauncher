@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use storage_index::{ItemTotal, StorageIndex};
 use tauri::Manager;
 use vitals::Vitals;
-use world_cache::{BlockPos, WorldCache, WorldSummary};
+use world_cache::{BlockPos, ChunkPos, WorldCache, WorldSummary};
 
 /// Estado compartilhado do app. `world`/`storage`/`queue` ainda nascem vazios
 /// — só `vitals`, `connection` e `bot_pos` são alimentados de verdade agora,
@@ -26,10 +26,8 @@ pub(crate) struct AppState {
     queue: Mutex<InstructionQueue>,
     pub(crate) vitals: Mutex<Option<Vitals>>,
     pub(crate) connection: Mutex<ConnectionStatus>,
-    /// Última posição (pés do jogador) reportada pelo addon. Não é ainda
-    /// mapeada visualmente no viewer (isso depende do sistema de
-    /// câmera/grid real, ver "Known gaps") — hoje só alimenta o readout
-    /// mono de coordenadas.
+    /// Última posição (pés do jogador) reportada pelo addon. Mapeada no
+    /// grid do viewer em `src/main.ts` (`worldToScreen`).
     pub(crate) bot_pos: Mutex<Option<BlockPos>>,
 }
 
@@ -61,6 +59,14 @@ mod commands {
         }
     }
 
+    /// Coordenadas dos chunks já vistos (ver `addon_socket.rs`, `chunk_loaded`)
+    /// — só posição, nenhum bloco dentro ainda. O viewer usa isso pra
+    /// desenhar a grade só onde já foi explorado, per `docs/SPEC.md`.
+    #[tauri::command]
+    fn world_chunks(state: State<AppState>) -> Vec<ChunkPos> {
+        state.world.lock().unwrap().chunks.keys().copied().collect()
+    }
+
     #[tauri::command]
     fn queue_snapshot(state: State<AppState>) -> Vec<Instruction> {
         state.queue.lock().unwrap().items.clone()
@@ -80,6 +86,7 @@ mod commands {
         builder.invoke_handler(tauri::generate_handler![
             connection_status,
             world_summary,
+            world_chunks,
             queue_snapshot,
             storage_totals,
             vitals_snapshot,

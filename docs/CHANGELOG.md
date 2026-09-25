@@ -86,6 +86,14 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   contagem real ("N chunks vistos") quando não há uma estimativa de total — mostrar uma porcentagem
   contra um total desconhecido seria inventar dado, então a barra some até existir uma estimativa de
   verdade.
+- **Grade do viewer renderizada com dados reais**: novo comando `world_chunks` expõe as coordenadas
+  dos chunks vistos; `src/main.ts` ganhou `worldToScreen`/`renderChunkGrid`, que desenha um `div` por
+  chunk explorado (câmera centrada na posição real do bot) e move o marcador teal + label mono pra
+  posição exata do jogador — tudo em coordenadas de mundo de verdade, sem framework, mesmo padrão do
+  resto do app. O grid CSS decorativo (sempre visível) foi removido do fundo do viewer: agora a malha
+  só aparece onde já foi explorado, como o spec pede ("área nunca explorada fica escura, sem grid
+  visível"). Ainda não é o renderer 3D com blocos texturizados — isso continua dependendo do pipeline
+  de atlas descrito em `docs/SPEC.md`, "Blocos 3D".
 
 ### Known gaps
 

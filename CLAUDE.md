@@ -98,17 +98,22 @@ There is no test suite yet.
 **Frontend (`src/main.ts`)**
 - View router: `setMode(name)` toggles `.view.active` / `.rail-btn.active`; views are `viewer`,
   `editor`, `fila`, `armazem`.
-- `refreshState()` calls all five Tauri commands once on load and renders each panel; there is no
-  live push yet (no socket on the Rust side to push from), so this is a manual snapshot, not a stream.
-- `renderViewer`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest empty state when
-  the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
-  rows.
+- `refreshState()` polls all six Tauri commands every `REFRESH_INTERVAL_MS` (1s, matching the addon's
+  vitals cadence) — there is no push from the Rust side, so this is polling, not a stream. It used to
+  run once on load only; that was a real bug (UI froze on whatever was true at page load) fixed once
+  the addon bridge existed and made it observable — don't reintroduce a one-shot call.
+- `renderViewer`/`renderChunkGrid`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest
+  empty state when the underlying data is empty — follow that pattern for new panels instead of
+  inventing placeholder rows.
+- `renderChunkGrid` + `worldToScreen` — real DOM chunk grid (one `div.chunk-cell` per explored chunk,
+  camera centered on `world.bot_pos`) and the bot marker, positioned from actual game coordinates.
+  Not the 3D block renderer from the spec — see "Known gaps."
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, all behind `Mutex`) + the five commands currently exposed:
-  `connection_status`, `world_summary`, `queue_snapshot`, `storage_totals`, `vitals_snapshot`. Spawns
-  `addon_socket::listen` in `setup()`.
+  `Option<Vitals>`, `ConnectionStatus`, all behind `Mutex`) + the six commands currently exposed:
+  `connection_status`, `world_summary`, `world_chunks`, `queue_snapshot`, `storage_totals`,
+  `vitals_snapshot`. Spawns `addon_socket::listen` in `setup()`.
 - `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line. Handles `hello`
   (marks `AppState.connection` as connected), `vitals` (fills `AppState.vitals`), `position` (fills
   `AppState.bot_pos`), and `chunk_loaded` (marks presence in `AppState.world` via `apply_delta` with
@@ -150,8 +155,10 @@ There is no test suite yet.
   `StorageIndex`/`InstructionQueue` stay empty even with the addon connected.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **No real 3D renderer.** The viewer is a 2D grid faithful to the documented visual identity
-  (fog gradient, ghost outlines, glowing bot marker), not a wgpu surface yet.
+- **No 3D block rendering.** The viewer's chunk grid and bot marker use real game data (real chunk
+  positions, real coordinates), but no chunk has actual block content — that needs the texture atlas
+  pipeline from `docs/SPEC.md`, "Blocos 3D", not a wgpu surface change (the DOM-based grid can stay for
+  the chunk-level view; textured blocks are a separate, additive layer).
 - **No `minecraft-data`/jar ingestion.** Item/block/recipe/texture structs exist but nothing
   populates them.
 - **`StorageIndex` is in-memory only** — no persistence across restarts.

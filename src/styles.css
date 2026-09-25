@@ -150,12 +150,25 @@ button, input { font-family: inherit; }
 .viewer-canvas {
   flex: 1 1 auto;
   position: relative;
-  background:
-    radial-gradient(ellipse at center, rgba(20, 24, 29, 0.0) 0%, var(--bg-base) 72%),
-    repeating-linear-gradient(0deg, transparent 0, transparent 31px, var(--border-2) 31px, var(--border-2) 32px),
-    repeating-linear-gradient(90deg, transparent 0, transparent 31px, var(--border-2) 31px, var(--border-2) 32px);
+  /* Fog-of-war: só o gradiente radial de fundo. A grade em si (linhas de
+     divisa entre chunks) só é desenhada onde já foi explorado — ver
+     .chunk-cell — nunca em área nunca vista, per docs/SPEC.md. */
+  background: radial-gradient(ellipse at center, rgba(20, 24, 29, 0.0) 0%, var(--bg-base) 72%);
   background-color: var(--bg-base);
   overflow: hidden;
+}
+
+/* ---------- Grade de chunks (posições reais, ver worldToScreen em main.ts) ---------- */
+
+.chunk-grid {
+  position: absolute;
+  inset: 0;
+}
+
+.chunk-cell {
+  position: absolute;
+  border: 1px solid var(--border-2);
+  box-sizing: border-box;
 }
 
 .viewer-empty {
@@ -372,11 +385,3 @@ table.item-table td.num { text-align: right; }
 .status-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); }
 .status-pill.connected { color: var(--success); border-color: rgba(74, 222, 128, 0.3); }
 .status-pill.connected .dot { background: var(--success); }
-
-.position-readout {
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  background: var(--bg-panel);
-}
-.position-readout .dot { background: var(--teal); }
