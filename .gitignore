@@ -1,0 +1,38 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust & Tauri builds
+target/
+src-tauri/target/
+src-tauri/gen/schemas/
+.stfolder/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Cache local do minecraft-data/asset pipeline (baixado por versão, não versionado)
+src-tauri/.cache/
+
+# Build do addon Java (Gradle)
+mod-addon/.gradle/
+mod-addon/build/
+mod-addon/run/

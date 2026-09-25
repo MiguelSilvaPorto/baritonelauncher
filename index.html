@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Baritone Orchestrator</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="titlebar" data-tauri-drag-region>
+        <span class="titlebar-title">Baritone Orchestrator</span>
+        <div class="titlebar-controls">
+          <button id="win-min" title="Minimizar">&#x2013;</button>
+          <button id="win-max" title="Maximizar">&#x25A1;</button>
+          <button id="win-close" class="close" title="Fechar">&#x2715;</button>
+        </div>
+      </header>
+
+      <div class="shell">
+        <nav class="rail" id="rail">
+          <button class="rail-btn" data-mode="viewer" title="Viewer">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <rect x="3" y="3" width="8" height="8" rx="1" />
+              <rect x="13" y="3" width="8" height="8" rx="1" />
+              <rect x="3" y="13" width="8" height="8" rx="1" />
+              <rect x="13" y="13" width="8" height="8" rx="1" />
+            </svg>
+          </button>
+          <button class="rail-btn" data-mode="editor" title="Editor de schematic">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M4 20l4-1 11-11-3-3L5 16l-1 4z" />
+              <path d="M14 6l3 3" />
+            </svg>
+          </button>
+          <button class="rail-btn" data-mode="fila" title="Fila">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M4 6h16M4 12h16M4 18h10" />
+            </svg>
+          </button>
+          <button class="rail-btn" data-mode="armazem" title="Armazém">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M3 8l9-5 9 5-9 5-9-5z" />
+              <path d="M3 8v8l9 5 9-5V8" />
+              <path d="M12 13v8" />
+            </svg>
+          </button>
+        </nav>
+
+        <!-- ---------- Viewer ---------- -->
+        <section class="view" id="view-viewer">
+          <div class="viewer-canvas" id="viewer-canvas">
+            <div class="viewer-empty" id="viewer-empty">
+              <span class="headline">Nenhum bot conectado</span>
+              <span class="detail">
+                O addon Java (que fala com o Baritone via <code class="mono">IBaritone</code>) ainda
+                não está rodando ou não conectou no socket local. Assim que conectar, o mundo já
+                explorado aparece aqui.
+              </span>
+              <span class="endpoint mono" id="viewer-endpoint">socket: aguardando implementação</span>
+            </div>
+          </div>
+          <aside class="side-panel" id="queue-panel">
+            <div class="side-header">
+              <h2>Fila</h2>
+              <span class="count mono" id="queue-count">0</span>
+            </div>
+            <div class="queue-list" id="queue-list"></div>
+            <div class="side-footer" id="storage-footer"></div>
+          </aside>
+        </section>
+
+        <!-- ---------- Editor ---------- -->
+        <section class="view" id="view-editor">
+          <div class="placeholder-view">
+            <h1>Editor de schematic</h1>
+            <p>
+              Ainda não implementado. No spec, o editor pinta blocos texturizados sobre o mesmo
+              <code>WorldCache</code> renderizado no viewer (estilo WorldEdit) — a diferença entre o
+              que existe e o que foi desenhado vira a instrução de build. Isso depende do pipeline de
+              atlas de texturas (jar do Minecraft → <code>BlockDef</code>) descrito em
+              <code>docs/SPEC.md</code>, seção "Blocos 3D".
+            </p>
+          </div>
+        </section>
+
+        <!-- ---------- Fila (tela cheia) ---------- -->
+        <section class="view" id="view-fila">
+          <aside class="side-panel" style="width: 100%; border-left: none;">
+            <div class="side-header">
+              <h2>Fila de instruções</h2>
+              <span class="count mono" id="queue-count-full">0</span>
+            </div>
+            <div class="queue-list" id="queue-list-full"></div>
+          </aside>
+        </section>
+
+        <!-- ---------- Armazém ---------- -->
+        <section class="view" id="view-armazem">
+          <div class="storage-view">
+            <div class="storage-header">
+              <h1>Armazém — totais agregados por item</h1>
+            </div>
+            <div class="storage-body" id="storage-body"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
