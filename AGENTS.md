@@ -34,7 +34,9 @@ There is no component framework and no bundled state library: `main.ts` renders 
 
 ## 3. Stack
 
-- **Frontend:** TypeScript (strict) · Vite 8 · vanilla DOM, no framework.
+- **Frontend:** TypeScript (strict) · Vite 8 · vanilla DOM, no UI framework · Three.js for the 3D
+  viewer only (`src/viewer3d.ts`) — a graphics library, not an app framework; everything else stays
+  plain DOM/innerHTML.
 - **Backend:** Rust (edition 2021) · Tauri 2 · `serde`/`serde_json` · `tauri-plugin-opener` ·
   `tauri-plugin-dialog` · `tokio` (powers `addon_socket.rs`, the local TCP server the Java addon
   connects to).
@@ -102,12 +104,18 @@ There is no test suite yet.
   vitals cadence) — there is no push from the Rust side, so this is polling, not a stream. It used to
   run once on load only; that was a real bug (UI froze on whatever was true at page load) fixed once
   the addon bridge existed and made it observable — don't reintroduce a one-shot call.
-- `renderViewer`/`renderChunkGrid`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest
-  empty state when the underlying data is empty — follow that pattern for new panels instead of
-  inventing placeholder rows.
-- `renderChunkGrid` + `worldToScreen` — real DOM chunk grid (one `div.chunk-cell` per explored chunk,
-  camera centered on `world.bot_pos`) and the bot marker, positioned from actual game coordinates.
-  Not the 3D block renderer from the spec — see "Known gaps."
+- `renderViewer`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest empty state when
+  the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
+  rows.
+- **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
+  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
+  `main.ts` only calls `setChunks()`/`setBotPos()`/`clear()`/`resize()` on it from `refreshState()` and
+  `setMode()`. Chunks are added once and never removed (cumulative "explored" semantics, matching
+  `WorldCache`) as flat plates at their real world position — there is no block data to render yet
+  (see "Known gaps"). This intentionally uses WebGL inside the existing webview instead of a native
+  wgpu surface (which the spec's architecture diagram shows) — an explicit user decision, because
+  embedding wgpu in a separate window synced to the Tauri window is much higher-risk to get right
+  blind. Don't silently redo that tradeoff; if wgpu comes up again, confirm first.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
@@ -155,10 +163,9 @@ There is no test suite yet.
   `StorageIndex`/`InstructionQueue` stay empty even with the addon connected.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **No 3D block rendering.** The viewer's chunk grid and bot marker use real game data (real chunk
-  positions, real coordinates), but no chunk has actual block content — that needs the texture atlas
-  pipeline from `docs/SPEC.md`, "Blocos 3D", not a wgpu surface change (the DOM-based grid can stay for
-  the chunk-level view; textured blocks are a separate, additive layer).
+- **No 3D block rendering.** The Three.js scene (`src/viewer3d.ts`) uses real chunk positions and real
+  bot coordinates, but each chunk is a flat plate — no actual block content, because none is sent yet
+  (`chunk_loaded` is presence-only). Needs the texture atlas pipeline from `docs/SPEC.md`, "Blocos 3D."
 - **No `minecraft-data`/jar ingestion.** Item/block/recipe/texture structs exist but nothing
   populates them.
 - **`StorageIndex` is in-memory only** — no persistence across restarts.

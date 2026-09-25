@@ -86,22 +86,27 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   contagem real ("N chunks vistos") quando não há uma estimativa de total — mostrar uma porcentagem
   contra um total desconhecido seria inventar dado, então a barra some até existir uma estimativa de
   verdade.
-- **Grade do viewer renderizada com dados reais**: novo comando `world_chunks` expõe as coordenadas
-  dos chunks vistos; `src/main.ts` ganhou `worldToScreen`/`renderChunkGrid`, que desenha um `div` por
-  chunk explorado (câmera centrada na posição real do bot) e move o marcador teal + label mono pra
-  posição exata do jogador — tudo em coordenadas de mundo de verdade, sem framework, mesmo padrão do
-  resto do app. O grid CSS decorativo (sempre visível) foi removido do fundo do viewer: agora a malha
-  só aparece onde já foi explorado, como o spec pede ("área nunca explorada fica escura, sem grid
-  visível"). Ainda não é o renderer 3D com blocos texturizados — isso continua dependendo do pipeline
-  de atlas descrito em `docs/SPEC.md`, "Blocos 3D".
+- **Renderer 3D real (Three.js/WebGL)**: novo comando `world_chunks` expõe as coordenadas dos chunks
+  vistos. Primeira tentativa foi uma grade 2D em DOM (`renderChunkGrid`/`worldToScreen`) — corrigido a
+  pedido do usuário, que pediu especificamente o renderizador 3D que o spec descreve. `src/viewer3d.ts`
+  monta uma cena Three.js de verdade (câmera perspectiva orbitável via `OrbitControls`, luz
+  ambiente+direcional, fog) dentro do mesmo webview do app — decisão explícita do usuário em vez de
+  wgpu nativo embutido numa segunda janela Tauri (mais fiel ao texto do spec, mas muito mais arriscado
+  de acertar sem conseguir validar visualmente). Cada chunk explorado vira uma placa 16×16 na posição
+  real (adicionada uma vez, nunca removida — mesma semântica cumulativa de antes); o marcador do bot é
+  uma esfera teal emissiva + luz pontual na posição XYZ real, com label mono projetado em tela.
+  Ainda não é blocos texturizados de verdade — isso continua dependendo do pipeline de atlas descrito
+  em `docs/SPEC.md`, "Blocos 3D"; o que existe agora é a malha de chunks e o bot em 3D navegável.
 
 ### Known gaps
 
-- Streaming de chunk pro `WorldCache`, índice de baús, e recebimento de instruções da fila pelo addon
-  — o socket hoje só manda vitais, não posição/mundo/inventário (ver `mod-addon/README.md`).
+- Baús e recebimento de instruções da fila pelo addon — o socket manda vitais/posição/chunk, não
+  inventário nem comandos do lado Rust pro addon ainda (ver `mod-addon/README.md`).
 - `SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen` (crafting/fundição) no addon —
   ainda só descrito em `docs/SPEC.md`.
-- Viewer é uma grade 2D fiel à identidade visual, não um renderer wgpu real ainda.
+- Renderer 3D existe (Three.js/WebGL, câmera orbitável, chunks e bot reais), mas sem blocos
+  texturizados — cada chunk é uma placa lisa, não terreno de verdade. Depende do pipeline de atlas de
+  `docs/SPEC.md`, "Blocos 3D", que não existe ainda.
 - Sem ingestão de `minecraft-data`/jar oficial (itens, blocos, receitas, texturas).
 - `StorageIndex` só em memória, sem persistência.
 - Editor de schematic é um painel de placeholder, sem implementação.

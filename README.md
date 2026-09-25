@@ -15,10 +15,11 @@ quê, quando e em que ordem. Ver [`docs/SPEC.md`](docs/SPEC.md) para a especific
 arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mudanças.
 
 > **Status: ponta a ponta funcionando, escopo mínimo.** A shell do app, os modelos de dados Rust, a
-> identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app) e o
-> viewer mostrando vida/fome, posição e a grade de chunks explorados — tudo com dados de jogo reais —
-> estão implementados e testados manualmente. O renderer 3D com blocos texturizados, baús e a fila
-> puxando `#build`/`#mine` de verdade ainda não existem — ver "O que falta" abaixo.
+> identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app) e um
+> **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, chunks explorados e o bot posicionados
+> por coordenadas reais do jogo) estão implementados e testados manualmente. Blocos texturizados
+> dentro dos chunks, baús e a fila puxando `#build`/`#mine` de verdade ainda não existem — ver "O que
+> falta" abaixo.
 
 ## Arquitetura
 
@@ -76,10 +77,13 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `StorageIndex`/fila continuam vazios mesmo com o addon conectado.
 - **`SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen`** no addon — só descrito em
   `docs/SPEC.md`, sem código ainda.
-- **Renderer 3D com blocos texturizados** (wgpu, greedy meshing, atlas de texturas do jar do
-  Minecraft) — o viewer hoje desenha a grade de chunks explorados e o marcador do bot com coordenadas
-  reais (DOM, sem framework), fiel à identidade visual documentada, mas sem nenhum bloco renderizado
-  dentro de cada chunk. Isso depende do pipeline de atlas descrito em `docs/SPEC.md`, "Blocos 3D".
+- **Blocos texturizados dentro dos chunks** (greedy meshing, atlas de texturas do jar do Minecraft) —
+  o viewer 3D (`src/viewer3d.ts`, Three.js/WebGL) já renderiza os chunks explorados e o bot em
+  coordenadas reais numa cena orbitável de verdade, mas cada chunk é uma placa lisa, sem nenhum bloco
+  dentro. Isso depende do pipeline de atlas descrito em `docs/SPEC.md`, "Blocos 3D". (O spec descreve
+  esse renderer como wgpu nativo; aqui é WebGL dentro do próprio webview do app — decisão explícita
+  pra evitar o risco de embutir uma superfície wgpu numa janela separada sem conseguir validar
+  visualmente.)
 - **Ingestão do `minecraft-data`** (itens/blocos/receitas) e do jar oficial (texturas/modelos/atlas) —
   os structs Rust (`Item`, `Block`, `Recipe`, `IngredientRef`) já existem em
   `src-tauri/src/items.rs`, incluindo a função `fits_inventory_2x2`, mas nada os popula ainda.
@@ -88,7 +92,8 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 
 ## Estrutura do repositório
 
-- `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `styles.css`.
+- `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `viewer3d.ts` (o renderer 3D,
+  Three.js/WebGL) + `styles.css`.
 - `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
