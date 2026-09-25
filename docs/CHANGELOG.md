@@ -72,6 +72,12 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 - **`mod-addon/scripts/fetch-baritone.sh`**: baixa `baritone-api-neoforge-1.20.0.jar` da release
   oficial e confere o SHA-1 contra `checksums.txt` antes de liberar o build — o jar não é commitado no
   git (binário de terceiros, `libs/*.jar` no `.gitignore` do addon).
+- **Streaming de posição do bot**: addon manda `{"type":"position",...}` 4x/segundo (via
+  `getPlayerContext().playerFeet()`, `BetterBlockPos`), separado do intervalo de `vitals` (1x/s).
+  `AppState.bot_pos` no lado Rust, exposto por `world_summary`. Viewer mostra um indicador mono no
+  canto superior esquerdo com as coordenadas reais — ainda não é o marcador posicionado no grid (isso
+  depende do sistema de câmera/mapeamento de mundo, que não existe ainda), só confirma que o dado
+  chegou. Testado em jogo: coordenadas reais aparecendo ao vivo na janela do app.
 
 ### Known gaps
 

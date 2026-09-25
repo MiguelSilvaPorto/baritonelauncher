@@ -12,13 +12,13 @@ use std::sync::Mutex;
 use storage_index::{ItemTotal, StorageIndex};
 use tauri::Manager;
 use vitals::Vitals;
-use world_cache::{WorldCache, WorldSummary};
+use world_cache::{BlockPos, WorldCache, WorldSummary};
 
 /// Estado compartilhado do app. `world`/`storage`/`queue` ainda nascem vazios
-/// — só `vitals` e `connection` são alimentados de verdade agora, pelo
-/// addon Java via `addon_socket` (ver `docs/SPEC.md`, seção "Arquitetura").
-/// Nenhum comando aqui inventa dados — o que não está conectado ainda mostra
-/// estado vazio honesto na UI.
+/// — só `vitals`, `connection` e `bot_pos` são alimentados de verdade agora,
+/// pelo addon Java via `addon_socket` (ver `docs/SPEC.md`, seção
+/// "Arquitetura"). Nenhum comando aqui inventa dados — o que não está
+/// conectado ainda mostra estado vazio honesto na UI.
 #[derive(Default)]
 pub(crate) struct AppState {
     world: Mutex<WorldCache>,
@@ -26,6 +26,11 @@ pub(crate) struct AppState {
     queue: Mutex<InstructionQueue>,
     pub(crate) vitals: Mutex<Option<Vitals>>,
     pub(crate) connection: Mutex<ConnectionStatus>,
+    /// Última posição (pés do jogador) reportada pelo addon. Não é ainda
+    /// mapeada visualmente no viewer (isso depende do sistema de
+    /// câmera/grid real, ver "Known gaps") — hoje só alimenta o readout
+    /// mono de coordenadas.
+    pub(crate) bot_pos: Mutex<Option<BlockPos>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -52,7 +57,7 @@ mod commands {
         WorldSummary {
             chunks_explored: world.chunk_count() as u32,
             chunks_total_estimate: 0,
-            bot_pos: None,
+            bot_pos: *state.bot_pos.lock().unwrap(),
         }
     }
 

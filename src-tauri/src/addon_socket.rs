@@ -6,14 +6,16 @@
 //! - Framing: uma mensagem JSON por linha (`\n`-delimited), sem comprimento
 //!   prefixado — simples de implementar dos dois lados sem biblioteca extra
 //!   no addon Java (usa só `java.net.Socket`, sem WebSocket).
-//! - Mensagens hoje: `hello` (handshake) e `vitals` (vida/fome/armadura,
-//!   ~1x/segundo). Chunks, baús e fila ainda não trafegam por aqui — são o
-//!   próximo passo, não implementado ainda.
+//! - Mensagens hoje: `hello` (handshake), `vitals` (vida/fome/armadura,
+//!   ~1x/segundo) e `position` (pés do jogador, ~4x/segundo). Chunks e baús
+//!   ainda não trafegam por aqui — são o próximo passo, não implementado
+//!   ainda.
 //!
 //! O addon Java correspondente está em
 //! `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
 
 use crate::vitals::Vitals;
+use crate::world_cache::BlockPos;
 use crate::AppState;
 use serde::Deserialize;
 use tauri::{AppHandle, Manager};
@@ -39,6 +41,11 @@ enum AddonMessage {
         hunger: u8,
         saturation: f32,
         armor_points: u8,
+    },
+    Position {
+        x: i32,
+        y: i32,
+        z: i32,
     },
 }
 
@@ -107,6 +114,9 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                     active_effects: Vec::new(),
                 });
             }
+            AddonMessage::Position { x, y, z } => {
+                *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
+            }
         }
     }
 
@@ -116,4 +126,5 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
     connection.endpoint = None;
     drop(connection);
     *state.vitals.lock().unwrap() = None;
+    *state.bot_pos.lock().unwrap() = None;
 }

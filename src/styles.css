@@ -372,3 +372,11 @@ table.item-table td.num { text-align: right; }
 .status-pill .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); }
 .status-pill.connected { color: var(--success); border-color: rgba(74, 222, 128, 0.3); }
 .status-pill.connected .dot { background: var(--success); }
+
+.position-readout {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  background: var(--bg-panel);
+}
+.position-readout .dot { background: var(--teal); }

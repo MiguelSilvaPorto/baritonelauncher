@@ -176,9 +176,25 @@ function renderViewer(status: ConnectionStatus, world: WorldSummary) {
       <div class="bar"><span style="width:${pct}%"></span></div>
       <span class="pct mono">${pct}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
     `;
+
+    // Leitura crua de coordenadas — o marcador do bot posicionado de verdade
+    // no grid depende do sistema de câmera/mapeamento de mundo real, que
+    // ainda não existe (ver README "O que falta"). Isso só mostra que o
+    // dado chegou.
+    let posReadout = $<HTMLElement>("#position-readout");
+    if (!posReadout) {
+      posReadout = document.createElement("div");
+      posReadout.id = "position-readout";
+      posReadout.className = "status-pill position-readout";
+      $("#viewer-canvas").appendChild(posReadout);
+    }
+    posReadout.innerHTML = world.bot_pos
+      ? `<span class="dot"></span><span class="mono">${world.bot_pos.x}, ${world.bot_pos.y}, ${world.bot_pos.z}</span>`
+      : `<span class="dot"></span><span>aguardando posição...</span>`;
   } else {
     empty.classList.remove("hidden");
     endpoint.textContent = "socket: aguardando implementação do addon Java";
+    $<HTMLElement>("#position-readout")?.remove();
   }
 }
 
