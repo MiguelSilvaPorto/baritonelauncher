@@ -23,8 +23,10 @@ export default defineConfig(() => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri` and `mod-addon` (a
+      // separate Gradle/Java project whose build/ output otherwise triggers
+      // spurious full-page reloads)
+      ignored: ["**/src-tauri/**", "**/mod-addon/**"],
     },
   },
 }));

@@ -254,8 +254,13 @@ async function refreshState() {
   renderStorage(totals);
 }
 
+// 1s = mesmo intervalo de envio de vitais do addon (ver addon_socket.rs) — não
+// há push do backend pro frontend ainda, então isso é polling, não streaming.
+const REFRESH_INTERVAL_MS = 1000;
+
 window.addEventListener("DOMContentLoaded", () => {
   bootstrapRail();
   bootstrapTitlebar();
   refreshState();
+  setInterval(refreshState, REFRESH_INTERVAL_MS);
 });

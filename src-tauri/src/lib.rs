@@ -1,3 +1,4 @@
+mod addon_socket;
 mod instructions;
 mod items;
 mod storage_index;
@@ -9,42 +10,40 @@ use instructions::{Instruction, InstructionQueue};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use storage_index::{ItemTotal, StorageIndex};
+use tauri::Manager;
 use vitals::Vitals;
 use world_cache::{WorldCache, WorldSummary};
 
-/// Estado compartilhado do app. Hoje tudo nasce vazio: o socket local que
-/// recebe chunks/vitals/inventário do addon Java (ver `docs/SPEC.md`,
-/// seção "Arquitetura") ainda não existe, então não há nenhum dado real para
-/// mostrar até o addon existir e conectar. Nenhum comando aqui inventa dados
-/// — a UI mostra estado vazio honesto enquanto isso.
+/// Estado compartilhado do app. `world`/`storage`/`queue` ainda nascem vazios
+/// — só `vitals` e `connection` são alimentados de verdade agora, pelo
+/// addon Java via `addon_socket` (ver `docs/SPEC.md`, seção "Arquitetura").
+/// Nenhum comando aqui inventa dados — o que não está conectado ainda mostra
+/// estado vazio honesto na UI.
 #[derive(Default)]
-struct AppState {
+pub(crate) struct AppState {
     world: Mutex<WorldCache>,
     storage: Mutex<StorageIndex>,
     queue: Mutex<InstructionQueue>,
-    vitals: Mutex<Option<Vitals>>,
+    pub(crate) vitals: Mutex<Option<Vitals>>,
+    pub(crate) connection: Mutex<ConnectionStatus>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConnectionStatus {
-    connected: bool,
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct ConnectionStatus {
+    pub(crate) connected: bool,
     /// Preenchido quando `connected` é `true` — endereço do addon Java.
-    endpoint: Option<String>,
+    pub(crate) endpoint: Option<String>,
 }
 
 mod commands {
     use super::*;
     use tauri::State;
 
-    /// Estado da conexão com o addon Java. Sempre `connected: false` por
-    /// enquanto — o socket TCP/WebSocket local descrito no spec ainda não
-    /// foi implementado.
+    /// Estado da conexão com o addon Java, atualizado em tempo real por
+    /// `addon_socket` quando o addon conecta/desconecta.
     #[tauri::command]
-    fn connection_status() -> ConnectionStatus {
-        ConnectionStatus {
-            connected: false,
-            endpoint: None,
-        }
+    fn connection_status(state: State<AppState>) -> ConnectionStatus {
+        state.connection.lock().unwrap().clone()
     }
 
     #[tauri::command]
@@ -92,7 +91,6 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
-                use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     let icon_bytes = include_bytes!("../icons/icon.png");
                     if let Ok(icon) = tauri::image::Image::from_bytes(icon_bytes) {
@@ -100,6 +98,9 @@ pub fn run() {
                     }
                 }
             }
+
+            tauri::async_runtime::spawn(addon_socket::listen(app.handle().clone()));
+
             Ok(())
         });
 

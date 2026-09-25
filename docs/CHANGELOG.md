@@ -10,6 +10,18 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ## [Não lançado]
 
+### Fixed
+
+- **HUD de vitais não atualizava sozinho**: `refreshState()` em `src/main.ts` só rodava uma vez, no
+  carregamento da janela — se o addon conectasse depois disso, a UI ficava presa no estado antigo
+  ("nenhum bot conectado") mesmo com a ponte já funcionando de verdade. Agora roda em loop
+  (`setInterval`, 1s — mesmo intervalo de envio de vitais do addon). Confirmado em jogo: HUD passou a
+  mostrar vida/fome reais assim que a página recarregou.
+- **Vite disparava reload à toa**: o watcher do `vite dev` não ignorava `mod-addon/`, então artefatos
+  de build do Gradle (`mod-addon/build/reports/**`) contavam como mudança de frontend e recarregavam a
+  janela sem necessidade. `mod-addon/**` adicionado à lista de ignorados em `vite.config.ts`, junto de
+  `src-tauri/`.
+
 ### Added
 
 - **Scaffold inicial do projeto**: shell Tauri 2 + Vite + TypeScript (sem framework), estrutura de
@@ -39,11 +51,34 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 - **`docs/SPEC.md`**: especificação completa do produto/arquitetura (movida para `docs/`).
 - **`mod-addon/README.md`**: descrição do addon Java planejado (Forge/Fabric consumindo
   `IBaritone`), deliberadamente sem scaffold Gradle fake — ver o próprio arquivo para o porquê.
+  Atualizado com dados oficiais verificados direto do repositório `cabaletta/baritone`: qual variante
+  de jar usar (`baritone-api-*`, não `baritone-standalone-*`, per `SETUP.md`), snippet de
+  `build.gradle` pra dependência local (JitPack confirmado quebrado pra tag `v1.20.0`), e link dos
+  Javadocs oficiais.
+
+- **Socket local Rust ↔ addon Java** (`src-tauri/src/addon_socket.rs`): servidor TCP em
+  `127.0.0.1:31173`, protocolo v0 documentado no próprio módulo — JSON por linha, mensagens `hello`
+  (handshake) e `vitals` (vida/fome/saturação/armadura, ~1x/s). `connection_status` e `vitals_snapshot`
+  agora refletem dados reais do jogo quando o addon está conectado, em vez de sempre vazios.
+- **Addon Java real** em `mod-addon/`: projeto NeoForge a partir do MDK oficial
+  ([`NeoForgeMDKs/MDK-26.3-ModDevGradle`](https://github.com/NeoForgeMDKs/MDK-26.3-ModDevGradle)),
+  compilando contra `baritone-api-neoforge-1.20.0.jar` de verdade. A cada tick do cliente, lê vida/
+  fome/armadura via `BaritoneAPI.getProvider().getPrimaryBaritone().getPlayerContext().player()` e
+  manda pro socket acima, com reconexão automática se o app Rust não estiver de pé ainda.
+  `neoforge.mods.toml` declara Baritone (`modId="baritoe"`, confirmado no jar oficial — não é
+  `"baritone"`) como dependência obrigatória, então falta o Baritone vira erro claro do NeoForge, não
+  crash confuso. Testado manualmente: addon carrega sem erro junto do Baritone real em NeoForge
+  `26.3.0.22-beta`.
+- **`mod-addon/scripts/fetch-baritone.sh`**: baixa `baritone-api-neoforge-1.20.0.jar` da release
+  oficial e confere o SHA-1 contra `checksums.txt` antes de liberar o build — o jar não é commitado no
+  git (binário de terceiros, `libs/*.jar` no `.gitignore` do addon).
 
 ### Known gaps
 
-- Sem socket local Rust ↔ addon Java (`connection_status` sempre `false`).
-- Sem addon Java implementado.
+- Streaming de chunk pro `WorldCache`, índice de baús, e recebimento de instruções da fila pelo addon
+  — o socket hoje só manda vitais, não posição/mundo/inventário (ver `mod-addon/README.md`).
+- `SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen` (crafting/fundição) no addon —
+  ainda só descrito em `docs/SPEC.md`.
 - Viewer é uma grade 2D fiel à identidade visual, não um renderer wgpu real ainda.
 - Sem ingestão de `minecraft-data`/jar oficial (itens, blocos, receitas, texturas).
 - `StorageIndex` só em memória, sem persistência.
