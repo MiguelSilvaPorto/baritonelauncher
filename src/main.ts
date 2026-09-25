@@ -264,7 +264,9 @@ async function refreshState() {
 
   renderViewer(status, world);
   if (status.connected && viewer3d) {
-    viewer3d.setChunks(chunks);
+    // Chunk novo usa a altura atual do bot como aproximação de "chão local"
+    // — não temos altura de terreno de verdade ainda, ver viewer3d.ts.
+    viewer3d.setChunks(chunks, world.bot_pos?.y ?? 0);
     viewer3d.setBotPos(world.bot_pos ?? null);
   }
   renderHud(vitals);

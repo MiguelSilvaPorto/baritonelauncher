@@ -44,7 +44,7 @@ export class Viewer3D {
   private chunkMeshes = new Map<string, THREE.Object3D>();
   private botMarker: THREE.Group;
   private botLight: THREE.PointLight;
-  private hasFramedInitialView = false;
+  private lastBotWorldPos: THREE.Vector3 | null = null;
 
   private labelEl: HTMLDivElement;
 
@@ -89,7 +89,9 @@ export class Viewer3D {
     const group = new THREE.Group();
     const sphere = new THREE.Mesh(
       new THREE.SphereGeometry(0.6, 20, 20),
-      new THREE.MeshStandardMaterial({ color: COLOR_TEAL, emissive: COLOR_TEAL, emissiveIntensity: 0.9 })
+      // fog: false — o marcador é "você está aqui", nunca pode desaparecer
+      // no fog de distância como o resto da cena.
+      new THREE.MeshStandardMaterial({ color: COLOR_TEAL, emissive: COLOR_TEAL, emissiveIntensity: 0.9, fog: false })
     );
     group.add(sphere);
     return group;
@@ -100,8 +102,17 @@ export class Viewer3D {
   }
 
   /** Chunks só são adicionados, nunca removidos — ver doc-comment do módulo
-   * e de `addon_socket.rs`: é o "já explorado" cumulativo. */
-  setChunks(chunks: ChunkPos[]) {
+   * e de `addon_socket.rs`: é o "já explorado" cumulativo.
+   *
+   * `chunk_loaded` não manda altura de terreno (só existência do chunk), e o
+   * mundo moderno vai de Y=-64 a Y=320+ — não tem "chão" universal em Y=0.
+   * Usar Y=0 fixo deixava as placas praticamente fora de quadro sempre que o
+   * bot está em qualquer altitude normal de jogo. Em vez de inventar altura
+   * de terreno (que não temos), uso a altura real do bot no momento em que
+   * cada chunk é visto pela primeira vez — aproximação honesta (assume que o
+   * bot está perto do chão local quando o chunk carrega), não terreno de
+   * verdade. Isso também é fixado pra sempre no chunk, igual à posição X/Z. */
+  setChunks(chunks: ChunkPos[], referenceY: number) {
     for (const pos of chunks) {
       const key = this.chunkKey(pos);
       if (this.chunkMeshes.has(key)) continue;
@@ -119,12 +130,17 @@ export class Viewer3D {
       );
       group.add(edges);
 
-      group.position.set(pos.x * CHUNK_SIZE + CHUNK_SIZE / 2, 0, pos.z * CHUNK_SIZE + CHUNK_SIZE / 2);
+      group.position.set(pos.x * CHUNK_SIZE + CHUNK_SIZE / 2, referenceY, pos.z * CHUNK_SIZE + CHUNK_SIZE / 2);
       this.scene.add(group);
       this.chunkMeshes.set(key, group);
     }
   }
 
+  /** Câmera "persegue" o bot: a cada posição nova, move a câmera pelo mesmo
+   * delta que o bot andou, preservando o ângulo/distância que o usuário
+   * escolheu orbitando com o mouse. Sem isso, a câmera fica plantada onde
+   * enquadrou da primeira vez e o bot sai de quadro assim que anda — foi
+   * exatamente o bug relatado. */
   setBotPos(pos: BotPos | null) {
     if (!pos) {
       this.botMarker.visible = false;
@@ -132,14 +148,21 @@ export class Viewer3D {
       return;
     }
     this.botMarker.visible = true;
-    this.botMarker.position.set(pos.x, pos.y + 1, pos.z);
-    this.labelEl.textContent = `${pos.x}, ${pos.y}, ${pos.z}`;
+    const newPos = new THREE.Vector3(pos.x, pos.y + 1, pos.z);
 
-    if (!this.hasFramedInitialView) {
-      this.hasFramedInitialView = true;
+    if (this.lastBotWorldPos) {
+      const delta = newPos.clone().sub(this.lastBotWorldPos);
+      this.camera.position.add(delta);
+      this.controls.target.add(delta);
+    } else {
+      // Primeira posição conhecida: enquadra direto, não tem de onde vir o delta.
       this.controls.target.set(pos.x, pos.y, pos.z);
       this.camera.position.set(pos.x + 40, pos.y + 45, pos.z + 40);
     }
+
+    this.botMarker.position.copy(newPos);
+    this.lastBotWorldPos = newPos;
+    this.labelEl.textContent = `${pos.x}, ${pos.y}, ${pos.z}`;
   }
 
   /** Sem chunks nem bot ainda — estado honesto, não mostra uma cena vazia
@@ -149,7 +172,7 @@ export class Viewer3D {
     this.chunkMeshes.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
-    this.hasFramedInitialView = false;
+    this.lastBotWorldPos = null;
   }
 
   resize() {

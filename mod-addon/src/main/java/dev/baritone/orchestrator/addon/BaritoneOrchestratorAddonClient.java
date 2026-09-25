@@ -3,10 +3,12 @@ package dev.baritone.orchestrator.addon;
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.utils.BetterBlockPos;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
@@ -66,6 +68,16 @@ public class BaritoneOrchestratorAddonClient {
 
         if (!helloSent) {
             helloSent = send(HELLO_MESSAGE);
+            if (helloSent) {
+                // ChunkEvent.Load only fires once per chunk, when it's
+                // loaded — any chunk already loaded before this connection
+                // (e.g. the spawn area, loaded during world join before the
+                // socket had a chance to connect) never fires again, so its
+                // message would be lost forever without this. Runs on every
+                // (re)connect, not just the first one — also re-syncs if the
+                // Rust app was restarted while the game kept running.
+                syncAlreadyLoadedChunks(baritone.getPlayerContext().playerFeet());
+            }
         }
 
         ticksSinceLastPosition++;
@@ -112,6 +124,35 @@ public class BaritoneOrchestratorAddonClient {
         }
         ChunkPos pos = event.getChunk().getPos();
         send(String.format(Locale.ROOT, "{\"type\":\"chunk_loaded\",\"x\":%d,\"z\":%d}", pos.x(), pos.z()));
+    }
+
+    /**
+     * Backfills {@code chunk_loaded} for chunks that were already resident
+     * on the client before this connection existed — see the call site.
+     * Scans a square of {@code getEffectiveRenderDistance()} chunks around
+     * the player and checks each with {@code getChunk(x, z, false)}
+     * (non-forcing: returns null instead of loading it), so this never
+     * pulls in chunks the client doesn't already have.
+     */
+    private static void syncAlreadyLoadedChunks(BetterBlockPos center) {
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
+            return;
+        }
+        int centerX = center.x >> 4;
+        int centerZ = center.z >> 4;
+        int radius = Minecraft.getInstance().options.getEffectiveRenderDistance();
+
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
+                int cx = centerX + dx;
+                int cz = centerZ + dz;
+                LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, false);
+                if (chunk != null) {
+                    send(String.format(Locale.ROOT, "{\"type\":\"chunk_loaded\",\"x\":%d,\"z\":%d}", cx, cz));
+                }
+            }
+        }
     }
 
     private static void ensureConnected() {

@@ -21,6 +21,28 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   de build do Gradle (`mod-addon/build/reports/**`) contavam como mudança de frontend e recarregavam a
   janela sem necessidade. `mod-addon/**` adicionado à lista de ignorados em `vite.config.ts`, junto de
   `src-tauri/`.
+- **Placas de chunk invisíveis pra maioria das altitudes**: `viewer3d.ts` desenhava todo chunk em
+  `y=0` fixo, mas o bot podia estar em qualquer altura (mundo moderno vai de -64 a 320+) — com o bot
+  em `y=72`, por exemplo, as placas ficavam ~72 unidades abaixo do que a câmera enquadrava, fora de
+  quadro. `setChunks` agora recebe a altura atual do bot e usa isso como aproximação de "chão local"
+  pra chunk novo (não é altura de terreno real — ainda não temos esse dado —, mas é honesto: usa o
+  único dado de altura que existe, em vez de um chute fixo).
+- **Câmera do viewer 3D não seguia o bot**: `setBotPos` só enquadrava a câmera uma vez, na primeira
+  posição recebida — depois disso a câmera ficava parada enquanto o bot andava, então bastava se
+  afastar um pouco pra sumir de quadro. Agora, a cada posição nova, a câmera e o alvo do
+  `OrbitControls` se movem pelo mesmo delta que o bot andou (preserva o ângulo/distância escolhido
+  pelo usuário — não reenquadra do zero a cada frame). Reportado pelo usuário ("meu player saiu e não
+  consigo mais ver").
+- **Marcador do bot sumia no fog de distância**: o material da esfera teal não desabilitava `fog`, então
+  em cenas grandes ele escurecia junto com o resto — mas é o indicador "você está aqui", nunca devia
+  desaparecer. `fog: false` no material.
+- **Chunks ao redor do spawn não apareciam no viewer**: `ChunkEvent.Load` só dispara uma vez por chunk;
+  qualquer chunk já carregado antes do socket terminar de conectar (comum na própria área de spawn,
+  carregada no join do mundo) nunca reenviava a mensagem, e a mensagem original tinha se perdido pra
+  sempre. Addon agora faz uma varredura (`syncAlreadyLoadedChunks`, `getChunk(x,z,false)` — não força
+  carregar nada) num quadrado de `getEffectiveRenderDistance()` chunks ao redor do jogador toda vez que
+  conecta (primeira vez ou reconexão), preenchendo o que os eventos de load já perderam. Reportado pelo
+  usuário ("as chunks em volta do meu player não mostra nada").
 
 ### Added
 
