@@ -33,7 +33,7 @@ Addon Java (mod-addon/ — NeoForge, real)                    App Rust/Tauri (es
 └─ reporta posição/progresso/vitais ────────────┐            └─ Vitais/ameaças (src-tauri/src/vitals.rs)
                                                  ↓
                          socket TCP local 127.0.0.1:31173 (src-tauri/src/addon_socket.rs)
-                         hoje só manda `vitais` — chunk/baú/fila ainda não trafegam por aqui
+                         manda vitais, posição e presença de chunk — baú/fila ainda não trafegam
 ```
 
 ## Identidade visual
@@ -71,8 +71,9 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 
 ## O que falta (honesto, sem maquiar)
 
-- **Streaming de chunk, baús e instruções pelo socket** — hoje `addon_socket.rs` só recebe `vitals`;
-  posição do bot, `WorldCache` e `StorageIndex` continuam vazios mesmo com o addon conectado.
+- **Dados de bloco dentro do chunk, baús e instruções pelo socket** — `addon_socket.rs` já recebe
+  `vitals`/`position`/`chunk_loaded`, mas `chunk_loaded` só marca presença (nenhum bloco dentro) e
+  `StorageIndex`/fila continuam vazios mesmo com o addon conectado.
 - **`SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen`** no addon — só descrito em
   `docs/SPEC.md`, sem código ainda.
 - **Renderer 3D real** (wgpu, greedy meshing, atlas de texturas do jar do Minecraft) — o viewer hoje é

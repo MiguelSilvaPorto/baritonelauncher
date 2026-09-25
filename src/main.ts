@@ -171,11 +171,17 @@ function renderViewer(status: ConnectionStatus, world: WorldSummary) {
       chip.className = "progress-chip";
       $("#viewer-canvas").appendChild(chip);
     }
-    const pct = world.chunks_total_estimate > 0 ? Math.round((world.chunks_explored / world.chunks_total_estimate) * 100) : 0;
-    chip.innerHTML = `
-      <div class="bar"><span style="width:${pct}%"></span></div>
-      <span class="pct mono">${pct}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
-    `;
+    // Sem uma noção real de "total do mundo" (isso exigiria saber o quanto
+    // falta explorar, que não temos), a barra de progresso só faz sentido
+    // quando chunks_total_estimate vem preenchido. Sem isso, mostrar "0%"
+    // seria inventar um dado — então só a contagem crua.
+    chip.innerHTML =
+      world.chunks_total_estimate > 0
+        ? `
+      <div class="bar"><span style="width:${Math.round((world.chunks_explored / world.chunks_total_estimate) * 100)}%"></span></div>
+      <span class="pct mono">${Math.round((world.chunks_explored / world.chunks_total_estimate) * 100)}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
+    `
+        : `<span class="pct mono">${world.chunks_explored} chunks vistos</span>`;
 
     // Leitura crua de coordenadas — o marcador do bot posicionado de verdade
     // no grid depende do sistema de câmera/mapeamento de mundo real, que

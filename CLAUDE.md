@@ -110,15 +110,18 @@ There is no test suite yet.
   `connection_status`, `world_summary`, `queue_snapshot`, `storage_totals`, `vitals_snapshot`. Spawns
   `addon_socket::listen` in `setup()`.
 - `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line. Handles `hello`
-  (marks `AppState.connection` as connected) and `vitals` (fills `AppState.vitals`). Protocol is
-  documented in the module doc-comment; the matching Java client is
+  (marks `AppState.connection` as connected), `vitals` (fills `AppState.vitals`), `position` (fills
+  `AppState.bot_pos`), and `chunk_loaded` (marks presence in `AppState.world` via `apply_delta` with
+  an empty block map — deliberately cumulative, not removed on unload; see the module doc-comment for
+  why). The matching Java client is
   `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
-  Extending the protocol (e.g. adding a `position` or `chunk` message) means updating the
+  Extending the protocol further (e.g. real block data, chest contents) means updating the
   `AddonMessage` enum here **and** the Java sender in lockstep — they're not generated from a shared
   schema.
-- `world_cache.rs` — sparse per-chunk block cache (`WorldCache`), populated by chunk deltas from the
-  Java addon (not implemented yet — the socket only sends vitals so far). Also `CrossingStrategy` for
-  the learned water/lava crossing policy from `docs/SPEC.md`.
+- `world_cache.rs` — sparse per-chunk block cache (`WorldCache`). Chunk presence is real
+  (`chunk_loaded` messages), but no chunk has actual block data yet — that depends on the texture
+  atlas pipeline from `docs/SPEC.md`, "Blocos 3D", not implemented. Also `CrossingStrategy` for the
+  learned water/lava crossing policy.
 - `storage_index.rs` — `StorageIndex` (chest position → contents) and `aggregated_totals()`.
 - `items.rs` — `Item`, `Block`, `Recipe`, `IngredientRef`, `RecipeType`, `Station`, and
   `fits_inventory_2x2()` per the spec's "Receitas 2×2" section. Not populated from `minecraft-data`
@@ -133,17 +136,18 @@ There is no test suite yet.
   constants (deliberately *not* on the client-only class — referencing a client-only class from common
   code risks a `NoClassDefFoundError` on a dedicated server).
 - `BaritoneOrchestratorAddonClient.java` — `Dist.CLIENT`-only. On `ClientTickEvent.Post`, reads the
-  player through `BaritoneAPI.getProvider().getPrimaryBaritone().getPlayerContext().player()` (proof
-  the Baritone dependency works at runtime, not just compiles) and streams vitals to the socket once a
-  second, with a 5s reconnect backoff if the Rust app isn't up.
+  player through `BaritoneAPI.getProvider().getPrimaryBaritone()` (proof the Baritone dependency works
+  at runtime, not just compiles) and streams vitals (1x/s) and position (4x/s, `playerFeet()`) to the
+  socket, with a 5s reconnect backoff if the Rust app isn't up. Also subscribes to `ChunkEvent.Load`
+  (filtered to `ClientLevel`) to send one `chunk_loaded` per chunk — separate from the tick loop.
 - `neoforge.mods.toml` (templated from `gradle.properties`) declares Baritone as a required dependency
   — modid is `baritoe`, confirmed from the real jar, not `baritone`.
 
 ## 7. Known gaps (be honest about these, don't paper over them)
 
-- **Socket only carries vitals.** No chunk streaming, no chest/inventory data, no instructions sent
-  from the Rust side to the addon yet — `WorldCache`/`StorageIndex`/`InstructionQueue` stay empty even
-  with the addon connected.
+- **`chunk_loaded` only marks presence, no block data.** `WorldCache.chunks[pos].blocks` stays empty —
+  no chest/inventory data, no instructions sent from the Rust side to the addon yet either;
+  `StorageIndex`/`InstructionQueue` stay empty even with the addon connected.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
 - **No real 3D renderer.** The viewer is a 2D grid faithful to the documented visual identity

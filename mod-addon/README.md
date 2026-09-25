@@ -9,11 +9,14 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
 
 - Compila contra `baritone.api` (jar oficial, ver seção abaixo) e roda junto do
   Baritone de verdade no client — testado manualmente em NeoForge `26.3.0.22-beta`.
-- A cada tick do cliente, lê vida/fome/saturação/armadura do jogador via
-  `BaritoneAPI.getProvider().getPrimaryBaritone().getPlayerContext().player()`
-  (prova que a dependência do Baritone resolve e funciona em runtime, não só
-  em tempo de compilação) e manda pro app Rust por um socket TCP local, uma
-  vez por segundo.
+- A cada tick do cliente, lê vida/fome/saturação/armadura (1x/s) e posição
+  (`getPlayerContext().playerFeet()`, 4x/s) do jogador via
+  `BaritoneAPI.getProvider().getPrimaryBaritone()` (prova que a dependência do
+  Baritone resolve e funciona em runtime, não só em tempo de compilação) e
+  manda pro app Rust por um socket TCP local.
+- Assina `ChunkEvent.Load` (client-side) e manda um `chunk_loaded` por chunk
+  carregado — o app Rust já mostra a contagem real de chunks vistos no chip
+  de progresso do viewer.
 - Reconecta sozinho (a cada 5s) se o app Rust não estiver rodando ainda — não
   trava nem falha o carregamento do mod.
 - `neoforge.mods.toml` declara Baritone (`modId="baritoe"` — não é
@@ -27,8 +30,9 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 
 ## O que ainda não existe
 
-- Streaming de chunk pro `WorldCache` (posição do bot já dá pra pegar via
-  `getPlayerContext().playerFeet()`, só não está sendo mandada ainda).
+- **Dados de bloco de verdade dentro do chunk** — `chunk_loaded` hoje só marca presença
+  (`WorldCache.chunks[pos]` existe, sem nenhum bloco dentro). Pra virar visualização real, precisa do
+  pipeline de atlas de textura (`docs/SPEC.md`, "Blocos 3D") que ainda não existe.
 - Índice de baús (`StorageIndex`).
 - Recebimento de instruções da fila (hoje o socket só manda dados, não recebe
   comandos do lado Rust).
@@ -48,10 +52,14 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
   — primeira mensagem, marca `connection_status` como conectado no app.
 - `{"type":"vitals","health":20.0,"max_health":20.0,"hunger":20,"saturation":5.0,"armor_points":0}`
   — a cada ~20 ticks.
+- `{"type":"position","x":123,"y":64,"z":45}` — a cada ~5 ticks.
+- `{"type":"chunk_loaded","x":3,"z":-7}` — um por `ChunkEvent.Load` do lado cliente. Sem `x_unloaded`
+  de propósito (ver comentário em `addon_socket.rs`: isso é footprint cumulativo, não render distance
+  ao vivo).
 
 É a v0 deliberadamente mínima — não é o protocolo final do spec (que também
-cobre chunks, baús e instruções), é o menor recorte ponta a ponta que prova
-que a ponte funciona de verdade.
+cobre baús e instruções, e dados de bloco de verdade dentro de cada chunk), é
+o menor recorte ponta a ponta que prova que a ponte funciona de verdade.
 
 ## O jar do Baritone — qual usar e como pegar
 

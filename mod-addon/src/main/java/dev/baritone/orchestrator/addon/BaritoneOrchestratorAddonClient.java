@@ -3,12 +3,15 @@ package dev.baritone.orchestrator.addon;
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
 import baritone.api.utils.BetterBlockPos;
+import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.world.food.FoodData;
+import net.minecraft.world.level.ChunkPos;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.event.level.ChunkEvent;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -90,6 +93,25 @@ public class BaritoneOrchestratorAddonClient {
                     player.getArmorValue()
             ));
         }
+    }
+
+    /**
+     * Marks a client-rendered chunk as seen. Fires once per chunk load, so
+     * this can be noisy right after joining a world (one message per chunk
+     * already in render distance) — that's fine, each line is tiny and the
+     * Rust side just does a HashMap insert.
+     *
+     * <p>Deliberately does NOT send on {@link ChunkEvent.Unload} — see
+     * {@code addon_socket.rs} for why this is a cumulative "seen" footprint,
+     * not a live render-distance window.
+     */
+    @SubscribeEvent
+    static void onChunkLoad(ChunkEvent.Load event) {
+        if (!(event.getLevel() instanceof ClientLevel) || out == null) {
+            return;
+        }
+        ChunkPos pos = event.getChunk().getPos();
+        send(String.format(Locale.ROOT, "{\"type\":\"chunk_loaded\",\"x\":%d,\"z\":%d}", pos.x(), pos.z()));
     }
 
     private static void ensureConnected() {

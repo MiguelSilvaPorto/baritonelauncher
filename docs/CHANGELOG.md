@@ -78,6 +78,14 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   canto superior esquerdo com as coordenadas reais — ainda não é o marcador posicionado no grid (isso
   depende do sistema de câmera/mapeamento de mundo, que não existe ainda), só confirma que o dado
   chegou. Testado em jogo: coordenadas reais aparecendo ao vivo na janela do app.
+- **Streaming de chunk (contagem, não blocos ainda)**: addon assina `ChunkEvent.Load` do lado cliente
+  e manda `{"type":"chunk_loaded","x":...,"z":...}` por chunk carregado. `WorldCache.apply_delta`
+  (já existia, reaproveitado) marca presença — deliberadamente **não** remove no `ChunkEvent.Unload`,
+  porque isso é o "já explorado" cumulativo, não a janela de render distance atual (comentado em
+  `addon_socket.rs`). O chip de progresso do viewer troca "0% · 0 / 0 chunks" (dado inventado) por uma
+  contagem real ("N chunks vistos") quando não há uma estimativa de total — mostrar uma porcentagem
+  contra um total desconhecido seria inventar dado, então a barra some até existir uma estimativa de
+  verdade.
 
 ### Known gaps
 

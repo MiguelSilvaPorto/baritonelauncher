@@ -21,7 +21,7 @@ use world_cache::{BlockPos, WorldCache, WorldSummary};
 /// conectado ainda mostra estado vazio honesto na UI.
 #[derive(Default)]
 pub(crate) struct AppState {
-    world: Mutex<WorldCache>,
+    pub(crate) world: Mutex<WorldCache>,
     storage: Mutex<StorageIndex>,
     queue: Mutex<InstructionQueue>,
     pub(crate) vitals: Mutex<Option<Vitals>>,

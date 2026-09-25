@@ -7,17 +7,27 @@
 //!   prefixado — simples de implementar dos dois lados sem biblioteca extra
 //!   no addon Java (usa só `java.net.Socket`, sem WebSocket).
 //! - Mensagens hoje: `hello` (handshake), `vitals` (vida/fome/armadura,
-//!   ~1x/segundo) e `position` (pés do jogador, ~4x/segundo). Chunks e baús
-//!   ainda não trafegam por aqui — são o próximo passo, não implementado
-//!   ainda.
+//!   ~1x/segundo), `position` (pés do jogador, ~4x/segundo) e
+//!   `chunk_loaded` (um por chunk que o client carrega). Baús e fila ainda
+//!   não trafegam por aqui.
+//!
+//! `chunk_loaded` hoje só marca presença (`WorldCache.chunks[pos]` existe,
+//! sem blocos dentro) — é o "footprint" cumulativo de chunks já vistos pelo
+//! bot, não a janela de render distance atual: chunk que sai do render
+//! distance do client **não** é removido daqui, de propósito, porque
+//! `WorldCache` é sobre o que já foi explorado, não sobre o que está
+//! visível agora. Dados de bloco de verdade (pra render/instrução) ainda
+//! não trafegam — isso depende do pipeline de atlas de textura descrito em
+//! `docs/SPEC.md`, seção "Blocos 3D".
 //!
 //! O addon Java correspondente está em
 //! `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
 
 use crate::vitals::Vitals;
-use crate::world_cache::BlockPos;
+use crate::world_cache::{BlockPos, ChunkPos};
 use crate::AppState;
 use serde::Deserialize;
+use std::collections::HashMap;
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,7 +35,7 @@ use tokio::net::{TcpListener, TcpStream};
 const SOCKET_ADDR: &str = "127.0.0.1:31173";
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "snake_case")]
 enum AddonMessage {
     Hello {
         #[allow(dead_code)]
@@ -45,6 +55,10 @@ enum AddonMessage {
     Position {
         x: i32,
         y: i32,
+        z: i32,
+    },
+    ChunkLoaded {
+        x: i32,
         z: i32,
     },
 }
@@ -116,6 +130,16 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
             }
             AddonMessage::Position { x, y, z } => {
                 *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
+            }
+            AddonMessage::ChunkLoaded { x, z } => {
+                // `apply_delta` com um mapa vazio só marca presença — ver o
+                // doc-comment do módulo pra por que isso não é removido no
+                // unload.
+                state
+                    .world
+                    .lock()
+                    .unwrap()
+                    .apply_delta(ChunkPos { x, z }, HashMap::new());
             }
         }
     }
