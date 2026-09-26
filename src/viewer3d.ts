@@ -56,7 +56,7 @@ export class Viewer3D {
   private controls: OrbitControls;
   private container: HTMLElement;
 
-  private chunkMeshes = new Map<string, THREE.Object3D>();
+  private chunkMeshes = new Map<string, THREE.Group>();
   private botMarker: THREE.Group;
   private botLight: THREE.PointLight;
   private lastBotWorldPos: THREE.Vector3 | null = null;
@@ -130,7 +130,13 @@ export class Viewer3D {
 
   /** Recebe o atlas já extraído/empacotado pelo lado Rust (data URL + mapa
    * de UV) e prepara a textura pro Three.js. Chamado uma vez, quando o
-   * comando `get_texture_atlas` resolve — ver `main.ts`. */
+   * comando `get_texture_atlas` resolve — ver `main.ts`.
+   *
+   * Isso é assíncrono, mas `chunk_loaded` pode chegar aos montes de uma vez
+   * (ex: backfill de reconexão — ver `mod-addon/README.md`) antes do atlas
+   * terminar de carregar. Sem isso aqui, todo chunk criado nessa janela
+   * ficava sem textura pra sempre, porque `setChunks` só texturiza chunk
+   * *novo*. Por isso retrofita todo grupo já existente também. */
   setAtlas(dataUrl: string, textures: Record<string, UvRect>) {
     this.atlasLoading = true;
     new THREE.TextureLoader().load(
@@ -147,6 +153,8 @@ export class Viewer3D {
         this.atlasTexture = texture;
         this.atlasUvByName = textures;
         this.atlasLoading = false;
+
+        for (const group of this.chunkMeshes.values()) this.addTopTexture(group);
       },
       undefined,
       (err) => {
@@ -154,6 +162,22 @@ export class Viewer3D {
         this.atlasLoading = false;
       }
     );
+  }
+
+  /** Adiciona (ou reaproveita, se já existir) o plano texturizado no topo da
+   * placa. Não faz nada se o atlas ainda não carregou. */
+  private addTopTexture(group: THREE.Group) {
+    if (group.userData.textured || !this.atlasTexture) return;
+    const rect = this.atlasUvByName?.[PLACEHOLDER_TEXTURE];
+    if (!rect) return;
+
+    const top = new THREE.PlaneGeometry(CHUNK_SIZE - 0.5, CHUNK_SIZE - 0.5);
+    top.rotateX(-Math.PI / 2);
+    this.remapUv(top, rect);
+    const topMesh = new THREE.Mesh(top, new THREE.MeshStandardMaterial({ map: this.atlasTexture, roughness: 0.95 }));
+    topMesh.position.y = 0.21; // logo acima da placa, evita z-fighting
+    group.add(topMesh);
+    group.userData.textured = true;
   }
 
   private remapUv(geometry: THREE.PlaneGeometry, rect: UvRect) {
@@ -195,15 +219,7 @@ export class Viewer3D {
       );
       group.add(edges);
 
-      const rect = this.atlasUvByName?.[PLACEHOLDER_TEXTURE];
-      if (this.atlasTexture && rect) {
-        const top = new THREE.PlaneGeometry(CHUNK_SIZE - 0.5, CHUNK_SIZE - 0.5);
-        top.rotateX(-Math.PI / 2);
-        this.remapUv(top, rect);
-        const topMesh = new THREE.Mesh(top, new THREE.MeshStandardMaterial({ map: this.atlasTexture, roughness: 0.95 }));
-        topMesh.position.y = 0.21; // logo acima da placa, evita z-fighting
-        group.add(topMesh);
-      }
+      this.addTopTexture(group);
 
       group.position.set(pos.x * CHUNK_SIZE + CHUNK_SIZE / 2, referenceY, pos.z * CHUNK_SIZE + CHUNK_SIZE / 2);
       this.scene.add(group);

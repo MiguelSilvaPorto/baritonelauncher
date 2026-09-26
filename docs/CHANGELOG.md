@@ -12,6 +12,13 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Chunks que chegavam antes do atlas terminar de carregar ficavam sem textura pra sempre**: o atlas
+  é buscado de forma assíncrona (`get_texture_atlas`), mas o backfill de reconexão manda dezenas de
+  `chunk_loaded` de uma vez (49 num caso real) — praticamente sempre antes do atlas resolver.
+  `setChunks` só adicionava a textura em chunk *novo*, então todo chunk criado nessa janela nunca era
+  revisitado. Agora `setAtlas` retrofita (`addTopTexture`) todo grupo já existente assim que a textura
+  termina de carregar, além de continuar texturizando chunk novo normalmente. Reportado pelo usuário
+  ("sem texturas").
 - **HUD de vitais não atualizava sozinho**: `refreshState()` em `src/main.ts` só rodava uma vez, no
   carregamento da janela — se o addon conectasse depois disso, a UI ficava presa no estado antigo
   ("nenhum bot conectado") mesmo com a ponte já funcionando de verdade. Agora roda em loop
@@ -146,5 +153,8 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   coluna) nem textura correta por posição.
 - Sem ingestão de `minecraft-data` (itens, blocos, receitas) — diferente do atlas de texturas, que já
   lê o jar local, essa parte ainda não existe.
-- `StorageIndex` só em memória, sem persistência.
+- `WorldCache`/`StorageIndex` só em memória, sem persistência — reiniciar o app Rust apaga todo chunk
+  já visto (mesmo os que o Baritone Orchestrator estava rodando há horas), e o backfill de reconexão
+  do addon só cobre os chunks que o *client* ainda tem carregados naquele momento, não o histórico
+  completo de exploração. Reportado pelo usuário ("sem lembranças das chunks anteriores").
 - Editor de schematic é um painel de placeholder, sem implementação.
