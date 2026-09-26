@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
+import { Viewer3D, CHUNKS_PER_REFRESH, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
 
 interface TextureAtlas {
   image_data_url: string;
@@ -20,7 +20,7 @@ interface WorldSummary {
   bot_pos?: BotPos;
 }
 
-type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed";
+type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed" | "Canceled";
 type InstructionKind =
   | "Explore"
   | "Mine"
@@ -30,12 +30,19 @@ type InstructionKind =
   | "Smelt"
   | "TravelTo";
 
+/** Alvo horizontal (x, z) — ver `InstructionTarget` em src-tauri/src/instructions.rs. */
+interface InstructionTarget {
+  x: number;
+  z: number;
+}
+
 interface Instruction {
   id: string;
   kind: InstructionKind;
   label: string;
   status: InstructionStatus;
   progress: number;
+  target: InstructionTarget | null;
 }
 
 interface ItemTotal {
@@ -98,17 +105,23 @@ const STATUS_LABEL: Record<InstructionStatus, string> = {
   Paused: "pausado",
   Done: "concluído",
   Failed: "falhou",
+  Canceled: "cancelado",
 };
 
 function queueCard(instruction: Instruction): string {
   const statusClass = `status-${instruction.status.toLowerCase()}`;
+  const cancellable = instruction.status === "Queued" || instruction.status === "Active";
+  // `Explore` é contínuo e não tem progresso mensurável (o addon não manda
+  // `progress`) — barra só onde existe progresso real, nada de fingir 0%.
+  const showBar = !(instruction.kind === "Explore" && instruction.status === "Active");
   return `
     <div class="queue-card ${statusClass}">
       <div class="row1">
         <span class="label">${instruction.label}</span>
         <span class="kind mono">${STATUS_LABEL[instruction.status]}</span>
       </div>
-      <div class="bar"><span style="width:${Math.round(instruction.progress * 100)}%"></span></div>
+      ${showBar ? `<div class="bar"><span style="width:${Math.round(instruction.progress * 100)}%"></span></div>` : ""}
+      ${cancellable ? `<button type="button" class="queue-cancel" data-queue-cancel="${instruction.id}">cancelar</button>` : ""}
     </div>
   `;
 }
@@ -119,13 +132,60 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
     list.innerHTML = `
       <div class="empty-state">
         <span class="headline">Fila vazia</span>
-        <span class="detail">Nenhuma instrução foi enfileirada ainda — o editor de schematic e o painel de itens ainda geram instruções manualmente, a resolução automática de dependências está descrita em <code>docs/SPEC.md</code> mas não ligada aqui.</span>
+        <span class="detail">Enfileire uma instrução acima: "Ir para" manda o bot viajar até as coordenadas x/z e "Explorar" cobre a área a partir de onde ele está — o addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
       </div>
     `;
   } else {
     list.innerHTML = items.map(queueCard).join("");
   }
   if (countId) $(`#${countId}`).textContent = String(items.length);
+}
+
+function renderQueue(items: Instruction[]) {
+  renderQueueInto("queue-list", "queue-count", items);
+  renderQueueInto("queue-list-full", "queue-count-full", items);
+}
+
+/** Mesma instrução "Ir para"/"Explorar" nos dois painéis de fila (viewer e
+ *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar". */
+function bootstrapQueueComposers() {
+  $$<HTMLElement>(".queue-composer").forEach((composer) => {
+    const xInput = composer.querySelector<HTMLInputElement>('input[name="x"]');
+    const zInput = composer.querySelector<HTMLInputElement>('input[name="z"]');
+
+    composer.querySelector('[data-queue-action="travel"]')?.addEventListener("click", () => {
+      const x = Number(xInput?.value);
+      const z = Number(zInput?.value);
+      if (!Number.isFinite(x) || !Number.isFinite(z)) {
+        (Number.isFinite(x) ? zInput : xInput)?.focus();
+        return;
+      }
+      invoke<Instruction[]>("queue_push", { kind: "TravelTo", target: { x: Math.round(x), z: Math.round(z) } })
+        .then(renderQueue)
+        .catch((err) => console.error("[fila] ir para falhou:", err));
+    });
+
+    composer.querySelector('[data-queue-action="explore"]')?.addEventListener("click", () => {
+      const target = lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null;
+      invoke<Instruction[]>("queue_push", { kind: "Explore", target })
+        .then(renderQueue)
+        .catch((err) => console.error("[fila] explorar falhou:", err));
+    });
+  });
+}
+
+function bootstrapQueueActions() {
+  // Delegação: os cards são innerHTML recriado a cada refresh, então o
+  // listener fica no container, não no botão.
+  $$<HTMLElement>(".queue-list").forEach((list) => {
+    list.addEventListener("click", (event) => {
+      const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-queue-cancel]");
+      if (!btn) return;
+      invoke<Instruction[]>("queue_cancel", { id: btn.dataset.queueCancel })
+        .then(renderQueue)
+        .catch((err) => console.error("[fila] cancelar falhou:", err));
+    });
+  });
 }
 
 /* ---------- Armazém ---------- */
@@ -169,33 +229,43 @@ function renderStorage(totals: ItemTotal[]) {
 function renderViewer(status: ConnectionStatus, world: WorldSummary) {
   const empty = $("#viewer-empty");
   const endpoint = $("#viewer-endpoint");
+  const hasWorld = world.chunks_explored > 0;
 
-  if (status.connected) {
-    empty.classList.add("hidden");
-    endpoint.textContent = `socket: ${status.endpoint ?? "conectado"}`;
-    let chip = $<HTMLElement>("#progress-chip");
-    if (!chip) {
-      chip = document.createElement("div");
-      chip.id = "progress-chip";
-      chip.className = "progress-chip";
-      $("#viewer-canvas").appendChild(chip);
-    }
-    // Sem uma noção real de "total do mundo" (isso exigiria saber o quanto
-    // falta explorar, que não temos), a barra de progresso só faz sentido
-    // quando chunks_total_estimate vem preenchido. Sem isso, mostrar "0%"
-    // seria inventar um dado — então só a contagem crua.
-    chip.innerHTML =
-      world.chunks_total_estimate > 0
-        ? `
-      <div class="bar"><span style="width:${Math.round((world.chunks_explored / world.chunks_total_estimate) * 100)}%"></span></div>
-      <span class="pct mono">${Math.round((world.chunks_explored / world.chunks_total_estimate) * 100)}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
-    `
-        : `<span class="pct mono">${world.chunks_explored} chunks vistos</span>`;
-
-  } else {
+  // Sem conexão e sem nada em cache não há o que renderizar — estado honesto,
+  // e a cena é limpa (ex: primeira execução, ou cache apagado).
+  if (!status.connected && !hasWorld) {
     empty.classList.remove("hidden");
-    endpoint.textContent = "socket: aguardando implementação do addon Java";
+    endpoint.textContent = "socket: aguardando o addon Java";
     viewer3d?.clear();
+    return;
+  }
+
+  empty.classList.add("hidden");
+  endpoint.textContent = status.connected
+    ? `socket: ${status.endpoint ?? "conectado"}`
+    : "jogo não conectado — mostrando o mundo em cache";
+
+  let chip = $<HTMLElement>("#progress-chip");
+  if (!chip) {
+    chip = document.createElement("div");
+    chip.id = "progress-chip";
+    chip.className = "progress-chip";
+    $("#viewer-canvas").appendChild(chip);
+  }
+  // Sem uma noção real de "total do mundo" (isso exigiria saber o quanto
+  // falta explorar, que não temos), a barra de progresso só faz sentido
+  // quando chunks_total_estimate vem preenchido. Sem isso, mostrar "0%"
+  // seria inventar um dado — então só a contagem crua.
+  if (!status.connected) {
+    chip.innerHTML = `<span class="pct mono">${world.chunks_explored} chunks em cache</span>`;
+  } else if (world.chunks_total_estimate > 0) {
+    const pct = Math.round((world.chunks_explored / world.chunks_total_estimate) * 100);
+    chip.innerHTML = `
+      <div class="bar"><span style="width:${pct}%"></span></div>
+      <span class="pct mono">${pct}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
+    `;
+  } else {
+    chip.innerHTML = `<span class="pct mono">${world.chunks_explored} chunks vistos</span>`;
   }
 }
 
@@ -256,6 +326,26 @@ function renderHud(vitals: Vitals | null) {
 /* ---------- Bootstrap ---------- */
 
 let viewer3d: Viewer3D | null = null;
+/** Última posição do bot (do polling) — origem do "Explorar" no composer. */
+let lastBotPos: BotPos | null = null;
+/** Chunks já pedidos e ainda não resolvidos — evita pedir de novo no próximo
+ * refresh antes da resposta do anterior chegar. */
+const pendingChunks = new Set<string>();
+
+function requestChunk(pos: ChunkPos) {
+  const key = `${pos.x},${pos.z}`;
+  if (!viewer3d || viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(key)) return;
+  pendingChunks.add(key);
+  invoke<ArrayBuffer | number[]>("chunk_voxels", { x: pos.x, z: pos.z })
+    .then((raw) => {
+      // `tauri::ipc::Response` chega como ArrayBuffer; o fallback cobre uma
+      // resposta JSON antiga em vez de estourar.
+      const bytes = raw instanceof ArrayBuffer ? new Uint8Array(raw) : new Uint8Array(raw);
+      viewer3d?.addChunkVoxels(pos.x, pos.z, bytes);
+    })
+    .catch((err) => console.error(`[chunk_voxels] (${pos.x}, ${pos.z})`, err))
+    .finally(() => pendingChunks.delete(key));
+}
 
 async function refreshState() {
   const [status, world, chunks, queue, totals, vitals] = await Promise.all([
@@ -267,24 +357,43 @@ async function refreshState() {
     invoke<Vitals | null>("vitals_snapshot"),
   ]);
 
+  lastBotPos = world.bot_pos ?? null;
   renderViewer(status, world);
-  if (status.connected && viewer3d) {
-    // Atlas só existe depois que o addon já mandou `hello` (é de lá que
-    // vem a versão do MC, ver src-tauri/src/lib.rs) — busca uma vez só,
-    // não a cada refresh.
-    if (!viewer3d.hasAtlas() && !viewer3d.isLoadingAtlas) {
+
+  if (viewer3d) {
+    // Atlas: não depende mais do jogo estar aberto — a versão do MC fica no
+    // cache em disco (ver `world_store.rs`), então o mundo persistido abre
+    // texturizado. Sem versão conhecida (nunca conectou), o comando falha e
+    // a tentativa se repete no próximo refresh.
+    if (
+      !viewer3d.hasAtlas() &&
+      !viewer3d.isLoadingAtlas &&
+      (status.connected || world.chunks_explored > 0)
+    ) {
       invoke<TextureAtlas>("get_texture_atlas")
         .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
-        .catch((err) => console.error("[atlas]", err));
+        .catch((err) => console.warn("[atlas] ainda indisponível:", err));
     }
-    // Chunk novo usa a altura atual do bot como aproximação de "chão local"
-    // — não temos altura de terreno de verdade ainda, ver viewer3d.ts.
-    viewer3d.setChunks(chunks, world.bot_pos?.y ?? 0);
+
+    // Sempre chamado: com o jogo fechado o `bot_pos` do Rust volta a ser
+    // `None`, e sem isso o marcador ficaria congelado na última posição.
     viewer3d.setBotPos(world.bot_pos ?? null);
+
+    // Voxels são buscados aos poucos: montar malha é CPU na thread
+    // principal, então um backfill de centenas de chunks numa tacada
+    // travaria o viewer. O resto fica na fila implícita do Rust e chega
+    // nos próximos refreshes — vale igual pro mundo vindo do cache em
+    // disco, que também chega inteiro de uma vez em `world_chunks`.
+    let budget = CHUNKS_PER_REFRESH;
+    for (const pos of chunks) {
+      if (budget <= 0) break;
+      if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
+      requestChunk(pos);
+      budget--;
+    }
   }
   renderHud(vitals);
-  renderQueueInto("queue-list", "queue-count", queue);
-  renderQueueInto("queue-list-full", "queue-count-full", queue);
+  renderQueue(queue);
   renderStorage(totals);
 }
 
@@ -295,6 +404,8 @@ const REFRESH_INTERVAL_MS = 1000;
 window.addEventListener("DOMContentLoaded", () => {
   bootstrapRail();
   bootstrapTitlebar();
+  bootstrapQueueComposers();
+  bootstrapQueueActions();
 
   viewer3d = new Viewer3D($<HTMLElement>("#viewer-3d"), $<HTMLDivElement>("#bot-label"));
   window.addEventListener("resize", () => viewer3d?.resize());

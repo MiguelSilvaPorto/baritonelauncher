@@ -12,6 +12,46 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Folhas, videira e lírio-d'água saíam cinza**: essas texturas vêm em tons de cinza no próprio jar
+  — o verde só existe em runtime via "biome tint" (colormap/JSON de bioma, não implementado). Agora
+  levam tint fixo aproximado, igual já era feito com a grama: folhagem no tom de floresta (carvalho,
+  jungle, acácia, dark oak, mangrove, videira) e as cores fixas que o jogo dá a spruce (`#619961`) e
+  birch (`#80a755`). Cerejeira e azaleia já vêm coloridas no arquivo, e carvalho-pálido já vem com o
+  tom pálido que dá o nome — esses ficam sem tint, senão escureceriam. Reportado pelo usuário ("as
+  texturas que não carregam tipo as folhas que ainda estão zinzas").
+- **Água, lava e fogo nem textura tinham (animadas eram puladas pelo atlas)**: `water_still`,
+  `lava_still`, `fire_0`... são PNGs com os frames empilhados na vertical, e o atlas descartava tudo
+  que não fosse 16×16 — esses blocos caíam no cinza de fallback. Agora todas as texturas animadas
+  entram no atlas **com todos os frames** (`water_still_f0`, `_f1`…; frames 32×32 de
+  `water_flow`/`lava_flow` são reduzidos pra 16×16, porque o atlas é uniforme) e o viewer resolve o
+  nome certo por bloco (`water` → `water_still`, `lava` → `lava_still`, `fire` → `fire_0`). Água
+  ainda leva um tint de azul aproximado, como no jogo. O cache do atlas em disco ganhou versão no
+  nome (`atlas_v3_...`), senão o atlas antigo (sem essas texturas) continuaria sendo reaproveitado
+  pra sempre.
+- **Viewer travado a 2–5 fps depois do material por face**: cada bloco era um `Mesh` próprio e, com
+  um material por face, cada um passou a custar 6 draw calls (um por grupo do `BoxGeometry`) — com
+  milhares de blocos explorados, isso virava dezenas de milhares de draw calls por frame. Agora os
+  blocos são renderizados **instanciados**: um `InstancedMesh` por tipo de bloco, com capacidade que
+  dobra quando enche (copia as matrizes pra um lote maior, amortizado). O custo por frame caiu de
+  "6 × blocos" para "6 × tipos de bloco" (algumas dezenas), independente do tamanho do mundo — sem
+  mudar nada do visual (mesma textura por face, mesmo tint). De quebra, o dedupe de colunas do polling
+  deixou de alocar uma string por coluna por segundo (chave numérica). Reportado pelo usuário ("o
+  renderizador está estremamente travado 2fps a 5").
+- **Faces laterais dos blocos usavam a textura de topo**: cada cubo recebia um único material nas 6
+  faces, então o degrau de um bloco de grama mostrava a face lateral toda verde (textura
+  `grass_block_top`) em vez de terra com a franja verde no topo, como no jogo. Agora o `BoxGeometry`
+  usa um material por face, na ordem dos grupos do próprio Three.js: `"{bloco}_top"` em cima,
+  `"{bloco}_side"` nos 4 lados (ex: `grass_block_side`, que já vem com a franja verde impressa sobre
+  a terra) e `"{bloco}_bottom"` embaixo — com `dirt` no fundo de `grass_block`/`mycelium`/`podzol`,
+  como no modelo vanilla. Blocos sem variantes (`stone`, `dirt`...) continuam com a mesma textura nos 6
+  lados. Reportado pelo usuário ("arrume as texturas... normalmente as texturas renderizadas escolhem
+  um lado só e aplica para os 4 lados").
+- **Vão/grade preta entre os blocos do terreno**: cada bloco do viewer era um cubo de `0.98` (não
+  `1.0`), deixando um vão de 2% entre colunas vizinhas. Como o addon só manda a camada de superfície
+  (não existe bloco embaixo dela), esse vão deixava ver o fundo escuro da cena — um quadriculado de
+  linhas pretas entre os blocos. Agora a geometria compartilhada é `1×1×1` de verdade, como no jogo:
+  blocos vizinhos encostam e o limite visual entre eles passa a ser só a própria textura. Reportado
+  pelo usuário ("quero que arrume esse vão de rederização").
 - **Textura borrada — 1 tile esticado sobre o chunk inteiro em vez de 1 por bloco**: cada chunk é 16×16
   *blocos*, mas o UV mapeava o plano inteiro pra um único tile de 16×16 *pixels* do atlas — esticando
   uma textura de bloco 256x maior que deveria, virando borrão. Trocado por `buildTileTexture`: recorta
@@ -79,6 +119,79 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Mundo explorado salvo em disco — o viewer abre sem o jogo aberto**: o cache era só em memória,
+  então fechar o app apagava tudo que já tinha sido carregado e o viewer só mostrava algo com o addon
+  conectado de novo. Agora o `WorldCache` é gravado em `world.cache`, no diretório de dados do app
+  (`~/.local/share/dev.baritone.orchestrator/` no Linux), a cada 5s quando entra chunk novo e no
+  fechamento do app — comprimido com zlib e escrito de forma atômica (tmp + rename), então um crash no
+  meio da gravação não corrompe o cache bom. No boot, o app carrega esse arquivo antes de abrir a
+  janela. A versão do Minecraft do último `hello` vai no mesmo arquivo, então o atlas de texturas
+  também funciona offline e o mundo em cache abre já texturizado. A UI mantém a cena e busca
+  atlas/voxels mesmo desconectada, com o chip mostrando "N chunks em cache" e o rodapé "jogo não
+  conectado — mostrando o mundo em cache"; sem cache nenhum, continua o estado vazio honesto de
+  sempre. Nada é inventado: é o dado real que o addon mandou e foi salvo. Reportado pelo usuário
+  ("quero que adicione um cache que evita eu sempre ter o jogo aberto para ver oque já carreguei").
+- **Água e lava renderizadas de verdade — nível, transparência, animação e fluxo direcional** — o
+  viewer tratava (quando renderizava) fluido como cubo opaco de 1×1×1, e `water_flow`/`lava_flow`
+  eram puladas de vez, então não existia "fluxo" visual nenhum. Agora o protocolo `chunk_voxels`
+  carrega, por entrada de paleta, o **nível** do fluido (`0` = fonte, `1–7` = fluindo, `8+` =
+  caindo) e uma flag `FLUID` (formato 2; o addon Java e o Rust andam juntos). O viewer:
+  - desenha a superfície na altura real (`(8 − nível) / 9`; fonte e queda = `8/9`), como o
+    `WaterFluid#getHeight` do jogo — riacho vira degrau, cachoeira fica em pé;
+  - some com as faces entre o **mesmo** fluido (nada de grade de cubos d'água) e mostra só o degrau
+    quando o vizinho é mais raso;
+  - água é **translúcida** (`depthWrite` desligado, como no jogo) e lava é opaca/emissiva;
+  - toca **todos os frames** das texturas animadas (`water_still`, `water_flow`, `lava_still`,
+    `lava_flow`) em sequência — o atlas passou a extrair frame a frame do jar;
+  - calcula a direção da correnteza dos níveis dos vizinhos (mesma ideia do `FlowingFluid#getFlow`)
+    e gira a textura pra acompanhar o fluxo: cachoeira escorre pra baixo, riacho corre pro lado.
+  Reportado pelo usuário ("quero que vc arrume o carregamento de agua do meu app que ele não é capaz
+  de renderizar o agua e o fluxo dela").
+- **Canal reverso: a fila agora executa de verdade no jogo** — o socket só levava dados do jogo pro
+  app; a fila era decorativa. Agora o app manda `instruction` (`travel_to` →
+  `ICustomGoalProcess.setGoalAndPath(new GoalXZ(x, z))`, `explore` → `IExploreProcess.explore(x, z)`)
+  e `cancel` pelo mesmo socket, e o addon devolve `instruction_status` (`active` com progresso,
+  `done`/`failed`). O progresso do `travel_to` é real (fração da distância em linha reta até o alvo,
+  medida da posição do bot) e o `explore`, que é contínuo, não tem progresso — a barra some de
+  propósito em vez de fingir 0%. No app: comandos `queue_push`/`queue_cancel`, fila que anda em
+  sequência (a próxima só é despachada quando a ativa termina, ou quando o addon reconecta) e um
+  composer "Ir para" (x/z) / "Explorar" nos dois painéis de fila, com botão "cancelar" nos cards.
+  Sem conexão a instrução fica `Queued` e sai no próximo `hello`. No addon, a leitura do socket roda
+  numa thread própria que só enfileira as linhas; a execução (API do Baritone) acontece na thread do
+  cliente, via `onClientTick`. Reportado pelo usuário ("o que seria o proximo item da fila para resolver").
+
+- **Movimentação da câmera do viewer 3D — teclado + zoom livre**: antes a câmera só se movia pelo
+  mouse (orbitar/arrastar do `OrbitControls`) e o zoom era travado entre 8 e 400 blocos, sem como
+  chegar perto de um bloco pra inspecionar nem enquadrar o relevo de longe. Agora `WASD`/setas voam na
+  horizontal (relativo à direção da câmera), `Q`/`E` (ou `Espaço`) descem/sobem, `Shift` acelera,
+  `Alt` deixa preciso e `F` reenquadra o bot; a velocidade acompanha a distância do zoom (não fica
+  lenta demais afastado nem rápida demais de perto). O zoom ficou livre na prática (`1.5`–`2000`
+  blocos) e passou a aproximar/afastar no ponto do cursor (`zoomToCursor`), e o botão do meio do
+  mouse também vira "arrastar". O fog, que antes sumia com o mundo além de ~260 blocos, acompanha a
+  distância da câmera — mantém a profundidade no enquadramento normal sem engolir o terreno ao
+  afastar. Um rodapé discreto no canto do viewer lista os atalhos. Reportado pelo usuário ("hoje só
+  se movimenta pelo mouse e tem limite de zoom... está me incomodando").
+- **Terreno real: bloco de superfície + altura de verdade por coluna** — o maior salto de fidelidade
+  da sessão. Antes, cada chunk virava uma placa lisa com um bloco representante fixo; agora o addon
+  escaneia as 256 colunas de cada chunk carregado (`ChunkEvent.Load`, e o backfill de reconexão) de
+  cima pra baixo, pulando bloco "substituível" (`canBeReplaced()` — grama alta, samambaia, flor, muda
+  — a mesma checagem que o próprio jogo usa pra "dá pra colocar bloco através disso"), e manda a altura
+  real (Y) + o nome real do bloco de cada coluna numa nova mensagem `chunk_surface` (256 alturas +
+  256 nomes, arrays paralelos). Isso pega copa de árvore de graça (folha não é substituível, então uma
+  coluna sob uma árvore acha a folha como "superfície") — sem precisar de lógica dedicada pra árvore.
+  Não escaneia até o limite de build (320) pra economizar: teto de 192, cobre a esmagadora maioria do
+  terreno. O backfill de reconexão (que pode escanear 100+ chunks de uma vez, cada um até ~256×384
+  buscas de bloco) não roda tudo numa tacada — enfileira e drena só 2 chunks por tick, evitando travar
+  o jogo por um instante.
+- **`world_columns`**: novo comando Tauri expondo os blocos de superfície como lista plana
+  `{x,y,z,block}`, e `viewer3d.ts` reescrito — cada coluna vira um cubo de 1×1×1 na posição/altura
+  reais, com a textura real resolvida por face do bloco (`"{bloco}_top"` em cima, `"{bloco}_side"`
+  nos 4 lados, `"{bloco}_bottom"` embaixo — fallback pro nome puro quando a variante não existe, com
+  cache por material/textura pra não recriar a cada coluna) em vez da placa lisa com um único bloco
+  chutado pra todo chunk. `grass_block` ganha um tint verde fixo aproximado no topo (não é tint real
+  por bioma — isso precisaria saber o bioma da coluna e amostrar o colormap, não implementado).
+  Reportado pelo usuário ("cade as arvores vc está renderizando apenas uma camada... quero que mostre
+  relevos de 16x como se fosse pequenos bloquinhos no minecraft").
 - **Pipeline de atlas de texturas** (`src-tauri/src/texture_atlas.rs`): extrai as texturas de bloco do
   client jar do Minecraft **que o usuário já tem instalado localmente**
   (`~/.minecraft/versions/<versão>/<versão>.jar`) — nunca baixa nem empacota nada da Mojang neste

@@ -7,32 +7,48 @@
 //!   prefixado — simples de implementar dos dois lados sem biblioteca extra
 //!   no addon Java (usa só `java.net.Socket`, sem WebSocket).
 //! - Mensagens hoje: `hello` (handshake), `vitals` (vida/fome/armadura,
-//!   ~1x/segundo), `position` (pés do jogador, ~4x/segundo) e
-//!   `chunk_loaded` (um por chunk que o client carrega). Baús e fila ainda
+//!   ~1x/segundo), `position` (pés do jogador, ~4x/segundo) e `chunk_voxels`
+//!   (o chunk inteiro, seção por seção, comprimido — ver abaixo). Baús ainda
 //!   não trafegam por aqui.
+//! - Canal reverso (app → addon, mesmo socket): `instruction` (`travel_to` ou
+//!   `explore`) e `cancel` (id da instrução). O addon responde com
+//!   `instruction_status` (`active` com `progress`, ou `done`/`failed`), que
+//!   atualiza a fila de verdade — ver `instructions.rs` e `lib.rs`,
+//!   `dispatch_next_instruction`.
 //!
-//! `chunk_loaded` hoje só marca presença (`WorldCache.chunks[pos]` existe,
-//! sem blocos dentro) — é o "footprint" cumulativo de chunks já vistos pelo
-//! bot, não a janela de render distance atual: chunk que sai do render
-//! distance do client **não** é removido daqui, de propósito, porque
-//! `WorldCache` é sobre o que já foi explorado, não sobre o que está
-//! visível agora. Dados de bloco de verdade (pra render/instrução) ainda
-//! não trafegam — isso depende do pipeline de atlas de textura descrito em
-//! `docs/SPEC.md`, seção "Blocos 3D".
+//! `chunk_voxels` carrega o conteúdo real do chunk — paleta + índices por
+//! seção 16×16×16, com o campo `"data"` em base64 de um payload zlib (layout
+//! em `world_cache.rs`, `decode_voxels`) —, não só a superfície: é o que deixa
+//! o viewer mostrar relevo, cavernas e o que mais estiver embaixo. O cache é
+//! cumulativo (`WorldCache.chunks[pos]`): chunk que sai do render distance do
+//! client **não** é removido daqui, de propósito — `WorldCache` é sobre o que
+//! já foi explorado, não sobre o que está visível agora. Blocos que mudam
+//! depois do load (o bot minerando, por exemplo) ainda não são reenviados —
+//! cada chunk é um snapshot do momento em que carregou.
 //!
 //! O addon Java correspondente está em
 //! `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
 
+use crate::instructions::InstructionStatus as QueueInstructionStatus;
 use crate::vitals::Vitals;
-use crate::world_cache::{BlockPos, ChunkPos};
+use crate::world_cache::{decode_voxels, BlockPos, ChunkPos, ChunkSection};
 use crate::AppState;
+use base64::Engine;
+use flate2::read::ZlibDecoder;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Manager};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 const SOCKET_ADDR: &str = "127.0.0.1:31173";
+
+/// Teto do payload descomprimido por chunk — um chunk de verdade fica bem
+/// abaixo disso (poucas dezenas de KB); o teto existe só pra um payload
+/// corrompido não virar alocação gigante.
+const MAX_CHUNK_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -56,10 +72,31 @@ enum AddonMessage {
         y: i32,
         z: i32,
     },
-    ChunkLoaded {
+    ChunkVoxels {
         x: i32,
         z: i32,
+        /// Payload binário (ver `world_cache::decode_voxels`) comprimido com
+        /// zlib e codificado em base64.
+        data: String,
     },
+    /// Estado de execução de uma instrução do canal reverso. `progress` é
+    /// opcional (só faz sentido em `active`; `explore` não tem progresso
+    /// mensurável e não manda o campo).
+    InstructionStatus {
+        id: String,
+        status: AddonInstructionState,
+        progress: Option<f32>,
+    },
+}
+
+/// Estados que o addon reporta — subconjunto do `InstructionStatus` da fila
+/// (`Paused`/`Canceled` são decisões do app, não do addon).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AddonInstructionState {
+    Active,
+    Done,
+    Failed,
 }
 
 /// Roda pro resto da vida do app (`tauri::async_runtime::spawn`ada uma vez em
@@ -94,7 +131,27 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
         .unwrap_or_else(|_| "addon".to_string());
 
     let state = app.state::<AppState>();
-    let mut lines = BufReader::new(stream).lines();
+
+    // O socket é dividido em leitura (aqui) e escrita (tarefa própria
+    // consumindo o canal) — os comandos Tauri mandam linhas pro canal via
+    // `AppState.addon_tx` sem precisar alcançar o `TcpStream`.
+    let (read_half, mut write_half) = stream.into_split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    *state.addon_tx.lock().unwrap() = Some(tx.clone());
+
+    let writer = tauri::async_runtime::spawn(async move {
+        while let Some(line) = rx.recv().await {
+            if write_half.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+            if write_half.write_all(b"\n").await.is_err() {
+                break;
+            }
+            let _ = write_half.flush().await;
+        }
+    });
+
+    let mut lines = BufReader::new(read_half).lines();
 
     while let Ok(Some(line)) = lines.next_line().await {
         let Ok(message) = serde_json::from_str::<AddonMessage>(&line) else {
@@ -108,6 +165,9 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 connection.endpoint = Some(peer.clone());
                 drop(connection);
                 *state.mc_version.lock().unwrap() = Some(mc_version);
+                // Instruções enfileiradas enquanto o addon estava offline
+                // saem agora (o `hello` é o sinal de que dá pra escrever).
+                crate::dispatch_next_instruction(&state);
             }
             AddonMessage::Vitals {
                 health,
@@ -132,18 +192,45 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
             AddonMessage::Position { x, y, z } => {
                 *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
             }
-            AddonMessage::ChunkLoaded { x, z } => {
-                // `apply_delta` com um mapa vazio só marca presença — ver o
-                // doc-comment do módulo pra por que isso não é removido no
-                // unload.
-                state
-                    .world
+            AddonMessage::ChunkVoxels { x, z, data } => match decode_chunk_payload(&data) {
+                Ok(sections) => {
+                    state
+                        .world
+                        .lock()
+                        .unwrap()
+                        .apply_voxels(ChunkPos { x, z }, sections);
+                    // Avisa o gravador periódico (`lib.rs`, `world_store`)
+                    // que há coisa nova pra persistir.
+                    state.world_revision.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => eprintln!("[addon_socket] chunk_voxels inválido em ({x}, {z}): {err}"),
+            },
+            AddonMessage::InstructionStatus { id, status, progress } => {
+                let status = match status {
+                    AddonInstructionState::Active => QueueInstructionStatus::Active,
+                    AddonInstructionState::Done => QueueInstructionStatus::Done,
+                    AddonInstructionState::Failed => QueueInstructionStatus::Failed,
+                };
+                let terminal = state
+                    .queue
                     .lock()
                     .unwrap()
-                    .apply_delta(ChunkPos { x, z }, HashMap::new());
+                    .apply_remote_status(&id, status, progress);
+                if terminal {
+                    crate::dispatch_next_instruction(&state);
+                }
             }
         }
     }
+
+    writer.abort();
+    // Só desregistra o canal se ele ainda for o desta conexão — uma
+    // reconexão pode já ter registrado o dela.
+    let mut addon_tx = state.addon_tx.lock().unwrap();
+    if addon_tx.as_ref().is_some_and(|registered| registered.same_channel(&tx)) {
+        *addon_tx = None;
+    }
+    drop(addon_tx);
 
     // Conexão caiu (addon fechou, `#stop`, saiu do mundo, etc.).
     let mut connection = state.connection.lock().unwrap();
@@ -152,4 +239,24 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
     drop(connection);
     *state.vitals.lock().unwrap() = None;
     *state.bot_pos.lock().unwrap() = None;
+}
+
+/// base64 → zlib → `decode_voxels`. O payload do addon vai comprimido porque
+/// um chunk inteiro cru passa de 100 KB; zlib derruba isso pra poucos KB no
+/// terreno típico.
+fn decode_chunk_payload(data: &str) -> Result<Vec<ChunkSection>, String> {
+    let compressed = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|err| format!("base64 inválido: {err}"))?;
+
+    let mut raw = Vec::new();
+    ZlibDecoder::new(compressed.as_slice())
+        .take(MAX_CHUNK_PAYLOAD_BYTES)
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("zlib inválido: {err}"))?;
+    if raw.len() as u64 == MAX_CHUNK_PAYLOAD_BYTES {
+        return Err("payload descomprimido passou do teto".to_string());
+    }
+
+    decode_voxels(&raw)
 }
