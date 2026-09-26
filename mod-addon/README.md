@@ -127,8 +127,9 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   `name` já vem localizado pelo client e `distance`/`height` são medidos no jogo. É o estado atual,
   não um delta — mob que saiu do raio simplesmente não aparece mais.
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
-  estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
-  do `travel_to` — `explore` é contínuo e não tem progresso).
+  estado da instrução ativa (`active`/`paused`/`done`/`failed`; `progress` só quando
+  existe, ex: no `active` do `travel_to` — `explore` é contínuo e não tem progresso;
+  `paused` = builder parado por falta de material).
 
 **App → addon (canal reverso):**
 

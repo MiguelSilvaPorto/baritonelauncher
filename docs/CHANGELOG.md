@@ -12,6 +12,17 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Construir no criativo não colocava nada (ficava "ativo")**: o builder do Baritone **não busca
+  materiais** — ele só coloca o que está no inventário do jogador (a mensagem `Missing materials for
+  at least:` é dele), e no criativo o bot normalmente não tem o bloco escolhido na hotbar, então a
+  instrução ficava ativa pra sempre sem colocar nada. Agora, no criativo, o addon entrega os blocos
+  que faltam no inventário pelo **pacote criativo** (`handleCreativeModeItemAdd` — o mesmo que
+  arrastar um item da tela criativa manda; o servidor só aceita pra quem tem materiais infinitos,
+  nada é criado em survival) e só solta o `BuilderProcess` quando eles chegam no inventário. De
+  quebra, quando o builder está pausado por falta de material, a instrução passa a aparecer como
+  **"pausado"** na fila em vez de um "ativo" que nunca anda. Reportado pelo usuário ("não é possivel
+  colocar blocos" / "está no criativo era para colocar").
+
 - **Chão preto: chunks capturados antes de o motor de luz do client calcular a luz**: o addon
   serializava o chunk no `ChunkEvent.Load` e, nesse instante, o `getDataLayerData` do client ainda
   devolvia nada — o payload saía com **luz zero em tudo**. Como cada chunk é um snapshot, o terreno
@@ -31,7 +42,6 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   câmera chega na altura dela (fade ao longo da travessia dos 4 blocos da camada + 8 de folga) e
   volta ao normal quando a câmera desce — abaixo das nuvens nada muda, continua a nuvem do jogo.
   Reportado pelo usuário ("se uma nuvem passa por cima fica um breu no viewer").
-
 - **FPS travado conforme o mundo explorado cresce**: todo chunk já visto ficava na cena pra sempre, e
   o custo por frame (draw calls, triângulos, memória) crescia sem limite com a exploração — quanto
   mais chunks apareciam na tela (zoom afastado), pior ficava, até travar. Agora o viewer mantém uma

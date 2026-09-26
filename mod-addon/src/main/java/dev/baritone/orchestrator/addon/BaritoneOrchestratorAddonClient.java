@@ -12,6 +12,7 @@ import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.MultiPlayerGameMode;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.AbstractTexture;
@@ -28,8 +29,12 @@ import net.minecraft.world.entity.animal.golem.AbstractGolem;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.npc.villager.AbstractVillager;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.world.food.FoodData;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.LightLayer;
@@ -65,10 +70,12 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.zip.Deflater;
 
@@ -167,6 +174,16 @@ public class BaritoneOrchestratorAddonClient {
      *  conta a carência até reportar falha se nunca começar. */
     private static boolean schematicStarted;
     private static int schematicWaitTicks;
+
+    /** Build no criativo: o Baritone exige os itens no inventário (`Missing
+     *  materials`) e o inventário criativo normalmente não tem o bloco
+     *  escolhido — o addon entrega os blocos por pacote criativo e só solta o
+     *  `BuilderProcess` quando eles chegam (ou depois da carência). */
+    private static final int CREATIVE_WAIT_TICKS = 20;
+    private static OrchestratorSchematic pendingSchematic;
+    private static BlockPos pendingSchematicOrigin;
+    private static List<Item> pendingSchematicItems;
+    private static int pendingSchematicTicks;
 
     /** Waypoints da exploração com raio/estilo (ver `buildExploreWaypoints`):
      *  "círculos" e "zigue-zague" são uma sequência de Goals que este addon
@@ -662,7 +679,32 @@ public class BaritoneOrchestratorAddonClient {
 
         OrchestratorSchematic schematic = new OrchestratorSchematic(
                 maxX - minX + 1, maxY - minY + 1, maxZ - minZ + 1, targets);
-        baritone.getBuilderProcess().build("orchestrator", schematic, new BlockPos(minX, minY, minZ));
+        BlockPos origin = new BlockPos(minX, minY, minZ);
+
+        // Criativo: o builder do Baritone não busca materiais (`Missing
+        // materials for at least:`) e o inventário criativo normalmente não tem
+        // o bloco escolhido na hotbar. Dá os blocos por pacote criativo e adia
+        // o `build` até o servidor confirmar (1-2 ticks) — senão o builder
+        // pausa por "falta de material" mesmo podendo pegar qualquer item.
+        if ("build".equals(kind)) {
+            LocalPlayer player = baritone.getPlayerContext().player();
+            List<Item> needed = neededItems(targets);
+            if (player != null && !needed.isEmpty()) {
+                giveMissingCreativeItems(player, needed);
+                if (!inventoryHasAll(player, needed)) {
+                    pendingSchematic = schematic;
+                    pendingSchematicOrigin = origin;
+                    pendingSchematicItems = needed;
+                    pendingSchematicTicks = 0;
+                    System.out.println("[orchestrator] build aguardando " + needed.size()
+                            + " bloco(s) entrarem no inventário (criativo)");
+                    sendInstructionStatus("active", null);
+                    return;
+                }
+            }
+        }
+
+        baritone.getBuilderProcess().build("orchestrator", schematic, origin);
         System.out.println("[orchestrator] " + kind + " com " + targets.size() + " blocos ("
                 + unknown + " nomes desconhecidos ignorados) em "
                 + (maxX - minX + 1) + "x" + (maxY - minY + 1) + "x" + (maxZ - minZ + 1));
@@ -680,6 +722,63 @@ public class BaritoneOrchestratorAddonClient {
                 .getOptional(Identifier.withDefaultNamespace(name))
                 .map(block -> block.defaultBlockState())
                 .orElse(null);
+    }
+
+    /** Itens necessários pra colocar os blocos pedidos (bloco → item; bloco
+     *  sem forma de item, ex: água, não entra). */
+    private static List<Item> neededItems(Map<Long, BlockState> targets) {
+        Set<Item> items = new LinkedHashSet<>();
+        for (BlockState state : targets.values()) {
+            if (state.isAir()) continue;
+            Item item = state.getBlock().asItem();
+            if (item != Items.AIR) items.add(item);
+        }
+        return new ArrayList<>(items);
+    }
+
+    private static boolean inventoryHasAll(LocalPlayer player, List<Item> items) {
+        for (Item item : items) {
+            if (!player.getInventory().contains(new ItemStack(item))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Criativo: entrega no inventário os blocos que faltam, via
+     * {@code handleCreativeModeItemAdd} — o mesmo pacote que arrastar um item
+     * da tela criativa manda, e o servidor só aceita pra quem tem materiais
+     * infinitos (`hasInfiniteMaterials`). Preenche primeiro a hotbar (slots
+     * 36..44 do menu do inventário), depois o inventário principal (9..35);
+     * nunca sobrescreve item existente. Em survival não faz nada — lá os
+     * materiais têm que vir do mundo (a árvore de baú/craft/mina do spec).
+     */
+    private static void giveMissingCreativeItems(LocalPlayer player, List<Item> items) {
+        MultiPlayerGameMode gameMode = Minecraft.getInstance().gameMode;
+        if (gameMode == null || !player.hasInfiniteMaterials()) {
+            return;
+        }
+        Inventory inventory = player.getInventory();
+        List<Integer> freeSlots = new ArrayList<>();
+        for (int slot = 0; slot < 9; slot++) {
+            if (inventory.getItem(slot).isEmpty()) freeSlots.add(slot);
+        }
+        for (int slot = 9; slot < 36; slot++) {
+            if (inventory.getItem(slot).isEmpty()) freeSlots.add(slot);
+        }
+        int next = 0;
+        for (Item item : items) {
+            if (inventory.contains(new ItemStack(item))) continue;
+            if (next >= freeSlots.size()) {
+                System.out.println("[orchestrator] inventário sem espaço no criativo pra: " + item);
+                break;
+            }
+            int inventorySlot = freeSlots.get(next++);
+            // Índice do `Inventory` -> slot do menu do jogador (hotbar 0..8 =
+            // 36..44; inventário principal 9..35 = 9..35). O servidor valida
+            // 1..45 em `inventoryMenu.getSlot(...)`.
+            int menuSlot = inventorySlot < 9 ? 36 + inventorySlot : inventorySlot;
+            gameMode.handleCreativeModeItemAdd(new ItemStack(item, 64), menuSlot);
+        }
     }
 
     /**
@@ -777,11 +876,28 @@ public class BaritoneOrchestratorAddonClient {
         } else if ("explore".equals(activeInstructionKind) && !baritone.getExploreProcess().isActive()) {
             finishActiveInstruction("failed");
         } else if ("mine".equals(activeInstructionKind) || "build".equals(activeInstructionKind)) {
+            if (pendingSchematic != null) {
+                // Build no criativo esperando os itens entrarem no inventário
+                // (ver `giveMissingCreativeItems`) — solta o builder quando
+                // estiverem lá, ou depois da carência.
+                pendingSchematicTicks++;
+                LocalPlayer player = baritone.getPlayerContext().player();
+                if ((player != null && inventoryHasAll(player, pendingSchematicItems))
+                        || pendingSchematicTicks > CREATIVE_WAIT_TICKS) {
+                    baritone.getBuilderProcess().build("orchestrator", pendingSchematic, pendingSchematicOrigin);
+                    pendingSchematic = null;
+                    pendingSchematicItems = null;
+                }
+                sendInstructionStatus("active", null);
+                return;
+            }
             if (baritone.getBuilderProcess().isActive()) {
                 schematicStarted = true;
                 // O BuilderProcess não expõe contagem de blocos/andamento, então
-                // reporta ativo sem fração em vez de inventar um número.
-                sendInstructionStatus("active", null);
+                // reporta sem fração em vez de inventar um número. Pausado =
+                // faltou material (`Missing materials` no chat do jogo) — melhor
+                // um "pausado" honesto do que um "ativo" que nunca anda.
+                sendInstructionStatus(baritone.getBuilderProcess().isPaused() ? "paused" : "active", null);
             } else if (schematicStarted) {
                 finishActiveInstruction("done");
             } else if (++schematicWaitTicks > SCHEMATIC_START_GRACE_TICKS) {
@@ -804,6 +920,9 @@ public class BaritoneOrchestratorAddonClient {
         exploreWaypointIndex = 0;
         schematicStarted = false;
         schematicWaitTicks = 0;
+        pendingSchematic = null;
+        pendingSchematicItems = null;
+        pendingSchematicTicks = 0;
     }
 
     /** `progress` só vai no JSON quando existe — ver `addon_socket.rs`. */
