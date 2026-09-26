@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, CHUNKS_PER_REFRESH, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
-
+import { Viewer3D, CHUNKS_PER_REFRESH, type BotPos, type BotPose, type ChunkPos, type UvRect } from "./viewer3d";
 interface TextureAtlas {
   image_data_url: string;
   textures: Record<string, UvRect>;
@@ -20,6 +19,12 @@ interface WorldSummary {
   bot_pos?: BotPos;
 }
 
+/** Skin real do jogador (comando `player_skin`, ver `player_skin.rs`). */
+interface PlayerSkin {
+  name: string;
+  model: string;
+  image_data_url: string;
+}
 type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed" | "Canceled";
 type InstructionKind =
   | "Explore"
@@ -348,13 +353,14 @@ function requestChunk(pos: ChunkPos) {
 }
 
 async function refreshState() {
-  const [status, world, chunks, queue, totals, vitals] = await Promise.all([
+  const [status, world, chunks, queue, totals, vitals, skin] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
     invoke<ChunkPos[]>("world_chunks"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
+    invoke<PlayerSkin | null>("player_skin"),
   ]);
 
   lastBotPos = world.bot_pos ?? null;
@@ -374,10 +380,14 @@ async function refreshState() {
         .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
         .catch((err) => console.warn("[atlas] ainda indisponível:", err));
     }
+    // Sem o jogo aberto o `bot_pos` do Rust volta a ser `None` — esconde o
+    // modelo aqui (o polling de `bot_pose` faria o mesmo em 250ms, mas isso
+    // mantém a garantia explícita de nunca ficar congelado na última pose).
+    if (!world.bot_pos) viewer3d.setBotPose(null);
 
-    // Sempre chamado: com o jogo fechado o `bot_pos` do Rust volta a ser
-    // `None`, e sem isso o marcador ficaria congelado na última posição.
-    viewer3d.setBotPos(world.bot_pos ?? null);
+    // A skin real (ou `null` enquanto o addon não mandou) — o viewer mostra o
+    // modelo sem textura em vez de inventar uma skin.
+    viewer3d.setPlayerSkin(skin ? { model: skin.model, imageDataUrl: skin.image_data_url } : null);
 
     // Voxels são buscados aos poucos: montar malha é CPU na thread
     // principal, então um backfill de centenas de chunks numa tacada
@@ -401,6 +411,19 @@ async function refreshState() {
 // há push do backend pro frontend ainda, então isso é polling, não streaming.
 const REFRESH_INTERVAL_MS = 1000;
 
+// 250ms = mesma cadência do envio de `position` do addon (4x/s). A pose anda
+// em intervalo próprio porque no polling de 1s o modelo andaria em saltos; o
+// payload é minúsculo (5 números), então não pesa.
+const POSE_INTERVAL_MS = 250;
+
+async function refreshPose() {
+  try {
+    viewer3d?.setBotPose(await invoke<BotPose | null>("bot_pose"));
+  } catch (err) {
+    console.error("[bot_pose]", err);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   bootstrapRail();
   bootstrapTitlebar();
@@ -412,4 +435,6 @@ window.addEventListener("DOMContentLoaded", () => {
 
   refreshState();
   setInterval(refreshState, REFRESH_INTERVAL_MS);
+  refreshPose();
+  setInterval(refreshPose, POSE_INTERVAL_MS);
 });
