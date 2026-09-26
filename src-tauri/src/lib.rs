@@ -1,6 +1,7 @@
 mod addon_socket;
 mod instructions;
 mod items;
+mod mobs;
 mod player_skin;
 mod schematic;
 mod settings;
@@ -56,6 +57,10 @@ pub(crate) struct AppState {
     /// Skin real do jogador (PNG), mandada pelo addon quando muda — ver
     /// `player_skin.rs`.
     pub(crate) player_skin: Mutex<Option<player_skin::PlayerSkin>>,
+    /// Último snapshot dos mobs vivos ao redor do jogador (`entities`, ver
+    /// `mobs.rs`). `None` = o addon não mandou nada nesta conexão (a UI não
+    /// mostra painel); `Some` com lista vazia = varreu e não achou nada.
+    pub(crate) mobs: Mutex<Option<mobs::MobSnapshot>>,
     /// Versão do Minecraft reportada no `hello` do addon — usada pra achar
     /// o client jar certo em `texture_atlas.rs`. Real, não hardcoded: se o
     /// addon nunca conectou ainda, isso fica `None` e o comando do atlas
@@ -465,6 +470,15 @@ mod commands {
         state.player_skin.lock().unwrap().clone()
     }
 
+    /// Snapshot dos mobs vivos ao redor do bot (comando `nearby_mobs`), com o
+    /// raio varrido reportado pelo addon — ver `mobs.rs`. `None` = o addon
+    /// ainda não mandou `entities` (painel escondido); lista vazia é resposta
+    /// real ("nenhum mob no raio").
+    #[tauri::command]
+    fn nearby_mobs(state: State<AppState>) -> Option<mobs::MobSnapshot> {
+        state.mobs.lock().unwrap().clone()
+    }
+
     /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco a
     /// partir do client jar que o usuário já tem instalado — nunca baixa
     /// nada. Precisa saber a versão do MC, que só existe depois que o addon
@@ -532,6 +546,7 @@ mod commands {
             bot_pose,
             world_time,
             player_skin,
+            nearby_mobs,
             get_texture_atlas,
             settings_get,
             settings_set,

@@ -9,6 +9,8 @@ import {
   type ChunkPos,
   type UvRect,
   type EditMode,
+  type MobCategory,
+  type NearbyMob,
 } from "./viewer3d";
 
 interface TextureAtlas {
@@ -87,6 +89,13 @@ interface Vitals {
   armor_points: number;
   armor_pieces: (ArmorPiece | null)[];
   active_effects: { name: string; duration_ticks: number; amplifier: number }[];
+}
+
+/** Snapshot dos mobs vivos ao redor do bot (comando `nearby_mobs`, ver
+ *  `src-tauri/src/mobs.rs`). `radius` é o raio realmente varrido pelo addon. */
+interface MobSnapshot {
+  radius: number;
+  mobs: NearbyMob[];
 }
 
 /* ---------- Helpers ---------- */
@@ -661,6 +670,83 @@ function renderHud(vitals: Vitals | null) {
   `;
 }
 
+/* ---------- Mobs ao redor do bot ---------- */
+
+const MOB_CATEGORY_LABEL: Record<MobCategory, string> = {
+  hostile: "hostil",
+  neutral: "neutro",
+  passive: "passivo",
+  other: "outro",
+};
+
+/** Teto de linhas do painel — o resto vira "+N" (o snapshot tem até 64 mobs;
+ *  a lista inteira cobriria o viewer). */
+const MOB_PANEL_LIMIT = 6;
+
+/** Nomes de mob vêm do jogo (inclusive nome customizado de name tag), então
+ *  não podem virar HTML no `innerHTML` do painel. */
+function escapeHtml(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] ?? ch
+  );
+}
+
+/** Painel do viewer com os mobs do snapshot (`nearby_mobs`): hostis primeiro,
+ *  depois por distância. `null` = o addon nunca mandou `entities` — o painel
+ *  some em vez de fingir uma lista vazia ("sem dados" ≠ "varreu e não achou").
+ */
+function renderMobs(snapshot: MobSnapshot | null) {
+  let panel = $<HTMLElement>("#mob-panel");
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.id = "mob-panel";
+    panel.className = "mob-panel";
+    $("#viewer-canvas").appendChild(panel);
+  }
+
+  if (!snapshot) {
+    panel.style.display = "none";
+    return;
+  }
+  panel.style.display = "flex";
+
+  if (snapshot.mobs.length === 0) {
+    panel.innerHTML = `
+      <div class="mob-panel-header">
+        <span class="title">mobs</span>
+        <span class="count mono">0</span>
+      </div>
+      <span class="mob-empty">Nenhum mob num raio de ${Math.round(snapshot.radius)} blocos.</span>
+    `;
+    return;
+  }
+
+  const ordered = [...snapshot.mobs].sort(
+    (a, b) =>
+      Number(b.category === "hostile") - Number(a.category === "hostile") || a.distance - b.distance
+  );
+  const shown = ordered.slice(0, MOB_PANEL_LIMIT);
+  const hostiles = snapshot.mobs.filter((mob) => mob.category === "hostile").length;
+  panel.innerHTML = `
+    <div class="mob-panel-header">
+      <span class="title">mobs</span>
+      <span class="count mono">${snapshot.mobs.length}${hostiles > 0 ? ` · ${hostiles} hostis` : ""}</span>
+    </div>
+    ${shown
+      .map(
+        (mob) => `
+      <div class="mob-row ${mob.category}" title="${escapeHtml(mob.kind)}">
+        <span class="dot"></span>
+        <span class="name">${escapeHtml(mob.name)}</span>
+        <span class="meta mono">${MOB_CATEGORY_LABEL[mob.category]} · ${Math.round(mob.distance)} m</span>
+      </div>`
+      )
+      .join("")}
+    ${ordered.length > shown.length ? `<span class="mob-more mono">+${ordered.length - shown.length} mobs</span>` : ""}
+  `;
+}
+
 /* ---------- Bootstrap ---------- */
 
 let viewer3d: Viewer3D | null = null;
@@ -686,13 +772,14 @@ function requestChunk(pos: ChunkPos) {
 }
 
 async function refreshState() {
-  const [status, world, queue, totals, vitals, skin, worldTime] = await Promise.all([
+  const [status, world, queue, totals, vitals, skin, mobs, worldTime] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
     invoke<PlayerSkin | null>("player_skin"),
+    invoke<MobSnapshot | null>("nearby_mobs"),
     invoke<number | null>("world_time"),
   ]);
 
@@ -722,6 +809,10 @@ async function refreshState() {
     // A skin real (ou `null` enquanto o addon não mandou) — o viewer mostra o
     // modelo sem textura em vez de inventar uma skin.
     viewer3d.setPlayerSkin(skin ? { model: skin.model, imageDataUrl: skin.image_data_url } : null);
+
+    // Mobs ao redor do bot: o snapshot alimenta o painel (hostis primeiro,
+    // distância). Os marcadores no mundo andam em `refreshPose`, na cadência
+    // do addon — aqui é só o resumo de 1s.
 
     // Hora real do mundo pro ciclo de dia/noite. `null` (jogo fechado, logo
     // após abrir) não zera nada: o viewer congela na última hora real.
@@ -766,6 +857,7 @@ async function refreshState() {
     }
   }
   renderHud(vitals);
+  renderMobs(mobs);
   renderQueue(queue);
   renderStorage(totals);
 }
@@ -963,7 +1055,15 @@ function restartPolling() {
 
 async function refreshPose() {
   try {
-    viewer3d?.setBotPose(await invoke<BotPose | null>("bot_pose"));
+    const [pose, mobs] = await Promise.all([
+      invoke<BotPose | null>("bot_pose"),
+      invoke<MobSnapshot | null>("nearby_mobs"),
+    ]);
+    viewer3d?.setBotPose(pose);
+    // Marcadores de mob na mesma cadência da pose (250ms = `position` e
+    // `entities` do addon): no polling de 1s os rótulos andariam aos pulos.
+    // `null`/lista vazia limpam os marcadores.
+    viewer3d?.setNearbyMobs(mobs?.mobs ?? []);
   } catch (err) {
     console.error("[bot_pose]", err);
   }
