@@ -30,7 +30,12 @@ interface ConnectionStatus {
 interface WorldSummary {
   chunks_explored: number;
   chunks_total_estimate: number;
-  bot_pos?: BotPos;
+  bot_pos?: BotPos | null;
+  /** Onde o bot foi visto por último — persistido em `world.json`
+   *  (`world_store.rs`) e usado como âncora com o jogo fechado, pra câmera não
+   *  abrir na origem enquanto o terreno explorado está a centenas de blocos
+   *  dali. */
+  last_bot_pos?: BotPos | null;
 }
 
 /** Skin real do jogador (comando `player_skin`, ver `player_skin.rs`). */
@@ -754,6 +759,10 @@ function renderMobs(snapshot: MobSnapshot | null) {
 let viewer3d: Viewer3D | null = null;
 /** Última posição do bot (do polling) — origem do "Explorar" no composer. */
 let lastBotPos: BotPos | null = null;
+/** Enquadramento offline já feito nesta sessão (ver `refreshState`): a câmera
+ * só é movida uma vez, na primeira resposta de estado sem bot — depois disso o
+ * usuário é dono da câmera. */
+let framedOfflineWorld = false;
 /** Chunks já pedidos e ainda não resolvidos — evita pedir de novo no próximo
  * refresh antes da resposta do anterior chegar. */
 const pendingChunks = new Set<string>();
@@ -785,7 +794,7 @@ async function refreshState() {
     invoke<number | null>("world_time"),
   ]);
 
-  lastBotPos = world.bot_pos ?? null;
+  lastBotPos = world.bot_pos ?? world.last_bot_pos ?? null;
   renderViewer(status, world);
 
   if (viewer3d) {
@@ -843,33 +852,55 @@ async function refreshState() {
     }
     viewer3d.setInstructionTargets(ghosts);
 
+    // Sem bot no jogo, a câmera abre onde ele foi visto por último — posição
+    // persistida junto do mundo (`world.json`). Sem isso o viewer orbitava a
+    // origem e o terreno explorado (longe de 0,0) ficava a centenas de blocos
+    // de distância, como uma ilha no horizonte. `!status.connected` evita
+    // enquadrar numa posição antiga um instante antes da pose real chegar.
+    if (!status.connected && !world.bot_pos && world.last_bot_pos && !framedOfflineWorld) {
+      framedOfflineWorld = true;
+      viewer3d.frameOn(world.last_bot_pos);
+    }
+
     // Prioridade: chunks ao redor do bot primeiro. O backend devolve os N
     // mais próximos já ordenados (`world_chunks_near`); antes disso o cache
     // inteiro vinha em ordem arbitrária de `HashMap` e o terreno ao redor do
-    // bot podia chegar por último. Com o jogo fechado (mundo em cache sendo
-    // navegado) a âncora passa a ser o ponto que a câmera orbita.
-    const anchor: ChunkPos = world.bot_pos
-      ? { x: world.bot_pos.x >> 4, z: world.bot_pos.z >> 4 }
-      : viewer3d.getFocusChunk();
-    try {
-      const chunks = await invoke<ChunkPos[]>("world_chunks_near", {
-        x: anchor.x,
-        z: anchor.z,
-        limit: NEARBY_CHUNK_LIMIT,
-      });
-      // Voxels são buscados aos poucos; a montagem em si já é orçada por
-      // frame no viewer (`drainMeshQueue`), então pedir vários por refresh
-      // não trava — só acelera o preenchimento ao redor do bot. O quanto é
-      // preferência da aba Config; o padrão do backend vale até ela responder.
-      let budget = settings?.chunks_per_refresh ?? CHUNKS_PER_REFRESH;
-      for (const pos of chunks) {
-        if (budget <= 0) break;
-        if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
-        requestChunk(pos);
-        budget--;
+    // bot podia chegar por último. Com o jogo fechado a âncora é onde o bot
+    // foi visto por último; o ponto que a câmera orbita entra sempre como
+    // segunda âncora, porque se o usuário afastou a câmera do bot o que está
+    // na frente dele também precisa carregar (a janela do viewer cobre as
+    // duas).
+    const anchors: ChunkPos[] = [];
+    const primary = world.bot_pos ?? world.last_bot_pos ?? null;
+    if (primary) anchors.push({ x: primary.x >> 4, z: primary.z >> 4 });
+    const focus = viewer3d.getFocusChunk();
+    if (!anchors.some((anchor) => anchor.x === focus.x && anchor.z === focus.z)) anchors.push(focus);
+
+    // Voxels são buscados aos poucos; a montagem em si já é orçada por frame
+    // no viewer (`drainMeshQueue`), então pedir vários por refresh não trava —
+    // só acelera o preenchimento ao redor do bot. O quanto é preferência da
+    // aba Config; o padrão do backend vale até ela responder.
+    let budget = settings?.chunks_per_refresh ?? CHUNKS_PER_REFRESH;
+    for (const anchor of anchors) {
+      if (budget <= 0) break;
+      try {
+        const chunks = await invoke<ChunkPos[]>("world_chunks_near", {
+          x: anchor.x,
+          z: anchor.z,
+          limit: NEARBY_CHUNK_LIMIT,
+        });
+        for (const pos of chunks) {
+          if (budget <= 0) break;
+          // Fora da janela do viewer o chunk seria buscado e descartado no
+          // sweep seguinte — não gasta o orçamento com ele.
+          if (!viewer3d.isChunkInWindow(pos.x, pos.z)) continue;
+          if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
+          requestChunk(pos);
+          budget--;
+        }
+      } catch (err) {
+        console.warn("[chunks] prioridade por distância indisponível:", err);
       }
-    } catch (err) {
-      console.warn("[chunks] prioridade por distância indisponível:", err);
     }
   }
   renderHud(vitals);

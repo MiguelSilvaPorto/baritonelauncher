@@ -12,20 +12,37 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
-- **App travava a cada gravação do mundo (justo quando o bot se move)**: o gravador periódico do
-  `world_store` fazia **tudo** — serializar, comprimir e escrever — segurando o lock do `WorldCache`.
-  Medido com o cache real desta máquina (19,6 MB crus, build debug): ~2,25 s só para serializar os
-  chunks + ~1,3 s de zlib. Enquanto isso, todo comando que toca o mundo (`world_summary`,
-  `world_chunks_near`, `chunk_voxels`) e o próprio handler do socket ficavam esperando o lock —
-  resultado: segundos de travamento a cada 5 s, exatamente enquanto o bot anda e chunks novos chegam
-  (o `world_revision` muda e dispara a gravação). Três correções: (1) cada chunk agora carrega o
-  próprio payload binário em cache, montado uma vez quando o chunk chega (`Chunk::encoded_payload`) —
-  o arquivo de cache já guarda exatamente esses bytes, então o load também não re-serializa nada;
-  (2) a compressão e a escrita saem do lock, numa thread de blocking (`spawn_blocking`), sobrando só o
-  memcpy de montar o arquivo (~92 ms medidos, 24× menos); (3) a compressão usa nível 1 (~0,46 s em vez
-  de ~1,3 s, +0,6 MB no arquivo). O fechamento continua gravando, sem reescrever quando nada mudou
-  (`LAST_SAVED_REVISION`). Reportado pelo usuário ("qualquer movimento... qualquer conclusão que meu
-  Minecraft conclui o meu app trava").
+- **FPS travado conforme o mundo explorado cresce**: todo chunk já visto ficava na cena pra sempre, e
+  o custo por frame (draw calls, triângulos, memória) crescia sem limite com a exploração — quanto
+  mais chunks apareciam na tela (zoom afastado), pior ficava, até travar. Agora o viewer mantém uma
+  **janela de chunks ao redor do bot e do alvo da câmera**: o que passa do raio só é escondido, o que
+  passa de uma margem de histerese é descartado (malha + voxels) e volta a ser pedido ao Rust quando
+  o chunk chega perto de novo. O custo por frame fica constante com o tamanho do mundo explorado, e o
+  fog fecha antes da borda da janela pra não aparecer um vazio sem neblina. A distância do horizonte
+  (aba Config) agora vai até 400 blocos, que é o teto do que o viewer mantém montado — acima disso o
+  ajuste não teria efeito visível. Reportado pelo usuário ("o fps fica estremamente travado quanto
+  mais chunks eu vejo").
+- **Travadas periódicas enquanto o bot explorava (gravação do mundo)**: a cada 5 segundos o app
+  reencodava e recomprimia o **cache inteiro** do mundo pra gravar em disco, segurando o cache num
+  mutex durante o processo — medido com o cache real desta máquina (19,6 MB crus, build debug): ~2,25 s
+  só para serializar os chunks + ~1,3 s de zlib; nesse tempo todo comando que toca o mundo
+  (`world_summary`, `world_chunks_near`, `chunk_voxels`) e o handler do socket ficavam esperando o
+  lock, exatamente enquanto o bot andava e chunks novos chegavam. Agora o mundo vive num **log
+  append-only** (`world.log`): cada chunk é gravado na hora em que chega, custando o tamanho do chunk
+  (não o do mundo), e registros antigos de chunks reescritos são recuperados por uma compactação
+  automática. Os metadados que mudam o tempo todo (versão do Minecraft e última posição do bot) foram
+  pra um JSON minúsculo (`world.json`). O cache antigo (`world.cache`, snapshot de arquivo único) é
+  importado na primeira abertura no formato novo e preservado no disco.
+- **Memória do backend crescia junto com o mundo**: os voxels de **todo** chunk já explorado ficavam
+  na memória do processo pra sempre. Agora só um conjunto de trabalho recente (2048 chunks) fica em
+  memória; o resto é lido do log sob demanda quando o viewer ou o editor pedem — dá pra explorar por
+  muito mais tempo sem o app inchar.
+- **Viewer abria longe de onde o usuário estava com o jogo fechado**: sem o bot conectado, a câmera
+  orbitava a origem (0,0) e o terreno explorado — que costuma estar a centenas ou milhares de blocos
+  dali — aparecia como uma ilhota distante. Agora a última posição do bot é persistida
+  (`world.json`, `last_bot_pos`) e o viewer abre enquadrado nela (e carrega o terreno ao redor dela),
+  sem esperar o jogo abrir. Reportado pelo usuário ("se meu boneco não tiver no jogo ele leva o meu
+  visualizador para muito distante de onde eu estava").
 - **Conexão do addon caindo no meio do tick derrubava o jogo com `NullPointerException`**: quando um
   envio falhava (app Rust fechado, socket derrubado), o fluxo ficava com `out = null` e os envios
   seguintes do *mesmo tick* (vitais, posição, skin, chunks, mobs) estouravam NPE na thread do cliente

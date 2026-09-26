@@ -54,7 +54,7 @@ impl SchematicDiff {
 /// Diferença entre o mundo real e a camada de edição. Posição de chunk
 /// desconhecido é ignorada: não dá pra afirmar o que tem lá e a instrução
 /// mentiria — o viewer também não deixa pintar onde não conhece o terreno.
-pub fn diff(world: &WorldCache, edits: &[BlockEdit]) -> SchematicDiff {
+pub fn diff(world: &mut WorldCache, edits: &[BlockEdit]) -> SchematicDiff {
     let mut result = SchematicDiff::default();
     for edit in edits {
         let pos = BlockPos {
@@ -149,9 +149,9 @@ mod tests {
 
     #[test]
     fn break_and_place_are_splitted_by_current_world_state() {
-        let world = world_with_terrain();
+        let mut world = world_with_terrain();
         let diff = diff(
-            &world,
+            &mut world,
             &[
                 edit(1, 0, 1, None),              // quebrar o stone
                 edit(2, 3, 2, Some("oak_planks")), // ar -> colocar
@@ -178,15 +178,15 @@ mod tests {
 
     #[test]
     fn unknown_chunk_edits_are_ignored() {
-        let world = world_with_terrain();
-        let diff = diff(&world, &[edit(1000, 5, 1000, Some("stone"))]);
+        let mut world = world_with_terrain();
+        let diff = diff(&mut world, &[edit(1000, 5, 1000, Some("stone"))]);
         assert!(diff.is_empty(), "edição fora de chunk conhecido não gera instrução");
     }
 
     #[test]
     fn placing_into_air_never_breaks() {
-        let world = world_with_terrain();
-        let diff = diff(&world, &[edit(5, 5, 5, Some("stone"))]);
+        let mut world = world_with_terrain();
+        let diff = diff(&mut world, &[edit(5, 5, 5, Some("stone"))]);
         assert!(diff.break_blocks.is_empty());
         assert_eq!(diff.build_blocks.len(), 1);
     }

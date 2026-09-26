@@ -6,6 +6,12 @@
 //! bioma por coluna (`ChunkTints`), que é o que faz grama/folhagem/água terem a
 //! cor real do bioma no viewer.
 //!
+//! O mundo é cumulativo e cresce sem limite, então os voxels vivem no log em
+//! disco (`world_store.rs`) e só um set de trabalho (`HOT_CHUNK_LIMIT`) fica
+//! em memória, carregado sob demanda (`ensure_hot`). O que o viewer/editor pede
+//! de um chunk fora do set é lido do log na hora — a memória do app não cresce
+//! junto com a exploração.
+//!
 //! A mesma codificação binária trafega do addon pro Rust e do Rust pro
 //! frontend (`encode_voxels`/`decode_voxels`) — um formato só, documentado em
 //! `mod-addon/README.md`.
@@ -196,18 +202,65 @@ impl Chunk {
 
 #[derive(Debug, Default)]
 pub struct WorldCache {
+    /// Set de trabalho: chunks com os voxels em memória. O mundo inteiro vive
+    /// no log em disco (`world_store.rs`) e só este conjunto (limitado por
+    /// `HOT_CHUNK_LIMIT`) fica carregado — ver `ensure_hot`.
     pub chunks: HashMap<ChunkPos, Chunk>,
+    /// Último uso de cada chunk do set (`use_counter` crescente) — decide quem
+    /// sai quando o set passa do teto.
+    hot_last_used: HashMap<ChunkPos, u64>,
+    use_counter: u64,
+    /// Log em disco. `None` = cache só em memória (testes e usos pontuais).
+    store: Option<crate::world_store::WorldStore>,
     /// Trechos de água/lava já testados, ver `CrossingStrategy`.
     pub crossing_hints: HashMap<BlockPos, CrossingStrategy>,
 }
+
+/// Quantos chunks ficam com os voxels na memória ao mesmo tempo. O mundo
+/// explorado é cumulativo (cresce sem limite), mas quase todo ele só é
+/// desenhado de novo quando o bot/câmera volta pra perto — o que não cabe
+/// aqui é lido do log sob demanda (`world_store.rs`). É o que impede a
+/// memória do app de crescer junto com o mundo.
+const HOT_CHUNK_LIMIT: usize = 2048;
 
 impl WorldCache {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Cache persistente: os chunks vão pro log (`data_dir/world.log`) e o
+    /// set em memória é limitado. Usado pelo app; `new()` fica pros testes.
+    pub fn open(data_dir: &std::path::Path) -> Result<Self, String> {
+        Ok(Self {
+            store: Some(crate::world_store::WorldStore::open(data_dir)?),
+            ..Self::default()
+        })
+    }
+
     pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+        match &self.store {
+            Some(store) => store.len(),
+            None => self.chunks.len(),
+        }
+    }
+
+    /// Importa o cache antigo (`world.cache`, snapshot único) pro log novo,
+    /// uma vez — ver `world_store::import_legacy_cache`. Devolve a versão do
+    /// Minecraft que veio nele, se havia.
+    pub fn import_legacy_cache(&mut self, data_dir: &std::path::Path) -> Result<Option<String>, String> {
+        match &mut self.store {
+            Some(store) => crate::world_store::import_legacy_cache(data_dir, store),
+            None => Ok(None),
+        }
+    }
+
+    /// Posições de todos os chunks conhecidos (memória + disco) — o que
+    /// `world_chunks`/`world_chunks_near` usam.
+    pub fn positions(&self) -> Vec<ChunkPos> {
+        match &self.store {
+            Some(store) => store.positions().collect(),
+            None => self.chunks.keys().copied().collect(),
+        }
     }
 
     pub fn mark_dirty(&mut self, pos: ChunkPos) {
@@ -219,11 +272,9 @@ impl WorldCache {
     /// Substitui o conteúdo do chunk por um snapshot completo (o addon manda
     /// o chunk inteiro no load). Sem merge: se o chunk for reenviado (ex:
     /// recarregado depois de sair e voltar ao render distance), o snapshot
-    /// Substitui o conteúdo do chunk por um snapshot completo (o addon manda
-    /// o chunk inteiro no load). Sem merge: se o chunk for reenviado (ex:
-    /// recarregado depois de sair e voltar ao render distance), o snapshot
-    /// novo manda. O payload binário é montado aqui, por chunk — assim a
-    /// gravação do mundo (`world_store.rs`) só copia bytes prontos.
+    /// novo manda. O payload binário é montado aqui, por chunk — ele vai pro
+    /// log na hora (o custo é o tamanho do chunk, não o do mundo) e fica
+    /// cacheado no `Chunk` pro IPC.
     pub fn apply_voxels(
         &mut self,
         pos: ChunkPos,
@@ -231,14 +282,18 @@ impl WorldCache {
         tints: Option<ChunkTints>,
     ) {
         let payload = encode_voxels(&sections, tints.as_ref());
+        if let Some(store) = &mut self.store {
+            if let Err(err) = store.write_payload(pos, &payload) {
+                eprintln!("[world_store] falha ao gravar chunk ({}, {}): {err}", pos.x, pos.z);
+            }
+        }
         let chunk = self.chunks.entry(pos).or_default();
         chunk.set_sections(sections, tints, Some(payload));
-        chunk.dirty = true;
+        self.touch(pos);
     }
 
-    /// Igual a `apply_voxels`, mas recebe o payload já pronto (o arquivo de
-    /// cache guarda exatamente esses bytes) — evita re-serializar o mundo
-    /// inteiro ao carregar do disco.
+    /// Igual a `apply_voxels`, mas recebe o payload já pronto (o log guarda
+    /// exatamente esses bytes) — evita re-serializar o chunk ao ler do disco.
     pub fn apply_voxels_with_payload(
         &mut self,
         pos: ChunkPos,
@@ -248,13 +303,15 @@ impl WorldCache {
     ) {
         let chunk = self.chunks.entry(pos).or_default();
         chunk.set_sections(sections, tints, Some(payload));
-        chunk.dirty = true;
+        self.touch(pos);
     }
 
     /// Payload binário de um chunk pro frontend (mesmo formato do addon, ver
-    /// `encode_voxels`). Vazio se o chunk não existe neste cache — o viewer
-    /// trata isso como "ainda não pronto", não como chunk vazio.
-    pub fn chunk_voxels_bytes(&self, pos: ChunkPos) -> Vec<u8> {
+    /// `encode_voxels`). Vazio se o chunk não existe — o viewer trata isso
+    /// como "ainda não pronto", não como chunk vazio. Chunk fora do set de
+    /// trabalho é lido do log e devolvido sem inflar a memória.
+    pub fn chunk_voxels_bytes(&mut self, pos: ChunkPos) -> Vec<u8> {
+        self.ensure_hot(pos);
         match self.chunks.get(&pos) {
             Some(chunk) => chunk.encoded_payload().to_vec(),
             None => Vec::new(),
@@ -265,11 +322,13 @@ impl WorldCache {
     /// (diferente de ar); seção ausente num chunk carregado = ar, como no
     /// jogo. É o que o diff do editor de schematic (`schematic.rs`) usa pra
     /// saber o que existe de verdade antes de gerar a instrução.
-    pub fn block_at(&self, pos: BlockPos) -> Option<&str> {
-        let chunk = self.chunks.get(&ChunkPos {
+    pub fn block_at(&mut self, pos: BlockPos) -> Option<&str> {
+        let chunk_pos = ChunkPos {
             x: pos.x >> 4,
             z: pos.z >> 4,
-        })?;
+        };
+        self.ensure_hot(chunk_pos);
+        let chunk = self.chunks.get(&chunk_pos)?;
         // `>>` com sinal: -1 >> 4 = -1 (seção -1), igual à divisão do jogo.
         let Some(section) = chunk.sections.iter().find(|s| s.y as i32 == pos.y >> 4) else {
             return Some("air");
@@ -280,6 +339,53 @@ impl WorldCache {
             .get(index)
             .and_then(|slot| section.palette.get(*slot as usize));
         Some(entry.map(|e| e.block.as_str()).unwrap_or("air"))
+    }
+}
+
+impl WorldCache {
+    /// Garante que os voxels de um chunk estão na memória (lê do log se
+    /// preciso) e move o chunk pro fim da fila de uso.
+    fn ensure_hot(&mut self, pos: ChunkPos) {
+        if self.chunks.contains_key(&pos) {
+            self.touch(pos);
+            return;
+        }
+        let Some(store) = &mut self.store else {
+            return;
+        };
+        let payload = match store.read_payload(pos) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return,
+            Err(err) => {
+                eprintln!("[world_store] falha ao ler chunk ({}, {}): {err}", pos.x, pos.z);
+                return;
+            }
+        };
+        match decode_voxels(&payload) {
+            Ok(decoded) => {
+                self.apply_voxels_with_payload(pos, decoded.sections, decoded.tints, payload);
+            }
+            Err(err) => eprintln!(
+                "[world_store] payload inválido do chunk ({}, {}): {err}",
+                pos.x, pos.z
+            ),
+        }
+    }
+
+    fn touch(&mut self, pos: ChunkPos) {
+        if self.store.is_none() {
+            return; // sem log: tudo vive em memória, nada a evictar
+        }
+        self.use_counter += 1;
+        self.hot_last_used.insert(pos, self.use_counter);
+        while self.chunks.len() > HOT_CHUNK_LIMIT {
+            let Some((&oldest, _)) = self.hot_last_used.iter().min_by_key(|(_, used)| **used)
+            else {
+                break;
+            };
+            self.hot_last_used.remove(&oldest);
+            self.chunks.remove(&oldest);
+        }
     }
 }
 
@@ -537,6 +643,9 @@ pub struct WorldSummary {
     pub chunks_explored: u32,
     pub chunks_total_estimate: u32,
     pub bot_pos: Option<BlockPos>,
+    /// Onde o bot foi visto por último (persistido em `world.json`) — a âncora
+    /// do viewer quando o jogo está fechado. `None` = nunca conectou.
+    pub last_bot_pos: Option<BlockPos>,
 }
 
 #[cfg(test)]
