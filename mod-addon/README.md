@@ -28,10 +28,20 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   modificador de bioma que o jogo usa no render, então cada bioma aparece com
   a cor real. A fila drena poucos chunks por tick pra um backfill de reconexão
   não travar o jogo.
+- Varre as criaturas vivas num raio de 32 blocos (~4x/s, mesma cadência da
+  posição) e manda um snapshot `entities`: id de rede, tipo de registro
+  (`zombie`, `cow`...), nome já localizado pelo client, categoria
+  (`hostile`/`neutral`/`passive`/`other`, classificada por `NeutralMob`/
+  `Enemy`/`MobCategory`), posição, distância, vida e altura da hitbox. É o que
+  deixa o viewer identificar cada mob ao redor; jogadores ficam de fora e a
+  lista é o estado atual, não um delta. Nenhuma *reação* a isso ainda (o
+  `SurvivalProcess` do spec continua pendente).
 - Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
   "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
-  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
-  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios); a
+  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`), `explore` (nativo via
+  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios) e
+  `mine`/`build` do editor de schematic (`IBuilderProcess.build` com um
+  schematic esparso das posições — ver `OrchestratorSchematic`); a
   leitura roda numa thread própria e a execução acontece na thread do cliente.
 - Reconecta sozinho (a cada 5s) se o app Rust não estiver rodando ainda — não
   trava nem falha o carregamento do mod.
@@ -52,16 +62,23 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 - **Propriedades de blockstate** — o payload manda só o nome do bloco (`oak_stairs`), não o estado
   (`oak_stairs[facing=north,half=bottom]`); escada, laje e cerca aparecem como cubo cheio no viewer.
 - Índice de baús (`StorageIndex`).
-- `SurvivalProcess`/detecção de ameaça, simulação de `ContainerScreen` pra
-  crafting/fundição — tudo isso ainda é só o que está descrito em `docs/SPEC.md`.
+- `SurvivalProcess` (reagir às ameaças — a varredura de mobs já existe, ver
+  acima — e a simulação de `ContainerScreen` pra crafting/fundição) — tudo
+  isso ainda é só o que está descrito em `docs/SPEC.md`.
 - `armor_pieces` (durabilidade por peça) e `active_effects` — o protocolo já
   reserva os campos do lado Rust, o addon só não manda ainda.
-- Instruções além de `travel_to`/`explore` — o canal reverso existe (ver
-  protocolo abaixo), mas `Mine`/`Build`/baú/craft ainda não têm executor aqui.
+- Instruções de baú/craft (`FetchFromChest`/`Craft`/`Smelt`) — o canal reverso
+  existe (ver protocolo abaixo) e `Mine`/`Build` já têm executor aqui, mas baú e
+  crafting ainda não.
 
 ## Protocolo do socket (v0)
 
 Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resumo:
+
+**Duas versões diferentes, não confundir:** "v0" é o **protocolo** (transporte, framing e o conjunto
+de mensagens, ainda o recorte mínimo deliberado do spec); "formato 3" é só o **payload binário** do
+`chunk_voxels` (paleta + flags + nível de fluido + tints de bioma). São números independentes e
+evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTOCOL.md).
 
 - TCP, `127.0.0.1:31173`, só loopback.
 - Uma mensagem JSON por linha (`\n`-delimited), sem framing binário — dá pra
@@ -86,17 +103,22 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
   real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
   client ou do resource pack/jar instalado, nunca baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
-  (paleta + índices por seção, **mais os tints de bioma por coluna**, deflate +
-  base64). Por entrada da paleta: `u8` flags (`1` renderizável, `2` oclusor,
-  `4` fluido) + `u8` nível do fluido (blockstate vanilla: `0` fonte, `1..7`
-  fluindo, `8+` caindo). Depois das seções: `u8` tem_tints e, se `1`,
-  `256×3` bytes de grama + `256×3` de folhagem + `256×3` de água (colunas
-  `x + z*16`, cor RGB). Os tints saem do `BiomeColors` do client — colormap,
-  override e modificador de bioma já aplicados, igual ao render do jogo —
-  amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o
-  viewer cai nas cores fixas). Layout completo em `world_cache.rs`,
-  `decode_voxels` (formato 3; **formato 2, sem tints, ainda é aceito na
-  leitura** pro `world.cache` antigo).
+  (paleta + índices + luz por seção, **mais os tints de bioma por coluna**, deflate + base64). Por
+  entrada da paleta: `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
+  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo). Depois dos índices de cada seção vêm
+  `u8[4096]` de **luz** do motor do jogo, um byte por posição (nibble baixo = luz de bloco, alto =
+  luz de céu; mesma ordem dos índices). Depois das seções: `u8` tem_tints e, se `1`, `256×3` bytes de
+  grama + `256×3` de folhagem + `256×3` de água (colunas `x + z*16`, cor RGB). Os tints saem do
+  `BiomeColors` do client — colormap, override e modificador de bioma já aplicados, igual ao render
+  do jogo — amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o viewer cai nas
+  cores fixas). Layout completo em `world_cache.rs`, `decode_voxels` (formato 4; **formatos 3 e 2,
+  sem luz, ainda são aceitos na leitura** pro `world.cache` antigo e pra addon desatualizado).
+- `{"type":"entities","radius":32.0,"entities":[{"id":42,"kind":"zombie","name":"Zumbi",
+  "category":"hostile","x":1.5,"y":64.0,"z":-3.25,"health":20.0,"max_health":20.0,"distance":6.2,
+  "height":1.95}, ...]}` — snapshot (~4x/s) das criaturas vivas no raio `radius` ao redor do
+  jogador, ordenadas por distância (teto de 64). `category` ∈ `hostile`/`neutral`/`passive`/`other`;
+  `name` já vem localizado pelo client e `distance`/`height` são medidos no jogo. É o estado atual,
+  não um delta — mob que saiu do raio simplesmente não aparece mais.
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
   estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
   do `travel_to` — `explore` é contínuo e não tem progresso).
@@ -111,7 +133,14 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
   (`style` = `circles` ou `zigzag`) — exploração com área definida: o addon gera os waypoints
   (passo entre faixas/anéis = render distance efetiva) e os percorre com `GoalXZ`, reportando
   progresso real; waypoint inalcançável é pulado. Sem `radius`/`style`, é o `explore` nativo acima.
-- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()`.
+- `{"type":"instruction","id":"i4","kind":"build","blocks":[{"x":10,"y":64,"z":-3,"block":"stone"}, …]}`
+  — posiciona blocos com `IBuilderProcess.build(nome, schematic, origem)`, com um schematic esparso
+  que cobre exatamente as posições da lista (`OrchestratorSchematic`). `mine` é o mesmo payload com
+  `"block":"air"`: o builder quebra o que estiver lá (o caminho do `clearArea`). Nome de bloco é o
+  path do registry sem namespace; nome desconhecido é ignorado (sem nenhum, a instrução falha). Sem
+  progresso medível, reporta `active` sem `progress` e fecha em `done`/`failed`.
+- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()` + `IBuilderProcess.onLostControl()`
+  (o builder não para só com o cancelamento do pathing).
 
 O recebimento roda numa thread leitora que só enfileira as linhas; a execução
 acontece na thread do cliente (`onClientTick`), onde a API do Baritone é segura.

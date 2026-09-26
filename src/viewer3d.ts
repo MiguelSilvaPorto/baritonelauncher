@@ -62,6 +62,33 @@ const SUN_DISTANCE = 300;
  * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
 const SKY_RADIUS = 3000;
 
+// Nuvens vanilla — porte do `CloudRenderer` do client: o padrão vem de
+// `textures/environment/clouds.png` (256×256 texels = uma célula por texel,
+// corte em alpha < 10), cada célula é uma caixa de 12×12×4 blocos com topo em
+// 192.33 (altura padrão do overworld), cor branca com alpha 0.8, sombreamento
+// por face e deriva de 0.6 bloco/s no X (+3.96 fixo no Z, como no jogo); o
+// padrão se repete a cada 3072 blocos. A cor acompanha o ciclo dia/noite
+// (`daylightFactor`); a altura ainda é sempre a do overworld, porque o addon
+// não manda a dimensão (ver "Known gaps").
+const CLOUD_CELL_SIZE = 12;
+const CLOUD_THICKNESS = 4;
+const CLOUD_HEIGHT = 192.33;
+const CLOUD_ALPHA = 0.8;
+const CLOUD_ALPHA_CUTOFF = 10;
+const CLOUD_DRIFT_PER_SECOND = 0.6;
+const CLOUD_Z_OFFSET = 3.96;
+const CLOUD_TEXTURE_PX = 256;
+const CLOUD_SHADE_TOP = 1;
+const CLOUD_SHADE_BOTTOM = 0.7;
+const CLOUD_SHADE_NORTH_SOUTH = 0.8;
+const CLOUD_SHADE_EAST_WEST = 0.9;
+/** Período do padrão de nuvens em blocos (256 células × 12 blocos). */
+const CLOUD_PERIOD_BLOCKS = CLOUD_CELL_SIZE * CLOUD_TEXTURE_PX;
+// Multiplicador noturno do jogo (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`):
+// as nuvens escurecem pra um azul quase preto quando não há sol.
+const CLOUD_NIGHT_COLOR = new THREE.Color(0.1, 0.1, 0.15);
+const CLOUD_DAY_COLOR = new THREE.Color(0xffffff);
+
 // Cores pré-alocadas do ciclo: `updateDayNight` roda por frame e não pode
 // alocar `THREE.Color` a cada chamada.
 const SKY_DAY_ZENITH = new THREE.Color(SKY_DAY.zenith);
@@ -88,11 +115,18 @@ const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso"
 const COLOR_AMBER = 0xf2b155;
 const MAX_EDIT_VOLUME = 50_000; // teto de blocos por operação de região (um clique só)
 
-// Clique vs. arrastar: o botão esquerdo orbita (OrbitControls) e também edita
-// (editor) ou escolhe o alvo da fila — só conta como clique se o ponteiro quase
-// não andou (um clique lento, mas parado, continua valendo).
+// Clique vs. arrastar: sem ferramenta o botão esquerdo orbita (OrbitControls) e
+// um clique parado escolhe o alvo da fila. Com ferramenta ativa o esquerdo é do
+// editor (o arrasto vira seleção de região — ver `handlePointerMove`), então o
+// mesmo limiar separa o clique do arrasto nos dois casos.
 const CLICK_MAX_MOVE_PX = 6;
 const CLICK_MAX_MS = 800;
+
+/** Alcance do DDA de picking, em voxels percorridos pelo raio. Passa da maior
+ * distância de fog (800, ver a aba Config) de propósito: com a câmera afastada
+ * do terreno o raio atravessa centenas de blocos de ar/vazio antes de achar o
+ * primeiro bloco carregado — ver `pickBlock`. */
+const RAY_MAX_STEPS = 1024;
 
 // Movimento por teclado ("voo" pela cena): o OrbitControls sozinho só responde
 // ao mouse, então qualquer deslocamento exigia arrastar/orbitar — e o alvo da
@@ -142,6 +176,14 @@ const BOT_FOLLOW_MAX_SPEED = 40; // blocos/s
 const BOT_TELEPORT_DISTANCE = 8; // blocos
 const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
 const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
+
+// Marcadores de mob (`nearby_mobs`): a posição chega 4x/s e é interpolada a
+// cada frame, como a pose do bot — sem isso os rótulos piscariam de posição
+// em posição. Um salto grande é teleporte (enderman) ou id reciclado: encaixa
+// direto em vez de deslizar pelo mapa.
+const MOB_FOLLOW_RATE = 10; // 1/s
+const MOB_TELEPORT_DISTANCE = 16; // blocos
+const MOB_LABEL_GAP = 0.4; // acima da hitbox do mob (que já tem altura própria)
 
 // Cores reais de bioma chegam no payload v3, por coluna (`ChunkTints`): grama,
 // folhagem e água com a mesma cor que o `BiomeColors` do jogo resolve pra
@@ -221,14 +263,43 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
  * `map`, então o valor não importa — só precisa existir. */
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
-// Flags/versão do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-// v3 = seções + tints de bioma por coluna; v2 (sem tints) ainda é aceito na
-// leitura pro `world.cache` gravado antes, e cai no fallback fixo.
-const VOXEL_FORMAT_VERSION = 3;
+// Versão/flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
+// v4 = seções (paleta + índices + luz) + tints de bioma por coluna; v3 (sem
+// luz) e v2 (sem nada disso) ainda são aceitos na leitura pros `world.cache`
+// gravados antes, caindo no dia cheio e nos tints fixos.
+const VOXEL_FORMAT_VERSION = 4;
+const VOXEL_FORMAT_VERSION_TINTS = 3;
 const VOXEL_FORMAT_VERSION_LEGACY = 2;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
+
+/** Luz: cada byte do payload carrega dois níveis 0–15 — nibble baixo = luz de
+ * bloco (tocha, lava, glowstone...), nibble alto = luz de céu, já propagados
+ * pelo motor de luz do próprio jogo (`LightLayer.BLOCK`/`SKY`). O viewer
+ * reamostra por canto de face (smooth lighting, como o jogo) e assa o
+ * resultado na cor do vértice — o terreno usa material sem luz dinâmica. */
+/** Fator do céu usado ao assar a luz do terreno: o material do terreno não
+ * tem luz dinâmica, então a luz de céu é multiplicada na hora da malha. Ele
+ * acompanha o ciclo dia/noite (`updateDayNight`) — de noite só tocha/lava
+ * seguem iluminando; o piso é o "luar" do jogo. */
+const SKY_LIGHT_NIGHT_FLOOR = 0.12;
+
+/** Curva de brilho do jogo (`LightTexture`): nível 15 = 1.0, queda suave
+ * até 0 (caverna sem tocha fica escura). */
+function lightCurve(level: number): number {
+  const f = level / 15;
+  return f / (4 - 3 * f);
+}
+
+/** Shading por direção da face, como no jogo: topo 1.0, norte/sul 0.8,
+ * leste/oeste 0.6, fundo 0.5. */
+function faceShade(face: FaceDef): number {
+  if (face.dir[1] > 0) return 1;
+  if (face.dir[1] < 0) return 0.5;
+  return face.dir[2] !== 0 ? 0.8 : 0.6;
+}
+
 
 /** Duração de cada frame das texturas animadas de fluido, em ms. O jogo lê
  * isso do `.mcmeta` de cada textura; aqui é fixo (aproximação honesta, ver
@@ -282,6 +353,27 @@ export interface BotPose {
   z: number;
   yaw: number;
   pitch: number;
+}
+
+/** Categoria do mob, classificada pelo addon a partir do tipo real do jogo —
+ *  ver `MobCategory` em `src-tauri/src/mobs.rs`. */
+export type MobCategory = "hostile" | "neutral" | "passive" | "other";
+
+/** Um mob vivo ao redor do bot (comando `nearby_mobs`, espelha `NearbyMob` em
+ *  `src-tauri/src/mobs.rs`). Posição em blocos (double), `distance` já é a
+ *  distância real até o jogador medida pelo addon na varredura. */
+export interface NearbyMob {
+  id: number;
+  kind: string;
+  name: string;
+  category: MobCategory;
+  x: number;
+  y: number;
+  z: number;
+  health: number;
+  max_health: number;
+  height: number;
+  distance: number;
 }
 
 export interface ChunkPos {
@@ -349,6 +441,9 @@ interface DecodedSection {
   y: number;
   palette: PaletteEntry[];
   indices: Uint16Array;
+  /** 4096 bytes, índice `x + z*16 + y*256`: nibble baixo = luz de bloco,
+   * nibble alto = luz de céu (0–15 cada) — ver `world_cache.rs`. */
+  light: Uint8Array;
 }
 
 /** Tints de bioma por coluna (payload v3): cor `0xRRGGBB` por coluna
@@ -371,6 +466,21 @@ interface DecodedChunk {
   sections: Map<number, DecodedSection>;
   /** Tints de bioma por coluna; `null` = chunk sem essa informação. */
   tints: ChunkTints | null;
+  /** Maior seção Y que veio no payload — acima dela o ar é céu cheio (ver
+   * `lightAt`). */
+  maxSectionY: number;
+}
+
+/** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido e
+ *  as posições desenhada (interpolada) e alvo — ver
+ *  `setNearbyMobs`/`updateMobs`. */
+interface MobMarker {
+  el: HTMLDivElement;
+  nameEl: HTMLSpanElement;
+  metaEl: HTMLSpanElement;
+  mob: NearbyMob;
+  target: THREE.Vector3;
+  position: THREE.Vector3;
 }
 
 /** Uma face do cubo, na ordem dos vértices em sentido anti-horário visto de
@@ -527,12 +637,16 @@ function byteReader(bytes: Uint8Array) {
   };
 }
 
-/** Decodifica o payload de `chunk_voxels` (formato 3, ver `world_cache.rs` —
- * v2, sem tints, ainda é aceito pro cache antigo). */
+/** Decodifica o payload de `chunk_voxels` (formato 4, ver `world_cache.rs` —
+ * v3, sem luz, e v2, sem luz nem tints, ainda são aceitos pro cache antigo). */
 function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
   const reader = byteReader(bytes);
   const version = reader.u8();
-  if (version !== VOXEL_FORMAT_VERSION && version !== VOXEL_FORMAT_VERSION_LEGACY) {
+  if (
+    version !== VOXEL_FORMAT_VERSION &&
+    version !== VOXEL_FORMAT_VERSION_TINTS &&
+    version !== VOXEL_FORMAT_VERSION_LEGACY
+  ) {
     throw new Error(`versão de payload desconhecida: ${version}`);
   }
   const sectionCount = reader.u8();
@@ -551,11 +665,19 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
     }
     const indices = new Uint16Array(4096);
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
-    sections.set(y, { y, palette, indices });
+    const light = new Uint8Array(4096);
+    if (version >= VOXEL_FORMAT_VERSION) {
+      for (let idx = 0; idx < 4096; idx++) light[idx] = reader.u8();
+    } else {
+      // Payload antigo (v2/v3) não tem luz: dia cheio, como o viewer
+      // desenhava antes de existir luz de verdade.
+      light.fill(0xf0);
+    }
+    sections.set(y, { y, palette, indices, light });
   }
 
   let tints: ChunkTints | null = null;
-  if (version === VOXEL_FORMAT_VERSION) {
+  if (version >= VOXEL_FORMAT_VERSION_TINTS) {
     const hasTints = reader.u8();
     if (hasTints === 1) {
       const readColumns = () => {
@@ -573,7 +695,15 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
       throw new Error(`flag de tints inválida: ${hasTints}`);
     }
   }
-  return { x, z, sections, tints };
+
+  const sectionYs = Array.from(sections.keys());
+  return {
+    x,
+    z,
+    sections,
+    tints,
+    maxSectionY: sectionYs.length > 0 ? Math.max(...sectionYs) : 0,
+  };
 }
 
 export class Viewer3D {
@@ -618,6 +748,16 @@ export class Viewer3D {
   private lastPoseAtMs = 0;
   private botYaw = 0;
   private botPitch = 0;
+
+  /** Rótulos dos mobs vivos ao redor (comando `nearby_mobs`), chave = id de
+   *  rede da entidade — ver `setNearbyMobs`. */
+  private readonly mobMarkers = new Map<number, MobMarker>();
+  /** Camada dos rótulos de mob — mesmo padrão do `bot-label` (HTML projetado
+   *  por cima do canvas), um elemento por mob. */
+  private readonly mobLayer: HTMLDivElement;
+  /** Scratch da projeção dos rótulos (`updateMobLabels`) — evita alocar um
+   *  `Vector3` por mob por frame. */
+  private readonly mobScratch = new THREE.Vector3();
 
   private labelEl: HTMLDivElement;
 
@@ -674,6 +814,20 @@ export class Viewer3D {
   private selectionA: BlockPos | null = null;
   private selectionB: BlockPos | null = null;
   private hovered: PickedBlock | null = null;
+  /** Última posição do ponteiro sobre o canvas — o realce é recalculado
+   * quando a câmera se move (`handleCameraChange`), não só quando o mouse
+   * anda: com o damping, a cena continua andando depois do arrasto e o cubo
+   * de preview ficava apontando pra um bloco que não era mais o do clique. */
+  private lastPointer: { x: number; y: number } | null = null;
+  /** Arrasto de seleção em andamento (ferramenta "select"): `anchor` é o
+   * canto fixo, o oposto segue o cursor até soltar — ver `handlePointerMove`. */
+  private selectionDrag: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    anchor: BlockPos;
+    dragging: boolean;
+  } | null = null;
   /** Cubo de arame do bloco sob o cursor / destino da colocação. */
   private hoverHelper: THREE.LineSegments;
   /** Cubo de arame da região selecionada (âmbar = planejado). */
@@ -709,12 +863,12 @@ export class Viewer3D {
   private faceRenderCache = new Map<string, FaceRender | null>();
   /** Material do terreno opaco: um só pra tudo, com UV apontando pro tile
    * certo do atlas por face e cor por vértice (tint). */
-  private opaqueMaterial: THREE.MeshStandardMaterial | null = null;
+  private opaqueMaterial: THREE.MeshBasicMaterial | null = null;
   /** Material por bucket de fluido (`water_still`, `water_flow`,
    * `lava_still`, `lava_flow`). */
-  private bucketMaterials = new Map<string, THREE.MeshStandardMaterial>();
+  private bucketMaterials = new Map<string, THREE.MeshBasicMaterial>();
   /** Materiais com textura animada + seus frames, pra trocar o `map`. */
-  private animatedMaterials: { material: THREE.MeshStandardMaterial; frames: THREE.Texture[] }[] = [];
+  private animatedMaterials: { material: THREE.MeshBasicMaterial; frames: THREE.Texture[] }[] = [];
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
@@ -722,6 +876,17 @@ export class Viewer3D {
   private readonly linearColorCache = new Map<number, [number, number, number]>();
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
+  /** Layer de nuvens (3×3 tiles do padrão) — `null` até o PNG do jar chegar. */
+  private cloudGroup: THREE.Group | null = null;
+  /** Material compartilhado pelos 9 tiles — a cor é retintada por dia/noite
+   * em `updateClouds` (`daylightFactor`). */
+  private cloudMaterial: THREE.MeshBasicMaterial | null = null;
+  /** Base do relógio da deriva das nuvens (o jogo mede em ticks; aqui é o
+   * tempo real desde a primeira textura de nuvens carregada). */
+  private cloudStartMs = 0;
+  /** Fator 0..1 de luz do dia, calculado em `updateDayNight` — as nuvens usam
+   * pra escurecer à noite como no jogo. */
+  private daylightFactor = 1;
   /** Canvas/textura do gradiente do domo — `paintSky` redesenha os dois. */
   private skyCanvas: HTMLCanvasElement | null = null;
   private skyTexture: THREE.CanvasTexture | null = null;
@@ -737,11 +902,20 @@ export class Viewer3D {
   private readonly dayNightA = new THREE.Color();
   private readonly dayNightB = new THREE.Color();
   private readonly dayNightC = new THREE.Color();
+  /** Fator de luz de céu já assado na malha atual — acompanha o dia/noite
+   * (ver `updateDayNight`). */
+  private bakedSkyFactor = 1;
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
     this.labelEl = labelEl;
     this.targetEl = targetEl;
+
+    // Camada dos rótulos de mob: filha do mesmo overlay do `bot-label` — o
+    // canvas (e o container) troca entre viewer/editor, o overlay não.
+    this.mobLayer = document.createElement("div");
+    this.mobLayer.className = "mob-layer";
+    (labelEl.parentElement ?? container).appendChild(this.mobLayer);
 
     this.scene = new THREE.Scene();
     this.fog = new THREE.Fog(SKY_DAY.horizon, FOG_NEAR_BASE, FOG_FAR_BASE);
@@ -773,7 +947,10 @@ export class Viewer3D {
     this.controls.zoomToCursor = true; // a roda aproxima no ponto do cursor, não no centro do alvo
     this.controls.maxPolarAngle = Math.PI * 0.49; // não deixa virar de cabeça pra baixo
     // Botão do meio também vira `pan` (arrastar = mover): com `zoomToCursor`
-    // a roda já dá conta do dolly, e pan é o gesto que mais falta.
+    // a roda já dá conta do dolly, e pan é o gesto que mais falta. Com uma
+    // ferramenta do editor ativa `setEditMode` troca os botões: o esquerdo
+    // passa a ser do editor e a câmera orbita no direito — sem isso o clique
+    // de seleção/colocação também girava a câmera.
     this.controls.mouseButtons = {
       LEFT: THREE.MOUSE.ROTATE,
       MIDDLE: THREE.MOUSE.PAN,
@@ -786,18 +963,26 @@ export class Viewer3D {
     window.addEventListener("keyup", this.handleKeyUp);
     window.addEventListener("blur", this.clearKeys);
 
-    // Clique parado no terreno escolhe o destino; arrastar continua orbitando
-    // (o OrbitControls escuta os mesmos eventos, então nada de preventDefault
-    // aqui — a distinção é só o movimento/tempo). O mesmo clique vira edição
-    // quando há uma ferramenta do editor ativa — ver `handlePointerUp`.
+    // Clique parado no terreno escolhe o destino; arrastar orbita (o
+    // OrbitControls escuta os mesmos eventos, então nada de preventDefault
+    // aqui — a distinção é só o movimento/tempo). Com uma ferramenta do editor
+    // ativa o mesmo clique edita e o arrasto marca região — ver
+    // `handlePointerDown`/`handlePointerMove`.
     const canvas = this.renderer.domElement;
     canvas.addEventListener("pointerdown", this.handlePointerDown);
     canvas.addEventListener("pointerup", this.handlePointerUp);
+    canvas.addEventListener("pointercancel", this.handlePointerCancel);
     canvas.addEventListener("pointermove", this.handlePointerMove);
     canvas.addEventListener("pointerleave", () => {
+      this.lastPointer = null;
       this.hovered = null;
       this.hoverHelper.visible = false;
     });
+    // O realce segue a câmera, não só o mouse: o damping continua movendo a
+    // cena por alguns frames depois do arrasto (e a pose do bot move a câmera
+    // quando o jogo está conectado) — sem isso o preview apontava pra um bloco
+    // e o clique acontecia em outro.
+    this.controls.addEventListener("change", this.handleCameraChange);
 
     // Luzes do ciclo dia/noite — posição/intensidade/cor reais em
     // `updateDayNight` (o construtor só deixa a cena num dia neutro).
@@ -914,6 +1099,194 @@ export class Viewer3D {
     // Estado inicial (dia claro); `updateDayNight` repinta conforme a hora.
     this.paintSky(SKY_DAY_ZENITH, SKY_DAY_MID, SKY_DAY_HORIZON);
     return sky;
+  }
+
+  /** Monta o layer de nuvens a partir do PNG do jar (ver `texture_atlas.rs`):
+   * uma geometria com as caixas de todas as células do padrão, replicada em
+   * 3×3 tiles que compartilham a malha (o padrão é periódico — ver
+   * `updateClouds`), o que cobre a vista mesmo com o zoom afastado. */
+  private buildClouds(dataUrl: string | null) {
+    if (!dataUrl) return;
+    new THREE.TextureLoader().load(
+      dataUrl,
+      (texture) => {
+        const image = texture.image as HTMLImageElement | undefined;
+        if (!image) return;
+        const geometry = this.buildCloudGeometry(image);
+        if (!geometry) return;
+
+        const material = new THREE.MeshBasicMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: CLOUD_ALPHA,
+          depthWrite: false,
+        });
+        this.cloudMaterial = material;
+        const group = new THREE.Group();
+        for (let ix = -1; ix <= 1; ix++) {
+          for (let iz = -1; iz <= 1; iz++) {
+            const tile = new THREE.Mesh(geometry, material);
+            tile.position.set(ix * CLOUD_PERIOD_BLOCKS, 0, iz * CLOUD_PERIOD_BLOCKS);
+            group.add(tile);
+          }
+        }
+        if (this.cloudGroup) {
+          this.scene.remove(this.cloudGroup);
+          for (const child of this.cloudGroup.children) {
+            if (child instanceof THREE.Mesh) child.geometry.dispose();
+          }
+        }
+        this.cloudGroup = group;
+        this.scene.add(group);
+        this.updateClouds(performance.now());
+      },
+      undefined,
+      (err) => console.error("[viewer3d] falha ao carregar textura de nuvens:", err)
+    );
+  }
+
+  /** Caixas do padrão de nuvens a partir dos pixels do PNG: cada texel com
+   * alpha ≥ `CLOUD_ALPHA_CUTOFF` é uma célula; topo e base sempre, os lados só
+   * quando o vizinho (com wrap, como no `CloudRenderer`) é vazio. */
+  private buildCloudGeometry(image: HTMLImageElement): THREE.BufferGeometry | null {
+    const width = image.width;
+    const height = image.height;
+    if (width !== CLOUD_TEXTURE_PX || height !== CLOUD_TEXTURE_PX) {
+      console.warn(`[viewer3d] textura de nuvens inesperada: ${width}×${height}`);
+      return null;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(image, 0, 0);
+    const pixels = ctx.getImageData(0, 0, width, height).data;
+
+    const solid = new Uint8Array(width * height);
+    for (let i = 0; i < solid.length; i++) {
+      solid[i] = pixels[i * 4 + 3] >= CLOUD_ALPHA_CUTOFF ? 1 : 0;
+    }
+    const wrapX = (v: number) => ((v % width) + width) % width;
+    const wrapZ = (v: number) => ((v % height) + height) % height;
+    const at = (x: number, z: number) => solid[wrapZ(z) * width + wrapX(x)];
+
+    const positions: number[] = [];
+    const colors: number[] = [];
+    const indices: number[] = [];
+    const size = CLOUD_CELL_SIZE;
+    const top = CLOUD_THICKNESS;
+    const addQuad = (corners: readonly (readonly [number, number, number])[], shade: number) => {
+      const base = positions.length / 3;
+      for (const [x, y, z] of corners) {
+        positions.push(x, y, z);
+        colors.push(shade, shade, shade);
+      }
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+
+    for (let z = 0; z < height; z++) {
+      for (let x = 0; x < width; x++) {
+        if (!solid[z * width + x]) continue;
+        const bx = x * size;
+        const bz = z * size;
+        addQuad(
+          [
+            [bx, top, bz],
+            [bx, top, bz + size],
+            [bx + size, top, bz + size],
+            [bx + size, top, bz],
+          ],
+          CLOUD_SHADE_TOP
+        );
+        addQuad(
+          [
+            [bx, 0, bz],
+            [bx + size, 0, bz],
+            [bx + size, 0, bz + size],
+            [bx, 0, bz + size],
+          ],
+          CLOUD_SHADE_BOTTOM
+        );
+        if (!at(x, z - 1)) {
+          addQuad(
+            [
+              [bx, 0, bz],
+              [bx, top, bz],
+              [bx + size, top, bz],
+              [bx + size, 0, bz],
+            ],
+            CLOUD_SHADE_NORTH_SOUTH
+          );
+        }
+        if (!at(x, z + 1)) {
+          addQuad(
+            [
+              [bx, 0, bz + size],
+              [bx + size, 0, bz + size],
+              [bx + size, top, bz + size],
+              [bx, top, bz + size],
+            ],
+            CLOUD_SHADE_NORTH_SOUTH
+          );
+        }
+        if (!at(x - 1, z)) {
+          addQuad(
+            [
+              [bx, 0, bz],
+              [bx, 0, bz + size],
+              [bx, top, bz + size],
+              [bx, top, bz],
+            ],
+            CLOUD_SHADE_EAST_WEST
+          );
+        }
+        if (!at(x + 1, z)) {
+          addQuad(
+            [
+              [bx + size, 0, bz + size],
+              [bx + size, 0, bz],
+              [bx + size, top, bz],
+              [bx + size, top, bz + size],
+            ],
+            CLOUD_SHADE_EAST_WEST
+          );
+        }
+      }
+    }
+    if (indices.length === 0) return null;
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
+    geometry.computeBoundingSphere();
+    return geometry;
+  }
+
+  /** Ancora o layer de nuvens no mundo: a célula `i` da textura fica em
+   * `i * 12 − drift` no X e `i * 12 − 3.96` no Z (mesma conta do
+   * `CloudRenderer`: `cloudX = camera.x + drift`, `cloudZ = camera.z + 3.96`,
+   * com o padrão andando pra −X a 0.6 bloco/s) — e o grupo vai pro múltiplo do
+   * período mais perto da câmera, o que não muda o visual (o padrão repete a
+   * cada 3072 blocos) e mantém os 3×3 tiles cobrindo a vista. */
+  private updateClouds(now: number) {
+    const group = this.cloudGroup;
+    if (!group) return;
+    if (this.cloudStartMs === 0) this.cloudStartMs = now;
+    // Cor do jogo: branco de dia, azul quase preto à noite (multiplicador
+    // noturno do `Timelines`), interpolado pelo mesmo fator de luz do céu.
+    this.cloudMaterial?.color.copy(CLOUD_NIGHT_COLOR).lerp(CLOUD_DAY_COLOR, this.daylightFactor);
+    const drift = (((now - this.cloudStartMs) / 1000) * CLOUD_DRIFT_PER_SECOND) % CLOUD_PERIOD_BLOCKS;
+    const anchorX = -drift;
+    const anchorZ = -CLOUD_Z_OFFSET;
+    const nearest = (anchor: number, camera: number) =>
+      anchor + Math.round((camera - anchor) / CLOUD_PERIOD_BLOCKS) * CLOUD_PERIOD_BLOCKS;
+    group.position.set(
+      nearest(anchorX, this.camera.position.x),
+      CLOUD_HEIGHT,
+      nearest(anchorZ, this.camera.position.z)
+    );
   }
 
   /** Redesenha o gradiente do domo (2×256) e reenvia pra GPU. Só é chamado a
@@ -1104,8 +1477,11 @@ export class Viewer3D {
    * Isso é assíncrono, mas o backfill de reconexão pode mandar dezenas de
    * chunks antes do atlas terminar de carregar; os voxels ficam guardados e
    * só viram malha aqui, com as texturas prontas. */
-  setAtlas(dataUrl: string, textures: Record<string, UvRect>) {
+  setAtlas(dataUrl: string, textures: Record<string, UvRect>, cloudDataUrl: string | null = null) {
     this.atlasLoading = true;
+    // As nuvens vêm do mesmo jar mas são outro PNG — monta em paralelo; sem
+    // ele (jar ausente) simplesmente não há nuvens, nada de inventar padrão.
+    this.buildClouds(cloudDataUrl);
     new THREE.TextureLoader().load(
       dataUrl,
       (texture) => {
@@ -1292,15 +1668,15 @@ export class Viewer3D {
     this.bucketMaterials.clear();
     this.faceRenderCache.clear();
     this.faceRectCache.clear();
-    // `alphaTest` recorta as texturas com transparência (folhas, plantas,
-    // tochas): sem ele o alpha é ignorado e os pixels vazios saem pretos.
-    // Sem atlas (`map: null`, modo degradado) não muda nada — o alpha do
-    // vértice é 1.
-    this.opaqueMaterial = new THREE.MeshStandardMaterial({
+    // Material do terreno é **sem luz dinâmica** (`MeshBasicMaterial`): a luz
+    // vem assada na cor do vértice, reamostrada da luz real do jogo (tocha,
+    // céu, lava...) em `pushQuadFlat` — é o que faz o bloco emissor iluminar
+    // os vizinhos e a caverna ficar escura. `alphaTest` recorta as texturas
+    // com transparência (folhas, plantas, tochas); no modo degradado
+    // (`map: null`) o alpha do vértice é 1 e nada muda.
+    this.opaqueMaterial = new THREE.MeshBasicMaterial({
       map: this.atlasTexture,
       vertexColors: true,
-      roughness: 0.95,
-      metalness: 0,
       alphaTest: 0.5,
     });
     this.bucketMaterials.set("opaque", this.opaqueMaterial);
@@ -1310,25 +1686,22 @@ export class Viewer3D {
     this.bucketMaterials.set("lava_flow", this.buildFluidMaterial("lava", "flow"));
   }
 
-  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshStandardMaterial {
+  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshBasicMaterial {
     const frames = this.loadFrames(`${kind}_${phase}`);
     const water = kind === "water";
-    const material = new THREE.MeshStandardMaterial({
+    const material = new THREE.MeshBasicMaterial({
       map: frames[0] ?? null,
       // O tint da água é por coluna (bioma, ver `meshFluidFace`) e chega por
-      // vértice; lava não tem tint (branco).
+      // vértice junto da luz; lava não tem tint (branco).
       color: 0xffffff,
       vertexColors: true,
-      roughness: water ? 0.35 : 0.6,
-      metalness: 0,
       // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
-      // opaca e emite luz.
+      // opaca. A luz da lava vem do próprio dado do jogo (bloco 15 propagado
+      // nas posições vizinhas), então ela não precisa de emissive.
       transparent: water,
       opacity: water ? 0.72 : 1,
       depthWrite: !water,
       side: THREE.DoubleSide,
-      emissive: water ? 0x000000 : 0x8a3b0c,
-      emissiveIntensity: water ? 0 : 0.55,
     });
     if (frames.length > 1) this.animatedMaterials.push({ material, frames });
     return material;
@@ -1468,8 +1841,81 @@ export class Viewer3D {
 
   /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
    * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
-   * usado pra superfície rebaixada de fluido. `color` é `0xRRGGBB` e `offset`
-   * desloca o quad ao longo da normal da face (camada de overlay). */
+   * usado pra superfície rebaixada de fluido. `offset` desloca o quad ao
+   * longo da normal da face (camada de overlay) e `light` traz o brilho 0–1
+   * já suavizado por canto (ver `faceCornerBrightness`). */
+  /** Byte de luz de uma posição (nibble baixo = bloco, alto = céu); 0 se o
+   * chunk/seção não está no cache. Acima do topo do mundo é céu cheio. */
+  private lightAt(x: number, y: number, z: number): number {
+    if (y > 319) return 0xf0;
+    if (y < -64) return 0;
+    const chunk = this.chunks.get(this.chunkKey(x >> 4, z >> 4));
+    if (!chunk) return 0;
+    const sectionY = y >> 4;
+    const section = chunk.sections.get(sectionY);
+    if (!section) {
+      // Seção de ar não vem no payload (só as que têm bloco): acima da maior
+      // seção do chunk é ar aberto (céu cheio); abaixo/entre, escuridão.
+      return sectionY > chunk.maxSectionY ? 0xf0 : 0;
+    }
+    return section.light[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] ?? 0;
+  }
+
+  /** Brilho 0–1 de um canto de face, no estilo do jogo: média das 4 posições
+   * de ar em volta do canto (a da frente da face + as duas arestas + a quina),
+   * nos dois canais, e `max(céu, bloco)` no fim. É isso que dá o degradê
+   * suave em volta de uma tocha em vez de blocos com brilho chapado. */
+  private cornerBrightness(
+    lightAt: (x: number, y: number, z: number) => number,
+    face: FaceDef,
+    corner: readonly [number, number, number],
+    x: number,
+    y: number,
+    z: number
+  ): number {
+    const axes: number[] = [];
+    for (let axis = 0; axis < 3; axis++) if (face.dir[axis] === 0) axes.push(axis);
+    const signs = axes.map((axis) => (corner[axis] === 1 ? 1 : -1));
+    const offset = (axis: number, sign: number) => {
+      const out = [0, 0, 0];
+      out[axis] = sign;
+      return out;
+    };
+    const o1 = offset(axes[0], signs[0]);
+    const o2 = offset(axes[1], signs[1]);
+    const bx = x + face.dir[0];
+    const by = y + face.dir[1];
+    const bz = z + face.dir[2];
+    const samples = [
+      [bx, by, bz],
+      [bx + o1[0], by + o1[1], bz + o1[2]],
+      [bx + o2[0], by + o2[1], bz + o2[2]],
+      [bx + o1[0] + o2[0], by + o1[1] + o2[1], bz + o1[2] + o2[2]],
+    ];
+
+    let block = 0;
+    let sky = 0;
+    for (const [sx, sy, sz] of samples) {
+      const value = lightAt(sx, sy, sz);
+      block += value & 15;
+      sky += value >> 4;
+    }
+    return lightCurve(Math.max(block >> 2, (sky >> 2) * this.bakedSkyFactor));
+  }
+
+  /** Brilho dos 4 cantos de uma face (0–1), já sem o shading direcional —
+   * `pushQuadFlat` aplica `faceShade` por cima. */
+  private faceCornerBrightness(
+    lightAt: (x: number, y: number, z: number) => number,
+    faceIndex: number,
+    x: number,
+    y: number,
+    z: number
+  ): number[] {
+    const face = FACES[faceIndex];
+    return face.corners.map((corner) => this.cornerBrightness(lightAt, face, corner, x, y, z));
+  }
+
   private pushQuadFlat(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1479,11 +1925,14 @@ export class Viewer3D {
     low: number,
     high: number,
     uv: readonly number[],
-    color: number,
+    r: number,
+    g: number,
+    b: number,
+    light: readonly number[],
     offset = 0
   ) {
     const face = FACES[faceIndex];
-    const [r, g, b] = this.linearColor(color);
+    const shade = faceShade(face);
     const offsetX = face.dir[0] * offset;
     const offsetY = face.dir[1] * offset;
     const offsetZ = face.dir[2] * offset;
@@ -1497,7 +1946,10 @@ export class Viewer3D {
       );
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
       buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
-      buffers.colors.push(r, g, b);
+      // A luz do jogo já vem pronta (tocha, céu, lava...): aqui ela só é
+      // multiplicada no tint do vértice junto do shading da direção da face.
+      const brightness = light[i] * shade;
+      buffers.colors.push(r * brightness, g * brightness, b * brightness);
     }
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
@@ -1568,7 +2020,8 @@ export class Viewer3D {
     entry: PaletteEntry,
     neighbor: PaletteEntry | null,
     flow: THREE.Vector3 | null,
-    color: number
+    color: number,
+    lightAt: (x: number, y: number, z: number) => number
   ) {
     const ownHeight = fluidHeight(entry.level);
     let low = 0;
@@ -1584,6 +2037,7 @@ export class Viewer3D {
     }
 
     const rotation = flow ? this.flowRotation(faceIndex, flow) : 0;
+    const [r, g, b] = this.linearColor(color);
     this.pushQuadFlat(
       buffers,
       faceIndex,
@@ -1593,7 +2047,10 @@ export class Viewer3D {
       low,
       high,
       FLUID_ROTATED_UV[faceIndex][rotation],
-      color
+      r,
+      g,
+      b,
+      this.faceCornerBrightness(lightAt, faceIndex, x, y, z)
     );
   }
 
@@ -1630,6 +2087,15 @@ export class Viewer3D {
         }
         return this.entryAt(x, y, z);
       };
+      // Luz local: quase toda amostra do smooth lighting cai na seção
+      // corrente, então evita o `Map.get` global na maioria dos casos.
+      const lightAt = (x: number, y: number, z: number): number => {
+        if ((x >> 4) === chunk.x && (z >> 4) === chunk.z) {
+          const source = (y >> 4) === sectionY ? section : chunk.sections.get(y >> 4);
+          if (source) return source.light[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
+        }
+        return this.lightAt(x, y, z);
+      };
 
       for (let ly = 0; ly < 16; ly++) {
         for (let lz = 0; lz < 16; lz++) {
@@ -1659,7 +2125,7 @@ export class Viewer3D {
                   flowNeeded = false;
                 }
                 const fluidColor = entry.block === "water" ? this.waterTintAt(column, chunk.tints) : 0xffffff;
-                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor);
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor, lightAt);
                 continue;
               }
               // Sólido: face some se o vizinho é oclusor; oclusão entre
@@ -1676,12 +2142,17 @@ export class Viewer3D {
               const color = render.known
                 ? this.faceTint(entry.block, face.kind, column, chunk.tints)
                 : COLOR_UNKNOWN_BLOCK;
-              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, color);
+              const [r, g, b] = this.linearColor(color);
+              const faceLight = this.faceCornerBrightness(lightAt, f, x, y, z);
+              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, r, g, b, faceLight);
               // Segunda camada do lado do grass_block no modelo vanilla:
               // cinza no arquivo, tingida com a cor de grama do bioma.
               if (entry.block === "grass_block" && face.kind === "side") {
                 const overlay = this.grassOverlayRender(f);
                 if (overlay) {
+                  const [overlayR, overlayG, overlayB] = this.linearColor(
+                    this.grassTintAt(column, chunk.tints)
+                  );
                   this.pushQuadFlat(
                     buffered("opaque"),
                     f,
@@ -1691,7 +2162,10 @@ export class Viewer3D {
                     0,
                     1,
                     overlay.uv,
-                    this.grassTintAt(column, chunk.tints),
+                    overlayR,
+                    overlayG,
+                    overlayB,
+                    faceLight,
                     GRASS_SIDE_OVERLAY_OFFSET
                   );
                 }
@@ -1738,7 +2212,10 @@ export class Viewer3D {
       const key = this.meshQueue.shift()!;
       this.queuedChunks.delete(key);
       const chunk = this.chunks.get(key);
-      if (chunk && this.atlasUvByName) this.buildChunkMesh(chunk);
+      // Degradado (sem atlas) também monta: `buildChunkMesh` desenha cor
+      // sólida por bloco. A guarda só pelo atlas deixava todo chunk preso na
+      // fila e o mundo não aparecia quando o jar estava ausente.
+      if (chunk && (this.atlasUvByName || this.atlasUnavailable)) this.buildChunkMesh(chunk);
     } while (this.meshQueue.length > 0 && performance.now() - start < this.meshBudgetMs);
   }
 
@@ -1816,6 +2293,86 @@ export class Viewer3D {
     this.playerModel.setSkin(skin);
   }
 
+  /** Recebe o snapshot dos mobs vivos ao redor (comando `nearby_mobs`) e
+   * mantém um rótulo por mob — nome, categoria (hostil em vermelho), distância
+   * e vida. A lista é o estado atual, não um delta: mob que saiu do raio tem o
+   * rótulo removido aqui. É o que "identifica" o mob: o viewer ainda não
+   * desenha os modelos reais de entidade (ver "Known gaps"), então o marcador
+   * é a informação honesta que temos — nome, tipo e vida vêm do jogo. */
+  setNearbyMobs(mobs: NearbyMob[]) {
+    const seen = new Set<number>();
+    for (const mob of mobs) {
+      seen.add(mob.id);
+      let marker = this.mobMarkers.get(mob.id);
+      if (!marker) {
+        const el = document.createElement("div");
+        const nameEl = document.createElement("span");
+        nameEl.className = "mob-name";
+        const metaEl = document.createElement("span");
+        metaEl.className = "mob-meta mono";
+        el.append(nameEl, metaEl);
+        this.mobLayer.appendChild(el);
+        const position = new THREE.Vector3(mob.x, mob.y, mob.z);
+        marker = { el, nameEl, metaEl, mob, target: position.clone(), position };
+        this.mobMarkers.set(mob.id, marker);
+      }
+      marker.mob = mob;
+      marker.target.set(mob.x, mob.y, mob.z);
+      // A classe carrega a categoria (hostil = perigo no CSS); reaplicar
+      // inteira mantém a cor certa mesmo se o mob mudar de categoria.
+      marker.el.className = `mob-label mob-${mob.category}`;
+      // Nome do jogo (pode ter nome customizado de name tag): textContent,
+      // nunca innerHTML.
+      marker.nameEl.textContent = mob.name;
+      marker.metaEl.textContent = `${mob.distance.toFixed(0)} m · ${Math.round(mob.health)}/${Math.round(
+        mob.max_health
+      )}`;
+    }
+    for (const [id, marker] of this.mobMarkers) {
+      if (seen.has(id)) continue;
+      marker.el.remove();
+      this.mobMarkers.delete(id);
+    }
+  }
+
+  /** Interpola a posição desenhada dos mobs até o alvo do último snapshot —
+   * mesma ideia do `updateBotMarker`, numa cadência mais lenta (mob anda
+   * menos que o bot correndo) e com encaixe direto em salto grande. */
+  private updateMobs(dt: number) {
+    if (this.mobMarkers.size === 0) return;
+    const step = 1 - Math.exp(-MOB_FOLLOW_RATE * dt);
+    for (const marker of this.mobMarkers.values()) {
+      if (marker.position.distanceTo(marker.target) > MOB_TELEPORT_DISTANCE) {
+        marker.position.copy(marker.target);
+        continue;
+      }
+      marker.position.lerp(marker.target, step);
+    }
+  }
+
+  /** Projeta cada rótulo de mob na tela, acima da hitbox dele (galinha e
+   * enderman não têm a mesma altura) — mesmo padrão do rótulo do bot, um por
+   * mob. Atrás da câmera, some. */
+  private updateMobLabels() {
+    if (this.mobMarkers.size === 0) return;
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    if (width === 0 || height === 0) return;
+    for (const marker of this.mobMarkers.values()) {
+      const vector = this.mobScratch
+        .copy(marker.position)
+        .setY(marker.position.y + marker.mob.height + MOB_LABEL_GAP)
+        .project(this.camera);
+      if (vector.z > 1) {
+        marker.el.style.display = "none";
+        continue;
+      }
+      marker.el.style.display = "flex";
+      marker.el.style.left = `${(vector.x * 0.5 + 0.5) * width}px`;
+      marker.el.style.top = `${(-vector.y * 0.5 + 0.5) * height}px`;
+    }
+  }
+
   /** Move o modelo (em velocidade constante até o alvo) e a câmera pelo mesmo
    * passo. Quando o resto cabe no passo do frame, `step` já é o resto exato —
    * o boneco chega e para junto com o bot, sem sobra pra deslizar depois. */
@@ -1854,6 +2411,29 @@ export class Viewer3D {
   private handlePointerDown = (event: PointerEvent) => {
     if (event.button !== 0) return;
     this.pointerDownAt = { x: event.clientX, y: event.clientY, time: performance.now() };
+
+    // Seleção por arrasto: o âncora é o canto já marcado (se houver um
+    // pendente) ou o bloco sob o pressionar. Um clique parado segue o caminho
+    // de sempre (dois cliques marcam os cantos) — ver `handlePointerUp`.
+    if (this.editMode !== "select") return;
+    const pending = this.selectionA && !this.selectionB ? this.selectionA : null;
+    const hit = pending ? null : this.pickBlock(event.clientX, event.clientY);
+    const anchor = pending ?? hit?.pos ?? null;
+    if (!anchor) return;
+    this.selectionDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      anchor,
+      dragging: false,
+    };
+    // Captura o ponteiro: soltar fora do canvas ainda fecha o gesto (se o
+    // sistema recusar a captura, o arrasto continua valendo dentro do canvas).
+    try {
+      this.renderer.domElement.setPointerCapture(event.pointerId);
+    } catch {
+      /* ponteiro já liberado — segue sem captura */
+    }
   };
 
   private handlePointerUp = (event: PointerEvent) => {
@@ -1861,14 +2441,27 @@ export class Viewer3D {
     this.pointerDownAt = null;
     if (!down || event.button !== 0) return;
     const moved = Math.hypot(event.clientX - down.x, event.clientY - down.y);
-    if (moved > CLICK_MAX_MOVE_PX || performance.now() - down.time > CLICK_MAX_MS) return;
-    // Com uma ferramenta do editor ativa o clique é edição; o alvo da fila
-    // fica de fora (nada de mirar instrução sem querer enquanto se pinta).
+
+    // Fim de um arrasto de seleção: a região já vinha sendo desenhada desde
+    // `handlePointerMove`, soltar só encerra o gesto. Sem arrasto (clique
+    // parado), cai no caminho normal abaixo.
+    if (this.selectionDrag) {
+      const wasDrag = this.selectionDrag.dragging;
+      this.selectionDrag = null;
+      if (wasDrag) return;
+    }
+
+    // Com ferramenta ativa o clique edita — o tempo pressionado não importa
+    // (um clique lento e parado continua sendo um clique); o que separa
+    // clique de arrasto é o movimento.
     if (this.editMode) {
+      if (moved > CLICK_MAX_MOVE_PX) return;
       const hit = this.pickBlock(event.clientX, event.clientY);
       if (hit) this.applyToolAt(hit);
       return;
     }
+    // Sem ferramenta: clique parado e curto mira um destino da fila.
+    if (moved > CLICK_MAX_MOVE_PX || performance.now() - down.time > CLICK_MAX_MS) return;
     this.pickTargetAt(event.clientX, event.clientY);
   };
 
@@ -1973,6 +2566,7 @@ export class Viewer3D {
 
     if (event.code === "Escape") {
       this.setTarget(null);
+      this.clearSelection(); // cancela um canto pendente / a região marcada
       return;
     }
 
@@ -2080,6 +2674,17 @@ export class Viewer3D {
     const phase = (time / TICKS_PER_DAY) * Math.PI * 2;
     const elevation = Math.sin(phase); // -1 = meia-noite, +1 = meio-dia
     const daylight = smoothstep(-0.12, 0.28, elevation);
+    this.daylightFactor = daylight; // as nuvens escurecem junto (updateClouds)
+
+    // A luz de céu assada acompanha o dia — sem isso o terreno ficaria claro
+    // de noite. O piso é o luar do jogo; a remontagem é orçada
+    // (`rebuildAllMeshes` só enfileira) e acontece em saltos grandes, não a
+    // cada frame.
+    const skyFactor = Math.max(SKY_LIGHT_NIGHT_FLOOR, daylight);
+    if (Math.abs(skyFactor - this.bakedSkyFactor) >= 0.2) {
+      this.bakedSkyFactor = skyFactor;
+      this.rebuildAllMeshes();
+    }
 
     // Sol nasce no leste (+X) e se põe no oeste, como no jogo.
     this.sunLight.position.set(
@@ -2157,12 +2762,20 @@ export class Viewer3D {
     return `${x},${y},${z}`;
   }
 
-  /** Ferramenta ativa — `null` deixa o clique só orbitando (viewer puro). */
+  /** Ferramenta ativa — `null` deixa o clique só orbitando (viewer puro). Com
+   * ferramenta ativa o botão esquerdo é do editor (clique edita, arrasto marca
+   * região) e a câmera passa pro direito (orbita) e meio (move): sem isso o
+   * clique de edição também girava a câmera — era o "a seleção interfere na
+   * câmera". Sem ferramenta nada muda (esquerdo orbita, como no viewer). */
   setEditMode(mode: EditMode | null) {
     this.editMode = mode;
+    this.controls.mouseButtons = mode
+      ? { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }
+      : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
     if (!mode) {
       this.hovered = null;
       this.hoverHelper.visible = false;
+      this.selectionDrag = null;
     }
     this.onEditChange?.();
   }
@@ -2275,6 +2888,12 @@ export class Viewer3D {
     };
   }
 
+  /** Canto A marcado esperando o oposto — o status do editor mostra isso
+   * (`main.ts`) pra deixar claro que o primeiro clique valeu. */
+  getPendingCorner(): BlockPos | null {
+    return this.selectionA && !this.selectionB ? this.selectionA : null;
+  }
+
   /** Move o canvas (e o contexto WebGL) pra outro host — o editor usa o mesmo
    * renderer do viewer, como o spec descreve ("mesmo motor de render"), sem
    * abrir um segundo contexto WebGL. O `container` acompanha: é dele que saem
@@ -2288,7 +2907,41 @@ export class Viewer3D {
 
   private handlePointerMove = (event: PointerEvent) => {
     if (!this.editMode) return;
-    this.hovered = this.pickBlock(event.clientX, event.clientY);
+    this.lastPointer = { x: event.clientX, y: event.clientY };
+    const hit = this.pickBlock(event.clientX, event.clientY);
+    this.hovered = hit;
+    this.refreshHoverHelper();
+
+    const drag = this.selectionDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!drag.dragging) {
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_MAX_MOVE_PX) return;
+      drag.dragging = true;
+    }
+    if (!hit) return; // fora do terreno: mantém a última região válida
+    // Região ao vivo: o canto oposto segue o cursor até soltar (o status do
+    // editor mostra tamanho/coordenadas a cada movimento).
+    this.selectionA = drag.anchor;
+    this.selectionB = hit.pos;
+    this.refreshSelectionHelper();
+    this.onEditChange?.();
+  };
+
+  /** Gesto cancelado pelo sistema (ex: ponteiro perdido): encerra sem aplicar
+   * nada, senão o próximo movimento continuaria "arrastando" a seleção. */
+  private handlePointerCancel = () => {
+    this.pointerDownAt = null;
+    this.selectionDrag = null;
+  };
+
+  /** A câmera mudou (órbita, inércia do damping, voo por teclado ou follow do
+   * bot): recalcula o bloco sob o cursor pra o realce não mentir — ver
+   * `lastPointer`. Sem isso o cubo de preview ficava parado no bloco antigo
+   * enquanto o clique já cairia em outro (era a sensação de "a seleção briga
+   * com a câmera"). */
+  private handleCameraChange = () => {
+    if (!this.editMode || !this.lastPointer) return;
+    this.hovered = this.pickBlock(this.lastPointer.x, this.lastPointer.y);
     this.refreshHoverHelper();
   };
 
@@ -2340,12 +2993,17 @@ export class Viewer3D {
     let maxZ = stepZ > 0 ? (z + 1 - origin.z) * deltaZ : stepZ < 0 ? (origin.z - z) * deltaZ : Infinity;
 
     let normal: [number, number, number] = [0, 0, 0];
-    // 512 passos cobre o alcance prático da câmera (mesmo com o zoom livre);
-    // depois disso o raio já se perdeu no vazio.
-    for (let step = 0; step < 512; step++) {
+    // `RAY_MAX_STEPS` cobre além da maior distância de fog; depois disso o
+    // raio já se perdeu no vazio.
+    for (let step = 0; step < RAY_MAX_STEPS; step++) {
       const entry = this.entryAt(x, y, z);
-      if (entry === null) return null; // chunk desconhecido
-      if ((entry.flags & VOXEL_FLAG_RENDER) !== 0) {
+      // Coluna ainda sem chunks: segue em frente em vez de desistir — com a
+      // câmera afastada do terreno o raio atravessa centenas de blocos fora do
+      // cache antes de achar o primeiro bloco carregado (antes, qualquer
+      // coluna desconhecida no caminho matava o picking e não dava pra
+      // selecionar nada de longe). Terminar dentro do desconhecido continua
+      // devolvendo `null`: ali não há como saber o que tem.
+      if (entry !== null && (entry.flags & VOXEL_FLAG_RENDER) !== 0) {
         return { pos: { x, y, z }, normal };
       }
       if (maxX < maxY && maxX < maxZ) {
@@ -2523,7 +3181,12 @@ export class Viewer3D {
   }
 
   private refreshSelectionHelper() {
-    const region = this.getSelection();
+    const a = this.selectionA;
+    const b = this.selectionB;
+    // Com só o canto A marcado, a "região" é ele mesmo (1×1×1): o primeiro
+    // clique precisa de retorno visual — antes não desenhava nada e parecia
+    // que a seleção não tinha funcionado.
+    const region = this.getSelection() ?? (a && !b ? { min: a, max: a } : null);
     if (!region) {
       this.selectionHelper.visible = false;
       return;
@@ -2549,6 +3212,10 @@ export class Viewer3D {
     this.queuedChunks.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
+    // Mobs são do mundo daquela conexão — sem addon online o snapshot deixa
+    // de existir no Rust e os rótulos não podem ficar congelados no mapa.
+    for (const marker of this.mobMarkers.values()) marker.el.remove();
+    this.mobMarkers.clear();
     this.clearEdits();
     this.clearSelection();
     this.targetBotPos = null;
@@ -2617,6 +3284,7 @@ export class Viewer3D {
 
     this.applyMovement(dt);
     this.updateBotMarker(dt);
+    this.updateMobs(dt);
     this.controls.update();
     // A hora local anda 20 ticks/s enquanto o addon reporta a hora real — é
     // isso que deixa o ciclo contínuo em vez de pular 1x/s no polling.
@@ -2625,6 +3293,7 @@ export class Viewer3D {
     }
     this.updateDayNight(now);
     this.updateSky();
+    this.updateClouds(now);
     this.updateFog();
     this.updateAnimation(now);
     this.sweepChunkWindow(now);
@@ -2632,6 +3301,7 @@ export class Viewer3D {
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
     this.updateTargetPosition();
+    this.updateMobLabels();
   };
 
   /** Mantém o popup do alvo grudado no bloco clicado (mesma projeção do

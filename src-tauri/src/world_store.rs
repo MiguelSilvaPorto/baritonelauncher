@@ -148,21 +148,17 @@ impl WorldStore {
         Ok(())
     }
 
-    /// Grava (ou regrava) um chunk: codifica, comprime e faz append de um
-    /// registro. O custo é o tamanho do chunk, não o do mundo.
-    pub fn write(
-        &mut self,
-        pos: ChunkPos,
-        sections: &[ChunkSection],
-        tints: Option<&ChunkTints>,
-    ) -> Result<(), String> {
-        let raw = encode_voxels(sections, tints);
-        let compressed = deflate(&raw)?;
+    /// Grava (ou regrava) um chunk a partir do payload já codificado
+    /// (`encode_voxels`) — quem chama já costuma ter os bytes prontos (o chunk
+    /// em memória, a importação do cache antigo). O custo é o tamanho do
+    /// chunk, não o do mundo: só comprime e faz append de um registro.
+    pub fn write_payload(&mut self, pos: ChunkPos, payload: &[u8]) -> Result<(), String> {
+        let compressed = deflate(payload)?;
         let offset = self.log_bytes;
         let mut record = Vec::with_capacity(RECORD_HEADER_LEN as usize + compressed.len());
         record.extend_from_slice(&pos.x.to_le_bytes());
         record.extend_from_slice(&pos.z.to_le_bytes());
-        record.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         record.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         record.extend_from_slice(&compressed);
         self.log.write_all(&record).map_err(|e| e.to_string())?;
@@ -176,9 +172,19 @@ impl WorldStore {
         Ok(())
     }
 
-    /// Payload de um chunk lido do log (registro vigente). `None` = chunk não
-    /// está no log.
-    pub fn read(&mut self, pos: ChunkPos) -> Result<Option<DecodedVoxels>, String> {
+    /// Conveniência (teste/uso direto): codifica as seções e grava.
+    pub fn write(
+        &mut self,
+        pos: ChunkPos,
+        sections: &[ChunkSection],
+        tints: Option<&ChunkTints>,
+    ) -> Result<(), String> {
+        self.write_payload(pos, &encode_voxels(sections, tints))
+    }
+
+    /// Payload (`encode_voxels`) do registro vigente de um chunk. `None` =
+    /// chunk não está no log.
+    pub fn read_payload(&mut self, pos: ChunkPos) -> Result<Option<Vec<u8>>, String> {
         let Some(offset) = self.index.get(&pos).copied() else {
             return Ok(None);
         };
@@ -193,8 +199,15 @@ impl WorldStore {
         self.log
             .read_exact(&mut compressed)
             .map_err(|e| format!("payload de ({}, {}) ilegível: {e}", pos.x, pos.z))?;
-        let raw = inflate(&compressed)?;
-        decode_voxels(&raw).map(Some)
+        inflate(&compressed).map(Some)
+    }
+
+    /// Conveniência: payload + decode (`DecodedVoxels`).
+    pub fn read(&mut self, pos: ChunkPos) -> Result<Option<DecodedVoxels>, String> {
+        match self.read_payload(pos)? {
+            Some(payload) => decode_voxels(&payload).map(Some),
+            None => Ok(None),
+        }
     }
 
     pub fn positions(&self) -> impl Iterator<Item = ChunkPos> + '_ {
@@ -325,8 +338,8 @@ pub fn import_legacy_cache(data_dir: &Path, store: &mut WorldStore) -> Result<Op
     }
     let stored = load_legacy(&cache_path)?;
     let chunks = stored.chunks.len();
-    for (pos, sections, tints) in stored.chunks {
-        store.write(pos, &sections, tints.as_ref())?;
+    for (pos, _sections, _tints, payload) in stored.chunks {
+        store.write_payload(pos, &payload)?;
     }
     println!(
         "[world_store] {chunks} chunks importados do cache antigo ({})",
@@ -341,7 +354,10 @@ pub struct StoredWorld {
     /// Versão do Minecraft do último `hello` — `None` se o cache foi salvo
     /// antes de qualquer conexão.
     pub mc_version: Option<String>,
-    pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Option<ChunkTints>)>,
+    /// `(posição, seções, tints, payload)` — o payload é mantido porque é
+    /// exatamente o formato do log; reencodá-lo na importação seria trabalho
+    /// jogado fora.
+    pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Option<ChunkTints>, Vec<u8>)>,
 }
 
 /// Formato antigo (container `BOWC` v1): usados na leitura, pra abrir (e
@@ -391,8 +407,14 @@ pub fn load_legacy(path: &Path) -> Result<StoredWorld, String> {
         if len > MAX_LEGACY_CHUNK_PAYLOAD {
             return Err(format!("payload de chunk grande demais: {len}"));
         }
-        match decode_voxels(reader.take(len as usize)?) {
-            Ok(decoded) => chunks.push((ChunkPos { x, z }, decoded.sections, decoded.tints)),
+        let payload = reader.take(len as usize)?;
+        match decode_voxels(payload) {
+            Ok(decoded) => chunks.push((
+                ChunkPos { x, z },
+                decoded.sections,
+                decoded.tints,
+                payload.to_vec(),
+            )),
             // Payload de um formato mais novo (outra build do app) ou corrompido:
             // pula o chunk em vez de invalidar o cache inteiro — o que dá pra
             // ler ainda importa.
@@ -471,6 +493,8 @@ mod tests {
                 })
                 .collect(),
             indices: (0..4096).map(|i| (i % blocks.len()) as u16).collect(),
+            // Luz de dia cheia (nibble baixo = bloco, alto = céu).
+            light: vec![0xf0; 4096],
         }
     }
 
@@ -641,7 +665,7 @@ mod tests {
         assert_eq!(world.chunk_count(), 1);
         // O chunk está quente; limpa o set de trabalho e confere que o dado
         // volta do log sob demanda.
-        world.hot_chunks.clear();
+        world.chunks.clear();
         assert_eq!(world.chunk_count(), 1, "contagem vem do índice, não da memória");
         let bytes = world.chunk_voxels_bytes(ChunkPos { x: -1, z: 2 });
         let decoded = decode_voxels(&bytes).expect("payload deveria decodificar");

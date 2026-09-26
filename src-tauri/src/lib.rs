@@ -1,6 +1,7 @@
 mod addon_socket;
 mod instructions;
 mod items;
+mod mobs;
 mod player_skin;
 mod schematic;
 mod settings;
@@ -61,6 +62,10 @@ pub(crate) struct AppState {
     /// Skin real do jogador (PNG), mandada pelo addon quando muda — ver
     /// `player_skin.rs`.
     pub(crate) player_skin: Mutex<Option<player_skin::PlayerSkin>>,
+    /// Último snapshot dos mobs vivos ao redor do jogador (`entities`, ver
+    /// `mobs.rs`). `None` = o addon não mandou nada nesta conexão (a UI não
+    /// mostra painel); `Some` com lista vazia = varreu e não achou nada.
+    pub(crate) mobs: Mutex<Option<mobs::MobSnapshot>>,
     /// Versão do Minecraft reportada no `hello` do addon — usada pra achar
     /// o client jar certo em `texture_atlas.rs`. Real, não hardcoded: se o
     /// addon nunca conectou ainda, isso fica `None` e o comando do atlas
@@ -103,8 +108,8 @@ pub(crate) fn send_to_addon(state: &AppState, line: String) {
 /// `Active` e houver conexão. Chamado em três momentos: quando o usuário
 /// enfileira (`queue_push`), quando o addon conecta (`hello` — cobre
 /// instruções criadas offline) e quando a ativa termina (`instruction_status`
-/// terminal). Só `TravelTo`/`Explore` têm executor no addon hoje; tipos sem
-/// executor ficam `Queued` de propósito (a UI ainda não os cria).
+/// terminal). `TravelTo`/`Explore`/`Mine`/`Build` têm executor no addon hoje;
+/// tipos sem executor ficam `Queued` de propósito (a UI ainda não os cria).
 pub(crate) fn dispatch_next_instruction(state: &AppState) {
     if state.addon_tx.lock().unwrap().is_none() {
         return; // sem conexão: a fila espera o próximo `hello`
@@ -115,16 +120,17 @@ pub(crate) fn dispatch_next_instruction(state: &AppState) {
         if queue.active().is_some() {
             return;
         }
-        // Só instruções com executor (ver `encode_instruction`): as outras
-        // (Mine/Build do editor de schematic) ficam na fila sem bloquear as
-        // que sabem rodar — ver o doc-comment de `activate_next_queued`.
-        queue.activate_next_queued(|instruction| encode_instruction(instruction).is_some())
+        // Só instruções com payload de verdade (ver `encode_instruction`):
+        // tipos sem executor — ou `Mine`/`Build` cujo schematic sumiu — ficam
+        // na fila sem bloquear as que sabem rodar — ver o doc-comment de
+        // `activate_next_queued`.
+        queue.activate_next_queued(|instruction| encode_instruction(state, instruction).is_some())
     };
     let Some(instruction) = next else {
         return;
     };
 
-    let Some(line) = encode_instruction(&instruction) else {
+    let Some(line) = encode_instruction(state, &instruction) else {
         // Inalcançável enquanto o predicado acima e `encode_instruction`
         // andarem juntos, mas devolver pra fila é melhor que mentir `Active`
         // se um dia saírem de sincronia.
@@ -140,9 +146,10 @@ pub(crate) fn dispatch_next_instruction(state: &AppState) {
 }
 
 /// Serializa a instrução no formato que o addon Java entende (ver
-/// `mod-addon/README.md`, "Protocolo do socket"). `None` = tipo ainda sem
-/// executor do lado Java.
-fn encode_instruction(instruction: &Instruction) -> Option<String> {
+/// `docs/PROTOCOL.md`). `Mine`/`Build` carregam a lista de blocos do schematic
+/// (guardada por `schematic_apply` em `AppState.schematics`); `None` = tipo —
+/// ou payload — ainda sem executor do lado Java.
+fn encode_instruction(state: &AppState, instruction: &Instruction) -> Option<String> {
     let id = &instruction.id;
     match instruction.kind {
         InstructionKind::TravelTo => {
@@ -182,6 +189,34 @@ fn encode_instruction(instruction: &Instruction) -> Option<String> {
             }
             payload.to_string()
         }),
+
+        InstructionKind::Mine | InstructionKind::Build => {
+            let blocks = state.schematics.lock().unwrap().get(id).cloned()?;
+            // `Mine` manda "ar" como alvo: o builder do Baritone quebra o que
+            // estiver no lugar quando o alvo é ar (o mesmo caminho do
+            // `clearArea`). `Build` manda o bloco de verdade.
+            let clearing = instruction.kind == InstructionKind::Mine;
+            let blocks: Vec<serde_json::Value> = blocks
+                .iter()
+                .map(|block| {
+                    json!({
+                        "x": block.x,
+                        "y": block.y,
+                        "z": block.z,
+                        "block": if clearing { "air" } else { block.block.as_str() },
+                    })
+                })
+                .collect();
+            Some(
+                json!({
+                    "type": "instruction",
+                    "id": id,
+                    "kind": if clearing { "mine" } else { "build" },
+                    "blocks": blocks,
+                })
+                .to_string(),
+            )
+        }
 
         _ => None,
     }
@@ -362,6 +397,10 @@ mod commands {
             }
         };
 
+        // O schematic (Mine/Build) só vive enquanto a instrução existe; sem
+        // isso a lista de blocos ficaria vazando no estado a cada cancelamento.
+        state.schematics.lock().unwrap().remove(&id);
+
         if was_active {
             send_to_addon(&state, json!({ "type": "cancel", "id": id }).to_string());
             dispatch_next_instruction(&state);
@@ -371,10 +410,10 @@ mod commands {
 
     /// Aplica a camada de edição do editor de schematic: o diff contra o
     /// `WorldCache` real (feito em `schematic.rs`, não no frontend) vira
-    /// instruções `Mine`/`Build` na fila. Elas ficam `Queued` de verdade —
-    /// o addon ainda não tem executor pra esses tipos (ver "Known gaps"),
-    /// mas o schematic fica guardado em `AppState.schematics` pro dia em que
-    /// tiver. Devolve só as contagens/ids; a lista de blocos não volta.
+    /// instruções `Mine`/`Build` na fila, com a lista de blocos guardada em
+    /// `AppState.schematics` (chave = id da instrução) pro `encode_instruction`
+    /// mandar junto quando o addon for executar. Devolve só as contagens/ids;
+    /// a lista de blocos não volta.
     #[tauri::command]
     fn schematic_apply(
         state: State<AppState>,
@@ -469,6 +508,15 @@ mod commands {
         state.player_skin.lock().unwrap().clone()
     }
 
+    /// Snapshot dos mobs vivos ao redor do bot (comando `nearby_mobs`), com o
+    /// raio varrido reportado pelo addon — ver `mobs.rs`. `None` = o addon
+    /// ainda não mandou `entities` (painel escondido); lista vazia é resposta
+    /// real ("nenhum mob no raio").
+    #[tauri::command]
+    fn nearby_mobs(state: State<AppState>) -> Option<mobs::MobSnapshot> {
+        state.mobs.lock().unwrap().clone()
+    }
+
     /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco a
     /// partir do client jar que o usuário já tem instalado — nunca baixa
     /// nada. Precisa saber a versão do MC, que só existe depois que o addon
@@ -536,6 +584,7 @@ mod commands {
             bot_pose,
             world_time,
             player_skin,
+            nearby_mobs,
             get_texture_atlas,
             settings_get,
             settings_set,
@@ -710,4 +759,57 @@ pub fn run() {
                 save_world_meta_if_changed(app, &mut last);
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instruction(id: &str, kind: InstructionKind) -> Instruction {
+        Instruction {
+            id: id.to_string(),
+            kind,
+            label: "teste".to_string(),
+            status: InstructionStatus::Queued,
+            progress: 0.0,
+            target: None,
+            explore: None,
+        }
+    }
+
+    /// O encoding de `Mine`/`Build` é o contrato com o addon: `mine` manda ar
+    /// como alvo (quebrar) e `build` manda o bloco; sem o schematic guardado o
+    /// tipo fica sem executor (`None`) em vez de despachar payload vazio.
+    #[test]
+    fn encodes_mine_and_build_with_the_stored_schematic() {
+        let state = AppState::default();
+        state.schematics.lock().unwrap().insert(
+            "i1".to_string(),
+            vec![schematic::SchematicBlock {
+                x: 10,
+                y: 64,
+                z: -3,
+                block: "stone".to_string(),
+            }],
+        );
+
+        let build = instruction("i1", InstructionKind::Build);
+        let line = encode_instruction(&state, &build).expect("build deveria ter payload");
+        assert!(line.contains("\"kind\":\"build\""), "{line}");
+        assert!(line.contains("\"block\":\"stone\""), "{line}");
+        assert!(line.contains("\"y\":64"), "{line}");
+
+        let mine = instruction("i1", InstructionKind::Mine);
+        let line = encode_instruction(&state, &mine).expect("mine deveria ter payload");
+        assert!(line.contains("\"kind\":\"mine\""), "{line}");
+        assert!(line.contains("\"block\":\"air\""), "{line}");
+
+        // Sem o schematic (terminal/cancel já limpou), não despacha.
+        state.schematics.lock().unwrap().clear();
+        assert!(encode_instruction(&state, &build).is_none());
+        assert!(encode_instruction(&state, &mine).is_none());
+
+        // Tipos sem executor continuam devolvendo `None`.
+        assert!(encode_instruction(&state, &instruction("i2", InstructionKind::Craft)).is_none());
+    }
 }
