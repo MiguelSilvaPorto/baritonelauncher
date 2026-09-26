@@ -31,16 +31,57 @@ import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
  */
 
 const BLOCK_TEXTURE_PX = 16; // resolução dos tiles do atlas (frames 32×32 são reduzidos lá)
-// Céu: o addon ainda não manda a hora do mundo, então o viewer não cicla
-// dia/noite (ver "Known gaps" no README) — este gradiente é uma aproximação
-// fixa de dia claro. O horizonte é também a cor do fog e do canvas: é nele
-// que o terreno distante se dissolve.
-const SKY_ZENITH = "#2f6ba8";
-const SKY_MID = "#6f9cc9";
-const SKY_HORIZON = "#c2d6e8";
+// Céu e ciclo de dia/noite: o addon manda a hora real do mundo 1x/s
+// (`world_time`, ticks 0..23999 — 0 = nascer do sol, 6000 = meio-dia, 12000 =
+// pôr do sol, 18000 = meia-noite), o viewer interpola a 20 ticks/s (como o
+// jogo) e move sol, lua, luz ambiente e o gradiente do céu. Sem hora
+// conhecida (jogo fechado, app recém-aberto), fica no meio-dia fixo — não
+// inventa um ciclo. O horizonte é também a cor do fog e do canvas: é nele que
+// o terreno distante se dissolve.
+const SKY_DAY = { zenith: 0x2f6ba8, mid: 0x6f9cc9, horizon: 0xc2d6e8 };
+const SKY_NIGHT = { zenith: 0x050a18, mid: 0x0a1226, horizon: 0x141d30 };
+/** Tom quente do horizonte no nascer/pôr do sol (pico quando o sol cruza o
+ * horizonte) — é o laranja que o céu do jogo ganha nesses momentos. */
+const SKY_TWILIGHT = 0xe8955a;
+/** Paletas de luz do ciclo: `LOW` = sol rasante, `HIGH` = meio-dia. */
+const SUN_COLOR_LOW = 0xff9e63;
+const SUN_COLOR_HIGH = 0xfff4e0;
+const MOON_COLOR = 0x9db4e8;
+const AMBIENT_DAY = 0.55; // era a luz fixa antiga
+const AMBIENT_NIGHT = 0.13;
+const MOON_INTENSITY = 0.1;
+// 1 dia do jogo = 24000 ticks = 20 min reais; a hora local anda 20 ticks por
+// segundo entre as mensagens do addon.
+const TICKS_PER_SECOND = 20;
+const TICKS_PER_DAY = 24000;
+const DEFAULT_DAY_TIME = 6000; // meio-dia fixo quando não há hora real
+/** Céu/fog não precisam ser recoloridos a cada frame — o ciclo é lento. */
+const SKY_REPAINT_MS = 500;
+const SUN_DISTANCE = 300;
 /** Raio do domo de céu: dentro do `far` da câmera (5000) e maior que o
  * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
 const SKY_RADIUS = 3000;
+
+// Cores pré-alocadas do ciclo: `updateDayNight` roda por frame e não pode
+// alocar `THREE.Color` a cada chamada.
+const SKY_DAY_ZENITH = new THREE.Color(SKY_DAY.zenith);
+const SKY_DAY_MID = new THREE.Color(SKY_DAY.mid);
+const SKY_DAY_HORIZON = new THREE.Color(SKY_DAY.horizon);
+const SKY_NIGHT_ZENITH = new THREE.Color(SKY_NIGHT.zenith);
+const SKY_NIGHT_MID = new THREE.Color(SKY_NIGHT.mid);
+const SKY_NIGHT_HORIZON = new THREE.Color(SKY_NIGHT.horizon);
+const SKY_TWILIGHT_COLOR = new THREE.Color(SKY_TWILIGHT);
+const SUN_COLOR_LOW_C = new THREE.Color(SUN_COLOR_LOW);
+const SUN_COLOR_HIGH_C = new THREE.Color(SUN_COLOR_HIGH);
+const AMBIENT_DAY_COLOR = new THREE.Color(0xffffff);
+const AMBIENT_NIGHT_COLOR = new THREE.Color(MOON_COLOR);
+
+/** Interpolação suave (Hermite) entre dois limiares — usada pra transformar
+ * a elevação do sol num fator de luz do dia contínuo. */
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
 const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso")
 // token `--amber` do SPEC ("ação planejada"): camada de edição do editor e
 // alvo clicado da fila.
@@ -681,6 +722,21 @@ export class Viewer3D {
   private readonly linearColorCache = new Map<number, [number, number, number]>();
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
+  /** Canvas/textura do gradiente do domo — `paintSky` redesenha os dois. */
+  private skyCanvas: HTMLCanvasElement | null = null;
+  private skyTexture: THREE.CanvasTexture | null = null;
+  /** Hora do mundo (ticks 0..23999) e se o addon está reportando agora. Sem
+   * jogo, a hora congela na última real; sem nenhuma, vale `DEFAULT_DAY_TIME`. */
+  private worldTime: number | null = null;
+  private worldTimeLive = false;
+  private lastSkyPaintMs = -Infinity;
+  /** Luzes do ciclo dia/noite — ver `updateDayNight`. */
+  private ambientLight: THREE.AmbientLight;
+  private sunLight: THREE.DirectionalLight;
+  private moonLight: THREE.DirectionalLight;
+  private readonly dayNightA = new THREE.Color();
+  private readonly dayNightB = new THREE.Color();
+  private readonly dayNightC = new THREE.Color();
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
@@ -688,7 +744,7 @@ export class Viewer3D {
     this.targetEl = targetEl;
 
     this.scene = new THREE.Scene();
-    this.fog = new THREE.Fog(SKY_HORIZON, FOG_NEAR_BASE, FOG_FAR_BASE);
+    this.fog = new THREE.Fog(SKY_DAY.horizon, FOG_NEAR_BASE, FOG_FAR_BASE);
     this.scene.fog = this.fog;
 
     // `far` acompanha o `maxDistance` do OrbitControls: com o zoom livre
@@ -699,7 +755,7 @@ export class Viewer3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     // O domo cobre a tela; isto é o fundo de segurança (o que aparece antes do
     // primeiro frame), por isso a cor do horizonte.
-    this.renderer.setClearColor(SKY_HORIZON, 1);
+    this.renderer.setClearColor(SKY_DAY.horizon, 1);
     container.appendChild(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -754,10 +810,15 @@ export class Viewer3D {
     // e o clique acontecia em outro.
     this.controls.addEventListener("change", this.handleCameraChange);
 
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-    const sun = new THREE.DirectionalLight(0xffffff, 0.5);
-    sun.position.set(80, 120, 40);
-    this.scene.add(sun);
+    // Luzes do ciclo dia/noite — posição/intensidade/cor reais em
+    // `updateDayNight` (o construtor só deixa a cena num dia neutro).
+    this.ambientLight = new THREE.AmbientLight(0xffffff, AMBIENT_DAY);
+    this.scene.add(this.ambientLight);
+    this.sunLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    this.sunLight.position.set(80, 120, 40);
+    this.scene.add(this.sunLight);
+    this.moonLight = new THREE.DirectionalLight(MOON_COLOR, 0);
+    this.scene.add(this.moonLight);
 
     this.sky = this.buildSky();
     this.scene.add(this.sky);
@@ -845,15 +906,6 @@ export class Viewer3D {
     const canvas = document.createElement("canvas");
     canvas.width = 2;
     canvas.height = 256;
-    const ctx = canvas.getContext("2d")!;
-    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
-    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    gradient.addColorStop(0, SKY_ZENITH);
-    gradient.addColorStop(0.55, SKY_MID);
-    gradient.addColorStop(1, SKY_HORIZON);
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     const sky = new THREE.Mesh(
@@ -867,7 +919,27 @@ export class Viewer3D {
       })
     );
     sky.frustumCulled = false; // está sempre na câmera — nunca cullar
+    this.skyCanvas = canvas;
+    this.skyTexture = texture;
+    // Estado inicial (dia claro); `updateDayNight` repinta conforme a hora.
+    this.paintSky(SKY_DAY_ZENITH, SKY_DAY_MID, SKY_DAY_HORIZON);
     return sky;
+  }
+
+  /** Redesenha o gradiente do domo (2×256) e reenvia pra GPU. Só é chamado a
+   * cada `SKY_REPAINT_MS` — o ciclo é lento e o domo não precisa de 60fps. */
+  private paintSky(zenith: THREE.Color, mid: THREE.Color, horizon: THREE.Color) {
+    const canvas = this.skyCanvas;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx || !this.skyTexture) return;
+    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    gradient.addColorStop(0, `#${zenith.getHexString()}`);
+    gradient.addColorStop(0.55, `#${mid.getHexString()}`);
+    gradient.addColorStop(1, `#${horizon.getHexString()}`);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    this.skyTexture.needsUpdate = true;
   }
 
   /** Chave numérica (x,z): o mundo do Minecraft cabe em |x|,|z| < 30M, então
@@ -1915,6 +1987,66 @@ export class Viewer3D {
   /** O domo é centrado na câmera (não no alvo): o horizonte do gradiente fica
    * sempre na linha do olhar, e o domo nunca "fica pra trás" quando a câmera
    * se afasta do bot. */
+  /** Hora real do mundo (ticks 0..23999) reportada pelo addon — ver
+   * `main.ts`/`addon_socket.rs`. `null` (sem jogo) **não** zera a hora local:
+   * a cena congela na última hora real, em vez de inventar um ciclo; sem
+   * nenhuma mensagem ainda, vale o meio-dia fixo (`DEFAULT_DAY_TIME`). */
+  setWorldTime(dayTime: number | null) {
+    if (dayTime === null) {
+      this.worldTimeLive = false;
+      return;
+    }
+    this.worldTime = ((dayTime % TICKS_PER_DAY) + TICKS_PER_DAY) % TICKS_PER_DAY;
+    this.worldTimeLive = true;
+  }
+
+  /** Move sol, lua, luz ambiente e o gradiente do céu conforme a hora do
+   * mundo. Com `worldTimeLive`, roda a cada frame (a hora local avança em
+   * `animate`); sem jogo, aplica a hora congelada uma vez e para. */
+  private updateDayNight(now: number) {
+    if (!this.worldTimeLive && this.lastSkyPaintMs !== -Infinity) return;
+
+    const time = this.worldTime ?? DEFAULT_DAY_TIME;
+    const phase = (time / TICKS_PER_DAY) * Math.PI * 2;
+    const elevation = Math.sin(phase); // -1 = meia-noite, +1 = meio-dia
+    const daylight = smoothstep(-0.12, 0.28, elevation);
+
+    // Sol nasce no leste (+X) e se põe no oeste, como no jogo.
+    this.sunLight.position.set(
+      Math.cos(phase) * SUN_DISTANCE,
+      elevation * SUN_DISTANCE,
+      SUN_DISTANCE * 0.25
+    );
+    this.sunLight.intensity = 0.5 * daylight;
+    this.sunLight.color.copy(SUN_COLOR_LOW_C).lerp(SUN_COLOR_HIGH_C, daylight);
+
+    // Lua fica do lado oposto e só rende à noite.
+    this.moonLight.position.set(
+      -Math.cos(phase) * SUN_DISTANCE,
+      -elevation * SUN_DISTANCE,
+      -SUN_DISTANCE * 0.25
+    );
+    this.moonLight.intensity = MOON_INTENSITY * (1 - daylight);
+
+    this.ambientLight.intensity = AMBIENT_NIGHT + (AMBIENT_DAY - AMBIENT_NIGHT) * daylight;
+    this.ambientLight.color.copy(AMBIENT_NIGHT_COLOR).lerp(AMBIENT_DAY_COLOR, daylight);
+
+    if (now - this.lastSkyPaintMs < SKY_REPAINT_MS) return;
+    this.lastSkyPaintMs = now;
+    // Nascer/pôr do sol deixa o horizonte quente — pico quando o sol raspa o
+    // horizonte (elevação perto de zero).
+    const twilight = Math.max(0, 1 - Math.abs(elevation) / 0.3);
+    const zenith = this.dayNightA.copy(SKY_NIGHT_ZENITH).lerp(SKY_DAY_ZENITH, daylight);
+    const mid = this.dayNightB.copy(SKY_NIGHT_MID).lerp(SKY_DAY_MID, daylight);
+    const horizon = this.dayNightC
+      .copy(SKY_NIGHT_HORIZON)
+      .lerp(SKY_DAY_HORIZON, daylight)
+      .lerp(SKY_TWILIGHT_COLOR, twilight * 0.65);
+    this.paintSky(zenith, mid, horizon);
+    this.fog.color.copy(horizon);
+    this.renderer.setClearColor(horizon, 1);
+  }
+
   private updateSky() {
     this.sky.position.copy(this.camera.position);
   }
@@ -2468,6 +2600,12 @@ export class Viewer3D {
     this.applyMovement(dt);
     this.updateBotMarker(dt);
     this.controls.update();
+    // A hora local anda 20 ticks/s enquanto o addon reporta a hora real — é
+    // isso que deixa o ciclo contínuo em vez de pular 1x/s no polling.
+    if (this.worldTimeLive && this.worldTime !== null) {
+      this.worldTime = (this.worldTime + dt * TICKS_PER_SECOND) % TICKS_PER_DAY;
+    }
+    this.updateDayNight(now);
     this.updateSky();
     this.updateFog();
     this.updateAnimation(now);

@@ -63,6 +63,11 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 
 Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resumo:
 
+**Duas versões diferentes, não confundir:** "v0" é o **protocolo** (transporte, framing e o conjunto
+de mensagens, ainda o recorte mínimo deliberado do spec); "formato 3" é só o **payload binário** do
+`chunk_voxels` (paleta + flags + nível de fluido + tints de bioma). São números independentes e
+evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTOCOL.md).
+
 - TCP, `127.0.0.1:31173`, só loopback.
 - Uma mensagem JSON por linha (`\n`-delimited), sem framing binário — dá pra
   testar até com `nc localhost 31173` digitando JSON na mão.
@@ -76,6 +81,11 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
 - `{"type":"position","x":123,"y":64,"z":45,"yaw":90.0,"pitch":12.5}` — a
   cada ~5 ticks (yaw/pitch = rotação real do jogador, usada pra orientar o
   modelo no viewer).
+- `{"type":"world_time","day_time":6000}` — hora do clock do overworld em
+  ticks (0 = nascer do sol, 6000 = meio-dia, 12000 = pôr do sol, 18000 =
+  meia-noite), a cada ~20 ticks, junto dos vitais. O app interpola a 20
+  ticks/s pro ciclo de dia/noite do viewer; sem jogo conectado, ele congela na
+  última hora real.
 - `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` —
   quando a skin muda (inclui a padrão, se o perfil ainda não carregou a
   real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
