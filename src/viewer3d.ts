@@ -88,11 +88,18 @@ const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso"
 const COLOR_AMBER = 0xf2b155;
 const MAX_EDIT_VOLUME = 50_000; // teto de blocos por operação de região (um clique só)
 
-// Clique vs. arrastar: o botão esquerdo orbita (OrbitControls) e também edita
-// (editor) ou escolhe o alvo da fila — só conta como clique se o ponteiro quase
-// não andou (um clique lento, mas parado, continua valendo).
+// Clique vs. arrastar: sem ferramenta o botão esquerdo orbita (OrbitControls) e
+// um clique parado escolhe o alvo da fila. Com ferramenta ativa o esquerdo é do
+// editor (o arrasto vira seleção de região — ver `handlePointerMove`), então o
+// mesmo limiar separa o clique do arrasto nos dois casos.
 const CLICK_MAX_MOVE_PX = 6;
 const CLICK_MAX_MS = 800;
+
+/** Alcance do DDA de picking, em voxels percorridos pelo raio. Passa da maior
+ * distância de fog (800, ver a aba Config) de propósito: com a câmera afastada
+ * do terreno o raio atravessa centenas de blocos de ar/vazio antes de achar o
+ * primeiro bloco carregado — ver `pickBlock`. */
+const RAY_MAX_STEPS = 1024;
 
 // Movimento por teclado ("voo" pela cena): o OrbitControls sozinho só responde
 // ao mouse, então qualquer deslocamento exigia arrastar/orbitar — e o alvo da
@@ -704,6 +711,20 @@ export class Viewer3D {
   private selectionA: BlockPos | null = null;
   private selectionB: BlockPos | null = null;
   private hovered: PickedBlock | null = null;
+  /** Última posição do ponteiro sobre o canvas — o realce é recalculado
+   * quando a câmera se move (`handleCameraChange`), não só quando o mouse
+   * anda: com o damping, a cena continua andando depois do arrasto e o cubo
+   * de preview ficava apontando pra um bloco que não era mais o do clique. */
+  private lastPointer: { x: number; y: number } | null = null;
+  /** Arrasto de seleção em andamento (ferramenta "select"): `anchor` é o
+   * canto fixo, o oposto segue o cursor até soltar — ver `handlePointerMove`. */
+  private selectionDrag: {
+    pointerId: number;
+    startX: number;
+    startY: number;
+    anchor: BlockPos;
+    dragging: boolean;
+  } | null = null;
   /** Cubo de arame do bloco sob o cursor / destino da colocação. */
   private hoverHelper: THREE.LineSegments;
   /** Cubo de arame da região selecionada (âmbar = planejado). */
@@ -809,7 +830,10 @@ export class Viewer3D {
     this.controls.zoomToCursor = true; // a roda aproxima no ponto do cursor, não no centro do alvo
     this.controls.maxPolarAngle = Math.PI * 0.49; // não deixa virar de cabeça pra baixo
     // Botão do meio também vira `pan` (arrastar = mover): com `zoomToCursor`
-    // a roda já dá conta do dolly, e pan é o gesto que mais falta.
+    // a roda já dá conta do dolly, e pan é o gesto que mais falta. Com uma
+    // ferramenta do editor ativa `setEditMode` troca os botões: o esquerdo
+    // passa a ser do editor e a câmera orbita no direito — sem isso o clique
+    // de seleção/colocação também girava a câmera.
     this.controls.mouseButtons = {
       LEFT: THREE.MOUSE.ROTATE,
       MIDDLE: THREE.MOUSE.PAN,
@@ -822,18 +846,26 @@ export class Viewer3D {
     window.addEventListener("keyup", this.handleKeyUp);
     window.addEventListener("blur", this.clearKeys);
 
-    // Clique parado no terreno escolhe o destino; arrastar continua orbitando
-    // (o OrbitControls escuta os mesmos eventos, então nada de preventDefault
-    // aqui — a distinção é só o movimento/tempo). O mesmo clique vira edição
-    // quando há uma ferramenta do editor ativa — ver `handlePointerUp`.
+    // Clique parado no terreno escolhe o destino; arrastar orbita (o
+    // OrbitControls escuta os mesmos eventos, então nada de preventDefault
+    // aqui — a distinção é só o movimento/tempo). Com uma ferramenta do editor
+    // ativa o mesmo clique edita e o arrasto marca região — ver
+    // `handlePointerDown`/`handlePointerMove`.
     const canvas = this.renderer.domElement;
     canvas.addEventListener("pointerdown", this.handlePointerDown);
     canvas.addEventListener("pointerup", this.handlePointerUp);
+    canvas.addEventListener("pointercancel", this.handlePointerCancel);
     canvas.addEventListener("pointermove", this.handlePointerMove);
     canvas.addEventListener("pointerleave", () => {
+      this.lastPointer = null;
       this.hovered = null;
       this.hoverHelper.visible = false;
     });
+    // O realce segue a câmera, não só o mouse: o damping continua movendo a
+    // cena por alguns frames depois do arrasto (e a pose do bot move a câmera
+    // quando o jogo está conectado) — sem isso o preview apontava pra um bloco
+    // e o clique acontecia em outro.
+    this.controls.addEventListener("change", this.handleCameraChange);
 
     // Luzes do ciclo dia/noite — posição/intensidade/cor reais em
     // `updateDayNight` (o construtor só deixa a cena num dia neutro).
@@ -1653,7 +1685,10 @@ export class Viewer3D {
       const key = this.meshQueue.shift()!;
       this.queuedChunks.delete(key);
       const chunk = this.chunks.get(key);
-      if (chunk && this.atlasUvByName) this.buildChunkMesh(chunk);
+      // Degradado (sem atlas) também monta: `buildChunkMesh` desenha cor
+      // sólida por bloco. A guarda só pelo atlas deixava todo chunk preso na
+      // fila e o mundo não aparecia quando o jar estava ausente.
+      if (chunk && (this.atlasUvByName || this.atlasUnavailable)) this.buildChunkMesh(chunk);
     } while (this.meshQueue.length > 0 && performance.now() - start < this.meshBudgetMs);
   }
 
@@ -1849,6 +1884,29 @@ export class Viewer3D {
   private handlePointerDown = (event: PointerEvent) => {
     if (event.button !== 0) return;
     this.pointerDownAt = { x: event.clientX, y: event.clientY, time: performance.now() };
+
+    // Seleção por arrasto: o âncora é o canto já marcado (se houver um
+    // pendente) ou o bloco sob o pressionar. Um clique parado segue o caminho
+    // de sempre (dois cliques marcam os cantos) — ver `handlePointerUp`.
+    if (this.editMode !== "select") return;
+    const pending = this.selectionA && !this.selectionB ? this.selectionA : null;
+    const hit = pending ? null : this.pickBlock(event.clientX, event.clientY);
+    const anchor = pending ?? hit?.pos ?? null;
+    if (!anchor) return;
+    this.selectionDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      anchor,
+      dragging: false,
+    };
+    // Captura o ponteiro: soltar fora do canvas ainda fecha o gesto (se o
+    // sistema recusar a captura, o arrasto continua valendo dentro do canvas).
+    try {
+      this.renderer.domElement.setPointerCapture(event.pointerId);
+    } catch {
+      /* ponteiro já liberado — segue sem captura */
+    }
   };
 
   private handlePointerUp = (event: PointerEvent) => {
@@ -1856,14 +1914,27 @@ export class Viewer3D {
     this.pointerDownAt = null;
     if (!down || event.button !== 0) return;
     const moved = Math.hypot(event.clientX - down.x, event.clientY - down.y);
-    if (moved > CLICK_MAX_MOVE_PX || performance.now() - down.time > CLICK_MAX_MS) return;
-    // Com uma ferramenta do editor ativa o clique é edição; o alvo da fila
-    // fica de fora (nada de mirar instrução sem querer enquanto se pinta).
+
+    // Fim de um arrasto de seleção: a região já vinha sendo desenhada desde
+    // `handlePointerMove`, soltar só encerra o gesto. Sem arrasto (clique
+    // parado), cai no caminho normal abaixo.
+    if (this.selectionDrag) {
+      const wasDrag = this.selectionDrag.dragging;
+      this.selectionDrag = null;
+      if (wasDrag) return;
+    }
+
+    // Com ferramenta ativa o clique edita — o tempo pressionado não importa
+    // (um clique lento e parado continua sendo um clique); o que separa
+    // clique de arrasto é o movimento.
     if (this.editMode) {
+      if (moved > CLICK_MAX_MOVE_PX) return;
       const hit = this.pickBlock(event.clientX, event.clientY);
       if (hit) this.applyToolAt(hit);
       return;
     }
+    // Sem ferramenta: clique parado e curto mira um destino da fila.
+    if (moved > CLICK_MAX_MOVE_PX || performance.now() - down.time > CLICK_MAX_MS) return;
     this.pickTargetAt(event.clientX, event.clientY);
   };
 
@@ -1968,6 +2039,7 @@ export class Viewer3D {
 
     if (event.code === "Escape") {
       this.setTarget(null);
+      this.clearSelection(); // cancela um canto pendente / a região marcada
       return;
     }
 
@@ -2147,12 +2219,20 @@ export class Viewer3D {
     return `${x},${y},${z}`;
   }
 
-  /** Ferramenta ativa — `null` deixa o clique só orbitando (viewer puro). */
+  /** Ferramenta ativa — `null` deixa o clique só orbitando (viewer puro). Com
+   * ferramenta ativa o botão esquerdo é do editor (clique edita, arrasto marca
+   * região) e a câmera passa pro direito (orbita) e meio (move): sem isso o
+   * clique de edição também girava a câmera — era o "a seleção interfere na
+   * câmera". Sem ferramenta nada muda (esquerdo orbita, como no viewer). */
   setEditMode(mode: EditMode | null) {
     this.editMode = mode;
+    this.controls.mouseButtons = mode
+      ? { LEFT: null, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.ROTATE }
+      : { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.PAN, RIGHT: THREE.MOUSE.PAN };
     if (!mode) {
       this.hovered = null;
       this.hoverHelper.visible = false;
+      this.selectionDrag = null;
     }
     this.onEditChange?.();
   }
@@ -2265,6 +2345,12 @@ export class Viewer3D {
     };
   }
 
+  /** Canto A marcado esperando o oposto — o status do editor mostra isso
+   * (`main.ts`) pra deixar claro que o primeiro clique valeu. */
+  getPendingCorner(): BlockPos | null {
+    return this.selectionA && !this.selectionB ? this.selectionA : null;
+  }
+
   /** Move o canvas (e o contexto WebGL) pra outro host — o editor usa o mesmo
    * renderer do viewer, como o spec descreve ("mesmo motor de render"), sem
    * abrir um segundo contexto WebGL. O `container` acompanha: é dele que saem
@@ -2278,7 +2364,41 @@ export class Viewer3D {
 
   private handlePointerMove = (event: PointerEvent) => {
     if (!this.editMode) return;
-    this.hovered = this.pickBlock(event.clientX, event.clientY);
+    this.lastPointer = { x: event.clientX, y: event.clientY };
+    const hit = this.pickBlock(event.clientX, event.clientY);
+    this.hovered = hit;
+    this.refreshHoverHelper();
+
+    const drag = this.selectionDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    if (!drag.dragging) {
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) <= CLICK_MAX_MOVE_PX) return;
+      drag.dragging = true;
+    }
+    if (!hit) return; // fora do terreno: mantém a última região válida
+    // Região ao vivo: o canto oposto segue o cursor até soltar (o status do
+    // editor mostra tamanho/coordenadas a cada movimento).
+    this.selectionA = drag.anchor;
+    this.selectionB = hit.pos;
+    this.refreshSelectionHelper();
+    this.onEditChange?.();
+  };
+
+  /** Gesto cancelado pelo sistema (ex: ponteiro perdido): encerra sem aplicar
+   * nada, senão o próximo movimento continuaria "arrastando" a seleção. */
+  private handlePointerCancel = () => {
+    this.pointerDownAt = null;
+    this.selectionDrag = null;
+  };
+
+  /** A câmera mudou (órbita, inércia do damping, voo por teclado ou follow do
+   * bot): recalcula o bloco sob o cursor pra o realce não mentir — ver
+   * `lastPointer`. Sem isso o cubo de preview ficava parado no bloco antigo
+   * enquanto o clique já cairia em outro (era a sensação de "a seleção briga
+   * com a câmera"). */
+  private handleCameraChange = () => {
+    if (!this.editMode || !this.lastPointer) return;
+    this.hovered = this.pickBlock(this.lastPointer.x, this.lastPointer.y);
     this.refreshHoverHelper();
   };
 
@@ -2330,12 +2450,17 @@ export class Viewer3D {
     let maxZ = stepZ > 0 ? (z + 1 - origin.z) * deltaZ : stepZ < 0 ? (origin.z - z) * deltaZ : Infinity;
 
     let normal: [number, number, number] = [0, 0, 0];
-    // 512 passos cobre o alcance prático da câmera (mesmo com o zoom livre);
-    // depois disso o raio já se perdeu no vazio.
-    for (let step = 0; step < 512; step++) {
+    // `RAY_MAX_STEPS` cobre além da maior distância de fog; depois disso o
+    // raio já se perdeu no vazio.
+    for (let step = 0; step < RAY_MAX_STEPS; step++) {
       const entry = this.entryAt(x, y, z);
-      if (entry === null) return null; // chunk desconhecido
-      if ((entry.flags & VOXEL_FLAG_RENDER) !== 0) {
+      // Coluna ainda sem chunks: segue em frente em vez de desistir — com a
+      // câmera afastada do terreno o raio atravessa centenas de blocos fora do
+      // cache antes de achar o primeiro bloco carregado (antes, qualquer
+      // coluna desconhecida no caminho matava o picking e não dava pra
+      // selecionar nada de longe). Terminar dentro do desconhecido continua
+      // devolvendo `null`: ali não há como saber o que tem.
+      if (entry !== null && (entry.flags & VOXEL_FLAG_RENDER) !== 0) {
         return { pos: { x, y, z }, normal };
       }
       if (maxX < maxY && maxX < maxZ) {
@@ -2513,7 +2638,12 @@ export class Viewer3D {
   }
 
   private refreshSelectionHelper() {
-    const region = this.getSelection();
+    const a = this.selectionA;
+    const b = this.selectionB;
+    // Com só o canto A marcado, a "região" é ele mesmo (1×1×1): o primeiro
+    // clique precisa de retorno visual — antes não desenhava nada e parecia
+    // que a seleção não tinha funcionado.
+    const region = this.getSelection() ?? (a && !b ? { min: a, max: a } : null);
     if (!region) {
       this.selectionHelper.visible = false;
       return;
