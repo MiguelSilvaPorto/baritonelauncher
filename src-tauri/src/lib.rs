@@ -626,32 +626,63 @@ fn load_persisted_world(app: &tauri::AppHandle) {
     }
 }
 
-/// Grava o cache agora, se a revisão mudou desde a última gravação.
-fn save_world_if_dirty(app: &tauri::AppHandle, last_saved: &mut u64) {
+/// Última revisão do mundo que foi parar no disco com sucesso. Fica num
+/// `AtomicU64` (e não numa variável local da task) porque o fechamento do app
+/// também grava — assim o exit não reescreve o que a task acabou de salvar.
+static LAST_SAVED_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot pronto pra gravar: o `encode` já saiu feito (barato, sob o lock
+/// do mundo) e a compressão/escrita fica pro chamador, **fora** do lock.
+struct PendingWorldSave {
+    path: PathBuf,
+    raw: Vec<u8>,
+    revision: u64,
+}
+
+/// Serializa o mundo se a revisão mudou desde a última gravação. Só o
+/// `encode` (memcpy dos chunks) roda com o lock do mundo segurado — comprimir
+/// ~20 MB com zlib leva ~1,2 s, e segurar o lock durante isso travava o
+/// refresh e o socket a cada gravação (ver `docs/CHANGELOG.md`).
+fn encode_world_if_dirty(app: &tauri::AppHandle) -> Option<PendingWorldSave> {
     let state = app.state::<AppState>();
     let revision = state.world_revision.load(Ordering::Relaxed);
-    if revision == *last_saved {
-        return;
+    if revision == LAST_SAVED_REVISION.load(Ordering::Relaxed) {
+        return None;
     }
-    let Ok(path) = world_cache_path(app) else {
-        return;
-    };
+    let path = world_cache_path(app).ok()?;
     let version = state.mc_version.lock().unwrap().clone();
-    let world = state.world.lock().unwrap();
-    match world_store::save(&path, &world, version.as_deref()) {
-        Ok(()) => *last_saved = revision,
-        Err(err) => eprintln!("[world_store] falha ao gravar: {err}"),
-    }
+    let raw = {
+        let world = state.world.lock().unwrap();
+        world_store::encode(&world, version.as_deref())
+    };
+    Some(PendingWorldSave {
+        path,
+        raw,
+        revision,
+    })
 }
 
 /// Gravação periódica em background (`setup()`), em vez de a cada chunk: o
 /// handler do socket aplica centenas de chunks num backfill de reconexão, e
 /// gravar por chunk transformaria isso em centenas de arquivos escritos.
 async fn world_store_task(app: tauri::AppHandle) {
-    let mut last_saved = 0u64;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WORLD_SAVE_INTERVAL_SECS)).await;
-        save_world_if_dirty(&app, &mut last_saved);
+        let Some(pending) = encode_world_if_dirty(&app) else {
+            continue;
+        };
+        let PendingWorldSave {
+            path,
+            raw,
+            revision,
+        } = pending;
+        // Compressão de CPU + I/O numa thread de blocking, sem o lock do
+        // mundo e sem segurar um worker do runtime async.
+        match tokio::task::spawn_blocking(move || world_store::write(&path, &raw)).await {
+            Ok(Ok(())) => LAST_SAVED_REVISION.store(revision, Ordering::Relaxed),
+            Ok(Err(err)) => eprintln!("[world_store] falha ao gravar: {err}"),
+            Err(err) => eprintln!("[world_store] gravação cancelada: {err}"),
+        }
     }
 }
 
@@ -686,9 +717,13 @@ pub fn run() {
         .run(|app, event| {
             // Gravação final no fechamento: o intervalo do gravador periódico
             // pode deixar os últimos segundos de exploração fora do disco.
+            // (No exit pode ser síncrono — o app está fechando.)
             if let tauri::RunEvent::Exit = event {
-                let mut last_saved = 0u64;
-                save_world_if_dirty(app, &mut last_saved);
+                if let Some(pending) = encode_world_if_dirty(app) {
+                    if let Err(err) = world_store::write(&pending.path, &pending.raw) {
+                        eprintln!("[world_store] falha na gravação final: {err}");
+                    }
+                }
             }
         });
 }
