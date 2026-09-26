@@ -20,11 +20,13 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.NeutralMob;
 import net.minecraft.world.entity.animal.Animal;
 import net.minecraft.world.entity.animal.golem.AbstractGolem;
+import net.minecraft.world.entity.animal.sheep.Sheep;
 import net.minecraft.world.entity.monster.Enemy;
 import net.minecraft.world.entity.npc.villager.AbstractVillager;
 import net.minecraft.world.entity.player.Player;
@@ -454,6 +456,18 @@ public class BaritoneOrchestratorAddonClient {
         mob.addProperty("max_health", round2(entity.getMaxHealth()));
         mob.addProperty("distance", round2(Math.sqrt(entity.distanceToSqr(player))));
         mob.addProperty("height", round2(entity.getBbHeight()));
+        // Pose real pro viewer orientar o modelo: yaw do corpo (o mesmo que o
+        // renderer do jogo usa), pitch da cabeça e o yaw da cabeça *relativo*
+        // ao corpo — exatamente o que vira `head.yRot` no modelo vanilla.
+        mob.addProperty("yaw", round2(entity.yBodyRot));
+        mob.addProperty("pitch", round2(entity.getXRot()));
+        mob.addProperty("head_yaw", round2(Mth.wrapDegrees(entity.getYRot() - entity.yBodyRot)));
+        mob.addProperty("is_baby", entity.isBaby());
+        // Só a ovelha tem camada tingível hoje: a cor da lã resolvida pelo
+        // próprio jogo. Tosquiada não manda `tint` — sem lã, sem sobreposição.
+        if (entity instanceof Sheep sheep && !sheep.isSheared()) {
+            mob.addProperty("tint", sheep.getColor().getTextureDiffuseColor() & 0xFFFFFF);
+        }
         return mob;
     }
 

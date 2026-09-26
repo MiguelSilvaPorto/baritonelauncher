@@ -814,6 +814,18 @@ async function refreshState() {
           viewer3d?.setAtlasUnavailable();
         });
     }
+    // Texturas de entidade (modelos de mob) — mesmo jar do atlas, mapa
+    // caminho → data URL (ver `texture_atlas.rs`). Uma tentativa só; sem elas
+    // os mobs continuam identificados pelo rótulo.
+    if (viewer3d.needsEntityTextures() && (status.connected || world.chunks_explored > 0)) {
+      viewer3d.markEntityTexturesLoading();
+      invoke<Record<string, string>>("get_entity_textures")
+        .then((textures) => viewer3d?.setEntityTextures(textures))
+        .catch((err) => {
+          console.warn("[mobs] sem texturas de entidade:", err);
+          viewer3d?.setEntityTexturesUnavailable();
+        });
+    }
     // Modelos de bloco reais (tocha, cogumelo, escada...): mesmo jar do
     // atlas, payload binário (ver `block_models.rs`). Uma tentativa só; se o
     // bake falhar, o viewer fica no cubo cheio de antes.

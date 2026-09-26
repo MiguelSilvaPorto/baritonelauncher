@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
+import { MobModel, mobVisualSpec } from "./entity_models";
 import {
   decodeBlockModels,
   parseProps,
@@ -385,6 +386,16 @@ export interface NearbyMob {
   max_health: number;
   height: number;
   distance: number;
+  /** Yaw do corpo em graus (0 = sul, como no jogo). */
+  yaw: number;
+  /** Pitch da cabeça em graus (positivo = olhando pra baixo). */
+  pitch: number;
+  /** Yaw da cabeça relativo ao corpo, em graus. */
+  head_yaw: number;
+  /** Filhote: o viewer troca pro modelo/textura de bebê quando existir. */
+  is_baby: boolean;
+  /** Cor de sobreposição em RGB (lã da ovelha); `null` = sem sobreposição. */
+  tint: number | null;
 }
 
 export interface ChunkPos {
@@ -485,9 +496,9 @@ interface DecodedChunk {
   maxSectionY: number;
 }
 
-/** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido e
- *  as posições desenhada (interpolada) e alvo — ver
- *  `setNearbyMobs`/`updateMobs`. */
+/** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido, o
+ *  modelo real (quando o viewer tem geometria/textura pro tipo) e as posições
+ *  desenhada (interpolada) e alvo — ver `setNearbyMobs`/`updateMobs`. */
 interface MobMarker {
   el: HTMLDivElement;
   nameEl: HTMLSpanElement;
@@ -495,6 +506,9 @@ interface MobMarker {
   mob: NearbyMob;
   target: THREE.Vector3;
   position: THREE.Vector3;
+  /** Modelo da entidade (ver `entity_models.ts`); `null` = tipo sem modelo
+   *  (ou texturas ainda não chegaram) — fica só o rótulo. */
+  model: MobModel | null;
 }
 
 /** Uma face do cubo, na ordem dos vértices em sentido anti-horário visto de
@@ -782,6 +796,17 @@ export class Viewer3D {
   /** Scratch da projeção dos rótulos (`updateMobLabels`) — evita alocar um
    *  `Vector3` por mob por frame. */
   private readonly mobScratch = new THREE.Vector3();
+  /** Texturas de entidade do jar local (comando `get_entity_textures`), chave
+   *  = caminho relativo (ex: `entity/cow/cow_temperate.png`) — ver
+   *  `entity_models.ts`. `null` = ainda não chegaram; os mobs ficam só no
+   *  rótulo até lá. Falha não é re-tentada (modo degradado, sem modelo). */
+  private entityTextures: Record<string, string> | null = null;
+  private entityTexturesLoading = false;
+  private entityTexturesUnavailable = false;
+  /** Caches compartilhados entre instâncias de mob: o mesmo PNG vira um
+   *  `THREE.Texture` (e o mesmo par textura+tint, um material). */
+  private readonly mobTextureCache = new Map<string, THREE.Texture>();
+  private readonly mobMaterialCache = new Map<string, THREE.MeshStandardMaterial>();
 
   private labelEl: HTMLDivElement;
 
@@ -2509,12 +2534,107 @@ export class Viewer3D {
     this.playerModel.setSkin(skin);
   }
 
+  /** O `main.ts` só deve tentar `get_entity_textures` quando isto for `true`:
+   * uma tentativa por vez, e nenhuma depois que as texturas chegaram/falharam
+   * — sem textura o mob fica honestamente no rótulo (mesmo padrão do
+   * `needsAtlas`). */
+  needsEntityTextures(): boolean {
+    return (
+      !this.entityTexturesUnavailable && this.entityTextures === null && !this.entityTexturesLoading
+    );
+  }
+
+  markEntityTexturesLoading() {
+    this.entityTexturesLoading = true;
+  }
+
+  /** Texturas de entidade do jar local (comando `get_entity_textures`) — é o
+   * que permite desenhar os modelos reais dos mobs (`entity_models.ts`) em vez
+   * de só rotulá-los. */
+  setEntityTextures(textures: Record<string, string>) {
+    this.entityTexturesLoading = false;
+    this.entityTextures = textures;
+    this.refreshMobModels();
+  }
+
+  /** Sem jar local (ou extração falhou): os mobs continuam identificados pelo
+   * rótulo, sem tentar de novo a cada segundo. */
+  setEntityTexturesUnavailable() {
+    this.entityTexturesLoading = false;
+    this.entityTexturesUnavailable = true;
+  }
+
+  /** Material de uma textura de mob, com `tint` opcional (a lã da ovelha).
+   * Cacheado: só o primeiro mob de cada tipo carrega o PNG. `null` = textura
+   * não extraída (jar ausente) — quem chama cai no rótulo. */
+  private mobMaterial(
+    textureKey: string,
+    tint: number | null,
+    polygonOffset = false
+  ): THREE.MeshStandardMaterial | null {
+    const dataUrl = this.entityTextures?.[textureKey];
+    if (!dataUrl) return null;
+
+    const key = `${textureKey}|${tint ?? "none"}|${polygonOffset ? "off" : "on"}`;
+    const cached = this.mobMaterialCache.get(key);
+    if (cached) return cached;
+
+    let texture = this.mobTextureCache.get(dataUrl);
+    if (!texture) {
+      texture = new THREE.TextureLoader().load(dataUrl);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      // Pixel art: nítido de perto, mipmap de longe (mesma escolha da skin).
+      texture.magFilter = THREE.NearestFilter;
+      texture.minFilter = THREE.NearestMipmapLinearFilter;
+      this.mobTextureCache.set(dataUrl, texture);
+    }
+
+    const material = new THREE.MeshStandardMaterial({
+      map: texture,
+      color: tint ?? 0xffffff,
+      roughness: 0.9,
+      // As texturas de entidade usam alpha cutout no jogo (olhos, recortes da
+      // lã) — o mesmo recorte aqui evita fundo preto virando corpo.
+      alphaTest: 0.5,
+      // Camada de sobreposição com a mesma geometria da base (lã do filhote):
+      // o jogo desenha por cima no mesmo depth; aqui o offset garante isso.
+      polygonOffset,
+      polygonOffsetFactor: polygonOffset ? -1 : 0,
+      polygonOffsetUnits: polygonOffset ? -1 : 0,
+    });
+    this.mobMaterialCache.set(key, material);
+    return material;
+  }
+
+  /** Monta o modelo real do mob (geometria do jogo + textura do jar) quando o
+   * viewer tem as duas coisas — `null` mantém só o rótulo. */
+  private buildMobModel(mob: NearbyMob): MobModel | null {
+    const spec = mobVisualSpec(mob.kind, mob.is_baby, mob.tint !== null);
+    if (!spec) return null;
+    const base = this.mobMaterial(spec.texture, null);
+    if (!base) return null;
+    const overlay = spec.overlay
+      ? this.mobMaterial(spec.overlay.texture, mob.tint ?? null, true)
+      : null;
+    const model = new MobModel(spec, base, overlay);
+    this.scene.add(model.group);
+    return model;
+  }
+
+  /** Texturas que chegaram depois do último snapshot: monta agora o modelo dos
+   * mobs que estavam só no rótulo. */
+  private refreshMobModels() {
+    for (const marker of this.mobMarkers.values()) {
+      if (!marker.model) marker.model = this.buildMobModel(marker.mob);
+    }
+  }
+
   /** Recebe o snapshot dos mobs vivos ao redor (comando `nearby_mobs`) e
-   * mantém um rótulo por mob — nome, categoria (hostil em vermelho), distância
-   * e vida. A lista é o estado atual, não um delta: mob que saiu do raio tem o
-   * rótulo removido aqui. É o que "identifica" o mob: o viewer ainda não
-   * desenha os modelos reais de entidade (ver "Known gaps"), então o marcador
-   * é a informação honesta que temos — nome, tipo e vida vêm do jogo. */
+   * mantém, por mob, o rótulo (nome, categoria — hostil em vermelho —,
+   * distância e vida) e o modelo real da entidade quando o viewer tem
+   * geometria/textura pro tipo (`entity_models.ts`). A lista é o estado
+   * atual, não um delta: mob que saiu do raio tem rótulo e modelo removidos
+   * aqui. */
   setNearbyMobs(mobs: NearbyMob[]) {
     const seen = new Set<number>();
     for (const mob of mobs) {
@@ -2529,7 +2649,15 @@ export class Viewer3D {
         el.append(nameEl, metaEl);
         this.mobLayer.appendChild(el);
         const position = new THREE.Vector3(mob.x, mob.y, mob.z);
-        marker = { el, nameEl, metaEl, mob, target: position.clone(), position };
+        marker = {
+          el,
+          nameEl,
+          metaEl,
+          mob,
+          target: position.clone(),
+          position,
+          model: this.buildMobModel(mob),
+        };
         this.mobMarkers.set(mob.id, marker);
       }
       marker.mob = mob;
@@ -2547,22 +2675,32 @@ export class Viewer3D {
     for (const [id, marker] of this.mobMarkers) {
       if (seen.has(id)) continue;
       marker.el.remove();
+      marker.model?.dispose();
       this.mobMarkers.delete(id);
     }
   }
 
   /** Interpola a posição desenhada dos mobs até o alvo do último snapshot —
    * mesma ideia do `updateBotMarker`, numa cadência mais lenta (mob anda
-   * menos que o bot correndo) e com encaixe direto em salto grande. */
+   * menos que o bot correndo) e com encaixe direto em salto grande. O modelo
+   * (quando existe) recebe a mesma posição interpolada, mais a pose real
+   * (yaw/pitch/cabeça) do snapshot. */
   private updateMobs(dt: number) {
     if (this.mobMarkers.size === 0) return;
     const step = 1 - Math.exp(-MOB_FOLLOW_RATE * dt);
     for (const marker of this.mobMarkers.values()) {
       if (marker.position.distanceTo(marker.target) > MOB_TELEPORT_DISTANCE) {
         marker.position.copy(marker.target);
-        continue;
+      } else {
+        marker.position.lerp(marker.target, step);
       }
-      marker.position.lerp(marker.target, step);
+      marker.model?.update(
+        dt,
+        marker.position,
+        marker.mob.yaw,
+        marker.mob.head_yaw,
+        marker.mob.pitch
+      );
     }
   }
 
@@ -3429,8 +3567,12 @@ export class Viewer3D {
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
     // Mobs são do mundo daquela conexão — sem addon online o snapshot deixa
-    // de existir no Rust e os rótulos não podem ficar congelados no mapa.
-    for (const marker of this.mobMarkers.values()) marker.el.remove();
+    // de existir no Rust e os rótulos/modelos não podem ficar congelados no
+    // mapa. As texturas/materiais ficam em cache (são do jar, não do mundo).
+    for (const marker of this.mobMarkers.values()) {
+      marker.el.remove();
+      marker.model?.dispose();
+    }
     this.mobMarkers.clear();
     this.clearEdits();
     this.clearSelection();

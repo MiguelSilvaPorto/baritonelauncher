@@ -122,9 +122,14 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   addon desatualizado).
 - `{"type":"entities","radius":32.0,"entities":[{"id":42,"kind":"zombie","name":"Zumbi",
   "category":"hostile","x":1.5,"y":64.0,"z":-3.25,"health":20.0,"max_health":20.0,"distance":6.2,
-  "height":1.95}, ...]}` — snapshot (~4x/s) das criaturas vivas no raio `radius` ao redor do
+  "height":1.95,"yaw":90.0,"pitch":12.5,"head_yaw":-8.0,"is_baby":false,
+  "tint":16383998}, ...]}` — snapshot (~4x/s) das criaturas vivas no raio `radius` ao redor do
   jogador, ordenadas por distância (teto de 64). `category` ∈ `hostile`/`neutral`/`passive`/`other`;
-  `name` já vem localizado pelo client e `distance`/`height` são medidos no jogo. É o estado atual,
+  `name` já vem localizado pelo client e `distance`/`height` são medidos no jogo. `yaw` é o yaw do
+  corpo (`yBodyRot`), `pitch`/`head_yaw` são a cabeça (yaw relativo ao corpo) — é o que o viewer usa
+  pra orientar e animar o modelo real do mob. `is_baby` troca pro modelo/textura de filhote; `tint`
+  só vem na ovelha com lã e é a cor real do `DyeColor` (a camada de lã do viewer é tingida com ela,
+  e ovelha tosquiada não manda o campo). É o estado atual,
   não um delta — mob que saiu do raio simplesmente não aparece mais.
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
   estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
