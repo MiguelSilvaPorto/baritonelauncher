@@ -132,7 +132,7 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
     list.innerHTML = `
       <div class="empty-state">
         <span class="headline">Fila vazia</span>
-        <span class="detail">Enfileire uma instrução acima: "Ir para" manda o bot viajar até as coordenadas x/z e "Explorar" cobre a área a partir de onde ele está — o addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
+        <span class="detail">Clique num bloco do terreno pra mirar um destino ("Ir para" ou "Explorar daqui"), ou digite as coordenadas x/z acima. O addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
       </div>
     `;
   } else {
@@ -146,30 +146,77 @@ function renderQueue(items: Instruction[]) {
   renderQueueInto("queue-list-full", "queue-count-full", items);
 }
 
+/** Enfileira e re-renderiza a fila na hora — o comando devolve o estado
+ *  atualizado, então a UI não espera o polling de 1s. */
+function pushQueueInstruction(kind: InstructionKind, target: InstructionTarget | null) {
+  return invoke<Instruction[]>("queue_push", { kind, target })
+    .then((queue) => {
+      renderQueue(queue);
+      return queue;
+    })
+    .catch((err) => {
+      console.error("[fila] enfileirar falhou:", err);
+      return null;
+    });
+}
+
 /** Mesma instrução "Ir para"/"Explorar" nos dois painéis de fila (viewer e
- *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar". */
+ *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar".
+ *  Digitar continua sendo o caminho secundário: o principal é clicar no
+ *  terreno (ver `bootstrapTargetPopup`). */
 function bootstrapQueueComposers() {
   $$<HTMLElement>(".queue-composer").forEach((composer) => {
     const xInput = composer.querySelector<HTMLInputElement>('input[name="x"]');
     const zInput = composer.querySelector<HTMLInputElement>('input[name="z"]');
+    const travelBtn = composer.querySelector<HTMLButtonElement>('[data-queue-action="travel"]');
+    const exploreBtn = composer.querySelector<HTMLButtonElement>('[data-queue-action="explore"]');
 
-    composer.querySelector('[data-queue-action="travel"]')?.addEventListener("click", () => {
+    const travel = () => {
       const x = Number(xInput?.value);
       const z = Number(zInput?.value);
       if (!Number.isFinite(x) || !Number.isFinite(z)) {
         (Number.isFinite(x) ? zInput : xInput)?.focus();
         return;
       }
-      invoke<Instruction[]>("queue_push", { kind: "TravelTo", target: { x: Math.round(x), z: Math.round(z) } })
-        .then(renderQueue)
-        .catch((err) => console.error("[fila] ir para falhou:", err));
-    });
+      pushQueueInstruction("TravelTo", { x: Math.round(x), z: Math.round(z) });
+    };
 
-    composer.querySelector('[data-queue-action="explore"]')?.addEventListener("click", () => {
-      const target = lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null;
-      invoke<Instruction[]>("queue_push", { kind: "Explore", target })
-        .then(renderQueue)
-        .catch((err) => console.error("[fila] explorar falhou:", err));
+    travelBtn?.addEventListener("click", travel);
+    // Enter no campo confirma o "Ir para" — digitar coordenada não deveria
+    // exigir tirar a mão do teclado.
+    for (const input of [xInput, zInput]) {
+      input?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          travel();
+        }
+      });
+    }
+
+    exploreBtn?.addEventListener("click", () => {
+      pushQueueInstruction("Explore", lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null);
+    });
+  });
+}
+
+/** Ações do alvo escolhido clicando no terreno (ver `viewer3d.setTarget`):
+ *  "Ir para", "Explorar daqui" e "dispensar". Só existe um popup, então o
+ *  listener é único. */
+function bootstrapTargetPopup() {
+  $("#target-popup").addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-target-action]");
+    const target = viewer3d?.getTarget();
+    if (!btn || !viewer3d || !target) return;
+
+    const action = btn.dataset.targetAction;
+    if (action === "dismiss") {
+      viewer3d.setTarget(null);
+      return;
+    }
+    const kind: InstructionKind = action === "travel" ? "TravelTo" : "Explore";
+    pushQueueInstruction(kind, { x: target.x, z: target.z }).then((queue) => {
+      // Alvo virou instrução real: o marcador âmbar sai de cena.
+      if (queue) viewer3d?.setTarget(null);
     });
   });
 }
@@ -360,6 +407,15 @@ async function refreshState() {
     }
     viewer3d.setBotPos(world.bot_pos ?? null);
 
+    // Instruções com alvo viram caixas de arame no mundo (âmbar = na fila,
+    // teal = ativa) — o viewer reflete a fila real, não uma decoração.
+    const ghosts: { id: string; active: boolean; x: number; z: number }[] = [];
+    for (const item of queue) {
+      if (!item.target || (item.status !== "Queued" && item.status !== "Active")) continue;
+      ghosts.push({ id: item.id, active: item.status === "Active", x: item.target.x, z: item.target.z });
+    }
+    viewer3d.setInstructionTargets(ghosts);
+
     // Voxels são buscados aos poucos: montar malha é CPU na thread
     // principal, então um backfill de centenas de chunks numa tacada
     // travaria o viewer. O resto fica na fila implícita do Rust e chega
@@ -386,8 +442,13 @@ window.addEventListener("DOMContentLoaded", () => {
   bootstrapTitlebar();
   bootstrapQueueComposers();
   bootstrapQueueActions();
+  bootstrapTargetPopup();
 
-  viewer3d = new Viewer3D($<HTMLElement>("#viewer-3d"), $<HTMLDivElement>("#bot-label"));
+  viewer3d = new Viewer3D(
+    $<HTMLElement>("#viewer-3d"),
+    $<HTMLDivElement>("#bot-label"),
+    $<HTMLDivElement>("#target-popup")
+  );
   window.addEventListener("resize", () => viewer3d?.resize());
 
   refreshState();

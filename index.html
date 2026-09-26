@@ -59,6 +59,14 @@
           <div class="viewer-canvas" id="viewer-canvas">
             <div class="viewer-3d" id="viewer-3d"></div>
             <div class="bot-label mono" id="bot-label"></div>
+            <div class="target-popup" id="target-popup">
+              <span class="target-coords mono"></span>
+              <div class="target-actions">
+                <button type="button" class="composer-btn" data-target-action="travel">Ir para</button>
+                <button type="button" class="composer-btn ghost" data-target-action="explore">Explorar daqui</button>
+                <button type="button" class="target-dismiss" data-target-action="dismiss" title="Dispensar alvo">×</button>
+              </div>
+            </div>
             <div class="viewer-empty" id="viewer-empty">
               <span class="headline">Nenhum bot conectado</span>
               <span class="detail">
@@ -69,6 +77,8 @@
               <span class="endpoint mono" id="viewer-endpoint">socket: aguardando implementação</span>
             </div>
             <div class="viewer-hint">
+              <span><kbd>clique</kbd> destino</span>
+              <span class="sep">·</span>
               <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> mover</span>
               <span class="sep">·</span>
               <span><kbd>Q</kbd>/<kbd>E</kbd> altura</span>
@@ -94,7 +104,7 @@
                 <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
                 <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
               </div>
-              <span class="composer-hint">Ir para = coordenadas x/z · Explorar = a partir do bot</span>
+              <span class="composer-hint">clique no terreno pra mirar um destino · ou digite x/z</span>
             </div>
             <div class="queue-list" id="queue-list"></div>
             <div class="side-footer" id="storage-footer"></div>
@@ -129,7 +139,7 @@
                 <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
                 <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
               </div>
-              <span class="composer-hint">Ir para = coordenadas x/z · Explorar = a partir do bot</span>
+              <span class="composer-hint">clique no terreno pra mirar um destino · ou digite x/z</span>
             </div>
             <div class="queue-list" id="queue-list-full"></div>
           </aside>

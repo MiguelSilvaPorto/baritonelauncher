@@ -119,6 +119,17 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Instruções sem digitar coordenada: clique no terreno pra mirar o destino** — a fila já executava
+  de verdade, mas a única forma de criar uma instrução era digitar x/z no composer, o que não combina
+  com a proposta de simplicidade do app. Agora um clique parado no terreno (a distinção com o arrastar
+  de órbita do `OrbitControls` é movimento/tempo, não botão) marca o bloco com uma caixa âmbar e abre
+  um popup no próprio ponto clicado com "Ir para" e "Explorar daqui" — o alvo vira instrução real e o
+  marcador sai de cena. `Esc` (ou clicar no céu, ou o ×) limpa o alvo. A digitação continua como
+  caminho secundário, com `Enter` confirmando o "Ir para". De quebra, toda instrução com alvo na fila
+  aparece no mundo como caixa de arame — âmbar enquanto espera, teal enquanto o bot executa —, então
+  a fila deixa de ser só uma lista lateral: dá pra ver onde cada destino fica antes de o bot chegar.
+  Reportado pelo usuário ("o sistema foi feito para ser simples e não pode simplesmente fazer o
+  usuário escrever todas as instruções automaticamente").
 - **Água e lava renderizadas de verdade — nível, transparência, animação e fluxo direcional** — o
   viewer tratava (quando renderizava) fluido como cubo opaco de 1×1×1, e `water_flow`/`lava_flow`
   eram puladas de vez, então não existia "fluxo" visual nenhum. Agora o protocolo `chunk_voxels`

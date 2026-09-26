@@ -179,6 +179,52 @@ button, input { font-family: inherit; }
   white-space: nowrap;
 }
 
+/* Alvo do clique no terreno (âmbar = planejado): coordenadas + ações. Fica
+ * acima e centralizado no bloco escolhido — a posição vem do `viewer3d.ts`,
+ * que projeta o ponto 3D na tela a cada frame. */
+.target-popup {
+  position: absolute;
+  display: none;
+  transform: translate(-50%, calc(-100% - 12px));
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--amber);
+  border-radius: var(--r-md);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  z-index: 4;
+  white-space: nowrap;
+}
+
+.target-popup::after {
+  /* Rabinho apontando pro bloco clicado. */
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  width: 8px;
+  height: 8px;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--amber);
+  border-bottom: 1px solid var(--amber);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.target-popup .target-coords { font-size: 11px; color: var(--text-2); }
+.target-popup .target-actions { display: flex; align-items: center; gap: 6px; }
+
+.target-popup .target-dismiss {
+  background: transparent;
+  border: none;
+  color: var(--text-3);
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.target-popup .target-dismiss:hover { color: var(--danger); }
+
 .viewer-empty {
   position: absolute;
   inset: 0;
