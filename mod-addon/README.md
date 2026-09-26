@@ -60,6 +60,11 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 
 Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resumo:
 
+**Duas versões diferentes, não confundir:** "v0" é o **protocolo** (transporte, framing e o conjunto
+de mensagens, ainda o recorte mínimo deliberado do spec); "formato 2" é só o **payload binário** do
+`chunk_voxels` (paleta + flags + nível de fluido). São números independentes e evoluem separados —
+referência completa em [`docs/PROTOCOL.md`](../docs/PROTOCOL.md).
+
 - TCP, `127.0.0.1:31173`, só loopback.
 - Uma mensagem JSON por linha (`\n`-delimited), sem framing binário — dá pra
   testar até com `nc localhost 31173` digitando JSON na mão.

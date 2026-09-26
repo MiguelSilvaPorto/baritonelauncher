@@ -12,7 +12,8 @@ orquestrado externamente, com:
 
 O bot é "burro" — só executa instruções literais — mas confiável. O app é o "cérebro" que decide o
 quê, quando e em que ordem. Ver [`docs/SPEC.md`](docs/SPEC.md) para a especificação completa da
-arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mudanças.
+arquitetura e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mudanças; o índice da
+documentação (com as referências externas oficiais) está em [`docs/README.md`](docs/README.md).
 
 > **Status: ponta a ponta funcionando, escopo mínimo.** A shell do app, os modelos de dados Rust, a
 > identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app, nos
@@ -109,5 +110,9 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `world_store.rs` (grava/carrega o mundo explorado em disco) e `settings.rs` (preferências da aba
   Config, em `settings.json` no diretório de dados do app).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
+- `docs/README.md` — índice da documentação, incluindo as referências externas oficiais.
+- `docs/PROTOCOL.md` — socket app ↔ addon: mensagens e formato binário do `chunk_voxels`.
+- `docs/CONFIG.md` — aba Config: campos, faixas aceitas e padrões.
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.
+- `docs/mockup-visao-principal.html` — mockup original da UI (referência visual, não doc técnica).
