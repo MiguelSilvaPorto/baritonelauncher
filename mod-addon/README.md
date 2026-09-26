@@ -38,6 +38,11 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 
 ## O que ainda não existe
 
+- **Atualização de blocos depois do load** — `chunk_voxels` é um snapshot do momento em que o chunk
+  carregou. O bot minerando/colocando bloco não reenvia nada, então o viewer fica desatualizado
+  naquele pedaço até o chunk ser recarregado.
+- **Propriedades de blockstate** — o payload manda só o nome do bloco (`oak_stairs`), não o estado
+  (`oak_stairs[facing=north,half=bottom]`); escada, laje e cerca aparecem como cubo cheio no viewer.
 - Índice de baús (`StorageIndex`).
 - `SurvivalProcess`/detecção de ameaça, simulação de `ContainerScreen` pra
   crafting/fundição — tudo isso ainda é só o que está descrito em `docs/SPEC.md`.
