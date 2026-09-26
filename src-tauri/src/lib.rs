@@ -6,10 +6,12 @@ mod texture_atlas;
 mod time_estimate;
 mod vitals;
 mod world_cache;
+mod world_store;
 
 use instructions::{Instruction, InstructionKind, InstructionQueue, InstructionStatus, InstructionTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use storage_index::{ItemTotal, StorageIndex};
@@ -41,8 +43,14 @@ pub(crate) struct AppState {
     /// Versão do Minecraft reportada no `hello` do addon — usada pra achar
     /// o client jar certo em `texture_atlas.rs`. Real, não hardcoded: se o
     /// addon nunca conectou ainda, isso fica `None` e o comando do atlas
-    /// devolve erro honesto em vez de chutar uma versão.
+    /// devolve erro honesto em vez de chutar uma versão. Fica também no
+    /// cache de mundo em disco (`world_store.rs`), pro atlas continuar
+    /// funcionando com o jogo fechado.
     pub(crate) mc_version: Mutex<Option<String>>,
+    /// Incrementado a cada chunk novo aplicado (`chunk_voxels`). O gravador
+    /// periódico do `world_store` compara com a última revisão salva e só
+    /// reescreve o arquivo quando algo mudou de verdade.
+    pub(crate) world_revision: AtomicU64,
 }
 
 /// Ids de instrução são gerados aqui (nunca pelo addon) — só precisam ser
@@ -290,6 +298,78 @@ mod commands {
     }
 }
 
+/// De quanto em quanto tempo o mundo é gravado em disco, quando há mudança.
+/// Curto o suficiente pra não perder trabalho de uma sessão, longo o
+/// suficiente pra um backfill de reconexão (centenas de chunks) virar uma
+/// gravação só.
+const WORLD_SAVE_INTERVAL_SECS: u64 = 5;
+
+/// Caminho do cache de mundo: diretório de dados do app (no Linux,
+/// `~/.local/share/dev.baritone.orchestrator/world.cache`). Fora do repo de
+/// propósito — é dado do usuário, não artefato do projeto.
+fn world_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("world.cache"))
+        .map_err(|err| err.to_string())
+}
+
+/// Carrega o mundo persistido (se existir) no `AppState` e restaura a versão
+/// do MC do último `hello` — é isso que deixa o viewer e o atlas de texturas
+/// funcionarem com o jogo fechado. Cache ausente é normal (primeira
+/// execução); cache ilegível é logado e ignorado, nunca derruba o app.
+fn load_persisted_world(app: &tauri::AppHandle) {
+    let path = match world_cache_path(app) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("[world_store] sem diretório de dados ({err}); cache desligado");
+            return;
+        }
+    };
+    match world_store::load(&path) {
+        Ok(Some(stored)) => {
+            let chunks = stored.chunks.len();
+            let state = app.state::<AppState>();
+            if let Some(version) = stored.mc_version.clone() {
+                *state.mc_version.lock().unwrap() = Some(version);
+            }
+            stored.apply_to(&mut state.world.lock().unwrap());
+            println!("[world_store] {chunks} chunks carregados de {}", path.display());
+        }
+        Ok(None) => {}
+        Err(err) => eprintln!("[world_store] cache ignorado ({err})"),
+    }
+}
+
+/// Grava o cache agora, se a revisão mudou desde a última gravação.
+fn save_world_if_dirty(app: &tauri::AppHandle, last_saved: &mut u64) {
+    let state = app.state::<AppState>();
+    let revision = state.world_revision.load(Ordering::Relaxed);
+    if revision == *last_saved {
+        return;
+    }
+    let Ok(path) = world_cache_path(app) else {
+        return;
+    };
+    let version = state.mc_version.lock().unwrap().clone();
+    let world = state.world.lock().unwrap();
+    match world_store::save(&path, &world, version.as_deref()) {
+        Ok(()) => *last_saved = revision,
+        Err(err) => eprintln!("[world_store] falha ao gravar: {err}"),
+    }
+}
+
+/// Gravação periódica em background (`setup()`), em vez de a cada chunk: o
+/// handler do socket aplica centenas de chunks num backfill de reconexão, e
+/// gravar por chunk transformaria isso em centenas de arquivos escritos.
+async fn world_store_task(app: tauri::AppHandle) {
+    let mut last_saved = 0u64;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(WORLD_SAVE_INTERVAL_SECS)).await;
+        save_world_if_dirty(&app, &mut last_saved);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
@@ -307,12 +387,22 @@ pub fn run() {
                 }
             }
 
+            load_persisted_world(app.handle());
+            tauri::async_runtime::spawn(world_store_task(app.handle().clone()));
             tauri::async_runtime::spawn(addon_socket::listen(app.handle().clone()));
 
             Ok(())
         });
 
     commands::register(builder)
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Gravação final no fechamento: o intervalo do gravador periódico
+            // pode deixar os últimos segundos de exploração fora do disco.
+            if let tauri::RunEvent::Exit = event {
+                let mut last_saved = 0u64;
+                save_world_if_dirty(app, &mut last_saved);
+            }
+        });
 }

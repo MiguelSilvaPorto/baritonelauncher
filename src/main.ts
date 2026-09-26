@@ -229,33 +229,43 @@ function renderStorage(totals: ItemTotal[]) {
 function renderViewer(status: ConnectionStatus, world: WorldSummary) {
   const empty = $("#viewer-empty");
   const endpoint = $("#viewer-endpoint");
+  const hasWorld = world.chunks_explored > 0;
 
-  if (status.connected) {
-    empty.classList.add("hidden");
-    endpoint.textContent = `socket: ${status.endpoint ?? "conectado"}`;
-    let chip = $<HTMLElement>("#progress-chip");
-    if (!chip) {
-      chip = document.createElement("div");
-      chip.id = "progress-chip";
-      chip.className = "progress-chip";
-      $("#viewer-canvas").appendChild(chip);
-    }
-    // Sem uma noção real de "total do mundo" (isso exigiria saber o quanto
-    // falta explorar, que não temos), a barra de progresso só faz sentido
-    // quando chunks_total_estimate vem preenchido. Sem isso, mostrar "0%"
-    // seria inventar um dado — então só a contagem crua.
-    chip.innerHTML =
-      world.chunks_total_estimate > 0
-        ? `
-      <div class="bar"><span style="width:${Math.round((world.chunks_explored / world.chunks_total_estimate) * 100)}%"></span></div>
-      <span class="pct mono">${Math.round((world.chunks_explored / world.chunks_total_estimate) * 100)}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
-    `
-        : `<span class="pct mono">${world.chunks_explored} chunks vistos</span>`;
-
-  } else {
+  // Sem conexão e sem nada em cache não há o que renderizar — estado honesto,
+  // e a cena é limpa (ex: primeira execução, ou cache apagado).
+  if (!status.connected && !hasWorld) {
     empty.classList.remove("hidden");
-    endpoint.textContent = "socket: aguardando implementação do addon Java";
+    endpoint.textContent = "socket: aguardando o addon Java";
     viewer3d?.clear();
+    return;
+  }
+
+  empty.classList.add("hidden");
+  endpoint.textContent = status.connected
+    ? `socket: ${status.endpoint ?? "conectado"}`
+    : "jogo não conectado — mostrando o mundo em cache";
+
+  let chip = $<HTMLElement>("#progress-chip");
+  if (!chip) {
+    chip = document.createElement("div");
+    chip.id = "progress-chip";
+    chip.className = "progress-chip";
+    $("#viewer-canvas").appendChild(chip);
+  }
+  // Sem uma noção real de "total do mundo" (isso exigiria saber o quanto
+  // falta explorar, que não temos), a barra de progresso só faz sentido
+  // quando chunks_total_estimate vem preenchido. Sem isso, mostrar "0%"
+  // seria inventar um dado — então só a contagem crua.
+  if (!status.connected) {
+    chip.innerHTML = `<span class="pct mono">${world.chunks_explored} chunks em cache</span>`;
+  } else if (world.chunks_total_estimate > 0) {
+    const pct = Math.round((world.chunks_explored / world.chunks_total_estimate) * 100);
+    chip.innerHTML = `
+      <div class="bar"><span style="width:${pct}%"></span></div>
+      <span class="pct mono">${pct}% · ${world.chunks_explored} / ${world.chunks_total_estimate} chunks</span>
+    `;
+  } else {
+    chip.innerHTML = `<span class="pct mono">${world.chunks_explored} chunks vistos</span>`;
   }
 }
 
@@ -349,21 +359,31 @@ async function refreshState() {
 
   lastBotPos = world.bot_pos ?? null;
   renderViewer(status, world);
-  if (status.connected && viewer3d) {
-    // Atlas só existe depois que o addon já mandou `hello` (é de lá que
-    // vem a versão do MC, ver src-tauri/src/lib.rs) — busca uma vez só,
-    // não a cada refresh.
-    if (!viewer3d.hasAtlas() && !viewer3d.isLoadingAtlas) {
+
+  if (viewer3d) {
+    // Atlas: não depende mais do jogo estar aberto — a versão do MC fica no
+    // cache em disco (ver `world_store.rs`), então o mundo persistido abre
+    // texturizado. Sem versão conhecida (nunca conectou), o comando falha e
+    // a tentativa se repete no próximo refresh.
+    if (
+      !viewer3d.hasAtlas() &&
+      !viewer3d.isLoadingAtlas &&
+      (status.connected || world.chunks_explored > 0)
+    ) {
       invoke<TextureAtlas>("get_texture_atlas")
         .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
-        .catch((err) => console.error("[atlas]", err));
+        .catch((err) => console.warn("[atlas] ainda indisponível:", err));
     }
+
+    // Sempre chamado: com o jogo fechado o `bot_pos` do Rust volta a ser
+    // `None`, e sem isso o marcador ficaria congelado na última posição.
     viewer3d.setBotPos(world.bot_pos ?? null);
 
     // Voxels são buscados aos poucos: montar malha é CPU na thread
     // principal, então um backfill de centenas de chunks numa tacada
     // travaria o viewer. O resto fica na fila implícita do Rust e chega
-    // nos próximos refreshes.
+    // nos próximos refreshes — vale igual pro mundo vindo do cache em
+    // disco, que também chega inteiro de uma vez em `world_chunks`.
     let budget = CHUNKS_PER_REFRESH;
     for (const pos of chunks) {
       if (budget <= 0) break;

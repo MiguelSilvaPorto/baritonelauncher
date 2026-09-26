@@ -127,6 +127,18 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Mundo explorado salvo em disco — o viewer abre sem o jogo aberto**: o cache era só em memória,
+  então fechar o app apagava tudo que já tinha sido carregado e o viewer só mostrava algo com o addon
+  conectado de novo. Agora o `WorldCache` é gravado em `world.cache`, no diretório de dados do app
+  (`~/.local/share/dev.baritone.orchestrator/` no Linux), a cada 5s quando entra chunk novo e no
+  fechamento do app — comprimido com zlib e escrito de forma atômica (tmp + rename), então um crash no
+  meio da gravação não corrompe o cache bom. No boot, o app carrega esse arquivo antes de abrir a
+  janela. A versão do Minecraft do último `hello` vai no mesmo arquivo, então o atlas de texturas
+  também funciona offline e o mundo em cache abre já texturizado. A UI mantém a cena e busca
+  atlas/voxels mesmo desconectada, com o chip mostrando "N chunks em cache" e o rodapé "jogo não
+  conectado — mostrando o mundo em cache"; sem cache nenhum, continua o estado vazio honesto de
+  sempre. Nada é inventado: é o dado real que o addon mandou e foi salvo. Reportado pelo usuário
+  ("quero que adicione um cache que evita eu sempre ter o jogo aberto para ver oque já carreguei").
 - **Água e lava renderizadas de verdade — nível, transparência, animação e fluxo direcional** — o
   viewer tratava (quando renderizava) fluido como cubo opaco de 1×1×1, e `water_flow`/`lava_flow`
   eram puladas de vez, então não existia "fluxo" visual nenhum. Agora o protocolo `chunk_voxels`
