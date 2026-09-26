@@ -191,6 +191,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Cores de bioma reais no viewer — fim do verde único**: o addon agora manda, junto de cada chunk, as
+  cores de bioma **por coluna** (grama, folhagem e água), resolvidas pelo `BiomeColors` do próprio
+  client — o mesmo colormap de temperatura/umidade, override de bioma e modificador de
+  pântano/floresta escura que o jogo aplica ao renderizar. O viewer usa essa cor por bloco: topo do
+  `grass_block`, folhas (carvalho, jungle, acácia, dark oak, mangrove), videira, lírio-d'água,
+  cana-de-açúcar e água (que agora é tingida por vértice, não por material único). Cada bioma passa a
+  ter a cor que tem no jogo — savana amarelada, pântano escuro com água marrom, taiga azulada,
+  badlands alaranjado etc. — em vez de um "verde floresta" fixo. O payload binário dos chunks sobe
+  pro formato 3 (bloco de tints no fim; o `world.cache` gravado antes continua abrindo, só sem tints,
+  caindo nas cores fixas aproximadas) e **o jar do addon precisa ser rebuildado** — com o jar antigo o
+  app avisa no console e mantém o comportamento antigo.
+- **Lado do bloco de grama com a camada de overlay do jogo**: o lado do `grass_block` só tinha a
+  textura base (terra + franja fixa, que não muda de bioma); o modelo vanilla desenha uma segunda
+  camada cinza (`grass_block_side_overlay`) por cima, tingida com a cor de grama do bioma. Agora o
+  viewer desenha essa camada também, então o lado da grama acompanha o bioma tanto quanto o topo.
 - **Aba "Config" com preferências reais, salvas em disco**: quinta view na rail (engrenagem) pra
   ajustar o **viewer 3D** e o **comportamento do app**, sem mudar nada até o usuário mexer — os
   padrões são exatamente as constantes que o app já usava. No viewer: distância do horizonte (fog),
