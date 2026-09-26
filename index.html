@@ -59,6 +59,31 @@
           <div class="viewer-canvas" id="viewer-canvas">
             <div class="viewer-3d" id="viewer-3d"></div>
             <div class="bot-label mono" id="bot-label"></div>
+            <div class="target-popup" id="target-popup">
+              <span class="target-coords mono"></span>
+              <div class="target-actions">
+                <input
+                  class="composer-input mono"
+                  type="number"
+                  name="radius"
+                  min="16"
+                  max="5000"
+                  step="16"
+                  placeholder="raio 256"
+                  title="Raio da exploração em blocos"
+                />
+                <select class="composer-input mono" name="style" title="Padrão de varredura da exploração">
+                  <option value="Circles">círculos</option>
+                  <option value="Zigzag">zigue-zague</option>
+                  <option value="auto">automático</option>
+                </select>
+              </div>
+              <div class="target-actions">
+                <button type="button" class="composer-btn" data-target-action="travel">Ir para</button>
+                <button type="button" class="composer-btn ghost" data-target-action="explore">Explorar daqui</button>
+                <button type="button" class="target-dismiss" data-target-action="dismiss" title="Dispensar alvo">×</button>
+              </div>
+            </div>
             <div class="viewer-empty" id="viewer-empty">
               <span class="headline">Nada carregado ainda</span>
               <span class="detail">
@@ -69,6 +94,8 @@
               <span class="endpoint mono" id="viewer-endpoint">socket: aguardando o addon Java</span>
             </div>
             <div class="viewer-hint">
+              <span><kbd>clique</kbd> destino</span>
+              <span class="sep">·</span>
               <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> mover</span>
               <span class="sep">·</span>
               <span><kbd>Q</kbd>/<kbd>E</kbd> altura</span>
@@ -92,9 +119,26 @@
                 <input class="composer-input mono" type="number" name="x" placeholder="x" step="1" />
                 <input class="composer-input mono" type="number" name="z" placeholder="z" step="1" />
                 <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
+              </div>
+              <div class="composer-row">
+                <input
+                  class="composer-input mono"
+                  type="number"
+                  name="radius"
+                  min="16"
+                  max="5000"
+                  step="16"
+                  placeholder="raio 256"
+                  title="Raio da exploração em blocos"
+                />
+                <select class="composer-input mono" name="style" title="Padrão de varredura da exploração">
+                  <option value="Circles">círculos</option>
+                  <option value="Zigzag">zigue-zague</option>
+                  <option value="auto">automático</option>
+                </select>
                 <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
               </div>
-              <span class="composer-hint">Ir para = coordenadas x/z · Explorar = a partir do bot</span>
+              <span class="composer-hint">clique no terreno pra mirar um destino · Explorar usa o raio/estilo</span>
             </div>
             <div class="queue-list" id="queue-list"></div>
             <div class="side-footer" id="storage-footer"></div>
@@ -127,9 +171,26 @@
                 <input class="composer-input mono" type="number" name="x" placeholder="x" step="1" />
                 <input class="composer-input mono" type="number" name="z" placeholder="z" step="1" />
                 <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
+              </div>
+              <div class="composer-row">
+                <input
+                  class="composer-input mono"
+                  type="number"
+                  name="radius"
+                  min="16"
+                  max="5000"
+                  step="16"
+                  placeholder="raio 256"
+                  title="Raio da exploração em blocos"
+                />
+                <select class="composer-input mono" name="style" title="Padrão de varredura da exploração">
+                  <option value="Circles">círculos</option>
+                  <option value="Zigzag">zigue-zague</option>
+                  <option value="auto">automático</option>
+                </select>
                 <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
               </div>
-              <span class="composer-hint">Ir para = coordenadas x/z · Explorar = a partir do bot</span>
+              <span class="composer-hint">clique no terreno pra mirar um destino · Explorar usa o raio/estilo</span>
             </div>
             <div class="queue-list" id="queue-list-full"></div>
           </aside>

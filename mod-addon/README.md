@@ -25,6 +25,11 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   que o viewer monta o terreno com face culling de verdade, inclusive água e
   lava. A fila drena poucos chunks por tick pra um backfill de reconexão não
   travar o jogo.
+- Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
+  "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
+  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
+  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios); a
+  leitura roda numa thread própria e a execução acontece na thread do cliente.
 - Reconecta sozinho (a cada 5s) se o app Rust não estiver rodando ainda — não
   trava nem falha o carregamento do mod.
 - `neoforge.mods.toml` declara Baritone (`modId="baritoe"` — não é
@@ -87,6 +92,10 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
   `ICustomGoalProcess.setGoalAndPath(new GoalXZ(x, z))`.
 - `{"type":"instruction","id":"i2","kind":"explore"}` (com `x`/`z` opcionais) —
   `IExploreProcess.explore(origemX, origemZ)`; sem coordenadas, usa os pés do bot.
+- `{"type":"instruction","id":"i3","kind":"explore","x":0,"z":0,"radius":256,"style":"circles"}`
+  (`style` = `circles` ou `zigzag`) — exploração com área definida: o addon gera os waypoints
+  (passo entre faixas/anéis = render distance efetiva) e os percorre com `GoalXZ`, reportando
+  progresso real; waypoint inalcançável é pulado. Sem `radius`/`style`, é o `explore` nativo acima.
 - `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()`.
 
 O recebimento roda numa thread leitora que só enfileira as linhas; a execução
