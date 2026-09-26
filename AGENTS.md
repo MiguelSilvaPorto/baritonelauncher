@@ -39,7 +39,8 @@ There is no component framework and no bundled state library: `main.ts` renders 
   plain DOM/innerHTML.
 - **Backend:** Rust (edition 2021) · Tauri 2 · `serde`/`serde_json` · `tauri-plugin-opener` ·
   `tauri-plugin-dialog` · `tokio` (powers `addon_socket.rs`, the local TCP server the Java addon
-  connects to).
+  connects to) · `image`/`zip`/`base64` (read-only jar/texture extraction in `texture_atlas.rs`, see
+  rule 9 below).
 - **Styling:** one `src/styles.css`, plain CSS custom properties under `:root` — the fixed dark
   identity from `docs/SPEC.md` ("Identidade visual"), not a multi-theme system.
 - **Addon:** Java 25 · NeoForge (ModDevGradle) · `mod-addon/`, a normal Gradle project you build with
@@ -94,6 +95,13 @@ There is no test suite yet.
    standalone variant obfuscates the `baritone.api` package too, so it silently can't be used as a
    dependency — see `mod-addon/README.md` for the full explanation (sourced from Baritone's own
    `SETUP.md`).
+10. **Never download, bundle, or commit Mojang/Minecraft assets (textures, models, sounds, the client
+    jar itself) anywhere in this repo.** Explicit user requirement — Mojang's license doesn't allow
+    redistributing game files. `texture_atlas.rs` only reads the client jar the user already has
+    installed locally (`~/.minecraft/versions/...`) and writes its derived atlas to the gitignored
+    `src-tauri/.cache/`. If you extend asset ingestion (models, sounds, `minecraft-data` itself),
+    follow the same pattern: read from what's already installed, cache outside git, never fetch from
+    Mojang's CDN or vendor a copy into the repo.
 
 ## 6. Architecture at a glance
 
@@ -119,22 +127,32 @@ There is no test suite yet.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, all behind `Mutex`) + the six commands currently exposed:
-  `connection_status`, `world_summary`, `world_chunks`, `queue_snapshot`, `storage_totals`,
-  `vitals_snapshot`. Spawns `addon_socket::listen` in `setup()`.
+  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, all behind `Mutex`) + the seven
+  commands currently exposed: `connection_status`, `world_summary`, `world_chunks`, `queue_snapshot`,
+  `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns `addon_socket::listen` in `setup()`.
 - `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line. Handles `hello`
   (marks `AppState.connection` as connected), `vitals` (fills `AppState.vitals`), `position` (fills
   `AppState.bot_pos`), and `chunk_loaded` (marks presence in `AppState.world` via `apply_delta` with
   an empty block map — deliberately cumulative, not removed on unload; see the module doc-comment for
-  why). The matching Java client is
+  why) and stores the version from `hello` in `AppState.mc_version` (used by `texture_atlas.rs` to
+  find the matching local jar — never hardcode a version here, read it from this field). The matching
+  Java client is
   `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
   Extending the protocol further (e.g. real block data, chest contents) means updating the
   `AddonMessage` enum here **and** the Java sender in lockstep — they're not generated from a shared
   schema.
 - `world_cache.rs` — sparse per-chunk block cache (`WorldCache`). Chunk presence is real
-  (`chunk_loaded` messages), but no chunk has actual block data yet — that depends on the texture
-  atlas pipeline from `docs/SPEC.md`, "Blocos 3D", not implemented. Also `CrossingStrategy` for the
-  learned water/lava crossing policy.
+  (`chunk_loaded` messages), but no chunk has actual block data yet — the addon doesn't send any.
+  Also `CrossingStrategy` for the learned water/lava crossing policy.
+- **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
+  (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
+  `src-tauri/.cache/` (gitignored). **Never download or bundle Mojang assets** — this reads only what
+  the user already has installed, per explicit user requirement (Mojang's license doesn't allow
+  redistributing game assets). Only handles 16×16 textures (animated ones, e.g. water/lava, are taller
+  multi-frame PNGs and are skipped — no animation support yet). Has a real integration test
+  (`cargo test texture_atlas`) that runs against whatever local jar exists, skipping itself (not
+  failing) if none is found — keep that skip behavior if you touch this file, other environments won't
+  have the jar.
 - `storage_index.rs` — `StorageIndex` (chest position → contents) and `aggregated_totals()`.
 - `items.rs` — `Item`, `Block`, `Recipe`, `IngredientRef`, `RecipeType`, `Station`, and
   `fits_inventory_2x2()` per the spec's "Receitas 2×2" section. Not populated from `minecraft-data`
@@ -163,11 +181,13 @@ There is no test suite yet.
   `StorageIndex`/`InstructionQueue` stay empty even with the addon connected.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **No 3D block rendering.** The Three.js scene (`src/viewer3d.ts`) uses real chunk positions and real
-  bot coordinates, but each chunk is a flat plate — no actual block content, because none is sent yet
-  (`chunk_loaded` is presence-only). Needs the texture atlas pipeline from `docs/SPEC.md`, "Blocos 3D."
-- **No `minecraft-data`/jar ingestion.** Item/block/recipe/texture structs exist but nothing
-  populates them.
+- **No real terrain, only a placeholder texture.** The texture atlas pipeline (`texture_atlas.rs`)
+  works and is wired into `viewer3d.ts`, but every chunk plate gets the same hardcoded
+  `PLACEHOLDER_TEXTURE` ("grass_block_top") because `chunk_loaded` is still presence-only — no actual
+  block content or height-per-column comes from the addon. Fixing this needs a protocol change
+  (addon sends real block/height data), not more atlas work.
+- **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
+  (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
 - **`StorageIndex` is in-memory only** — no persistence across restarts.
 - **Schematic editor is a placeholder panel**, not an implementation.
 

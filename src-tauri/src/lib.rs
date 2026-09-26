@@ -2,6 +2,7 @@ mod addon_socket;
 mod instructions;
 mod items;
 mod storage_index;
+mod texture_atlas;
 mod time_estimate;
 mod vitals;
 mod world_cache;
@@ -29,6 +30,11 @@ pub(crate) struct AppState {
     /// Última posição (pés do jogador) reportada pelo addon. Mapeada no
     /// grid do viewer em `src/main.ts` (`worldToScreen`).
     pub(crate) bot_pos: Mutex<Option<BlockPos>>,
+    /// Versão do Minecraft reportada no `hello` do addon — usada pra achar
+    /// o client jar certo em `texture_atlas.rs`. Real, não hardcoded: se o
+    /// addon nunca conectou ainda, isso fica `None` e o comando do atlas
+    /// devolve erro honesto em vez de chutar uma versão.
+    pub(crate) mc_version: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -82,6 +88,21 @@ mod commands {
         state.vitals.lock().unwrap().clone()
     }
 
+    /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco a
+    /// partir do client jar que o usuário já tem instalado — nunca baixa
+    /// nada. Precisa saber a versão do MC, que só existe depois que o addon
+    /// mandou `hello` ao menos uma vez.
+    #[tauri::command]
+    fn get_texture_atlas(state: State<AppState>) -> Result<crate::texture_atlas::TextureAtlas, String> {
+        let version = state
+            .mc_version
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "Ainda não sei a versão do Minecraft — conecte o addon primeiro.".to_string())?;
+        crate::texture_atlas::build_or_load_atlas(&version)
+    }
+
     pub(super) fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         builder.invoke_handler(tauri::generate_handler![
             connection_status,
@@ -90,6 +111,7 @@ mod commands {
             queue_snapshot,
             storage_totals,
             vitals_snapshot,
+            get_texture_atlas,
         ])
     }
 }

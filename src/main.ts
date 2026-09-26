@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, type ChunkPos, type BotPos } from "./viewer3d";
+import { Viewer3D, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
+
+interface TextureAtlas {
+  image_data_url: string;
+  textures: Record<string, UvRect>;
+}
 
 /* ---------- Tipos (espelham as structs em src-tauri/src) ---------- */
 
@@ -264,6 +269,14 @@ async function refreshState() {
 
   renderViewer(status, world);
   if (status.connected && viewer3d) {
+    // Atlas só existe depois que o addon já mandou `hello` (é de lá que
+    // vem a versão do MC, ver src-tauri/src/lib.rs) — busca uma vez só,
+    // não a cada refresh.
+    if (!viewer3d.hasAtlas() && !viewer3d.isLoadingAtlas) {
+      invoke<TextureAtlas>("get_texture_atlas")
+        .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
+        .catch((err) => console.error("[atlas]", err));
+    }
     // Chunk novo usa a altura atual do bot como aproximação de "chão local"
     // — não temos altura de terreno de verdade ainda, ver viewer3d.ts.
     viewer3d.setChunks(chunks, world.bot_pos?.y ?? 0);

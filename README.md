@@ -77,16 +77,18 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `StorageIndex`/fila continuam vazios mesmo com o addon conectado.
 - **`SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen`** no addon — só descrito em
   `docs/SPEC.md`, sem código ainda.
-- **Blocos texturizados dentro dos chunks** (greedy meshing, atlas de texturas do jar do Minecraft) —
-  o viewer 3D (`src/viewer3d.ts`, Three.js/WebGL) já renderiza os chunks explorados e o bot em
-  coordenadas reais numa cena orbitável de verdade, mas cada chunk é uma placa lisa, sem nenhum bloco
-  dentro. Isso depende do pipeline de atlas descrito em `docs/SPEC.md`, "Blocos 3D". (O spec descreve
-  esse renderer como wgpu nativo; aqui é WebGL dentro do próprio webview do app — decisão explícita
-  pra evitar o risco de embutir uma superfície wgpu numa janela separada sem conseguir validar
-  visualmente.)
-- **Ingestão do `minecraft-data`** (itens/blocos/receitas) e do jar oficial (texturas/modelos/atlas) —
-  os structs Rust (`Item`, `Block`, `Recipe`, `IngredientRef`) já existem em
-  `src-tauri/src/items.rs`, incluindo a função `fits_inventory_2x2`, mas nada os popula ainda.
+- **Terreno de verdade com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
+  (`src/viewer3d.ts`, Three.js/WebGL) já renderiza os chunks explorados e o bot em coordenadas reais
+  numa cena orbitável de verdade, e já texturiza cada placa com uma textura real extraída do jar local
+  (`src-tauri/src/texture_atlas.rs`) — mas hoje é sempre a mesma textura representante
+  (`grass_block_top`), não o bloco real de cada chunk, porque o addon ainda só manda presença de chunk,
+  não conteúdo. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio webview
+  do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela separada sem
+  conseguir validar visualmente.)
+- **Ingestão do `minecraft-data`** (itens/blocos/receitas) — os structs Rust (`Item`, `Block`,
+  `Recipe`, `IngredientRef`) já existem em `src-tauri/src/items.rs`, incluindo a função
+  `fits_inventory_2x2`, mas nada os popula ainda. (Diferente do atlas de texturas, que já lê o jar
+  local de verdade — isso aqui ainda não foi implementado.)
 - **Editor de schematic** — placeholder na UI explicando a dependência do atlas de texturas.
 - **Persistência** do `StorageIndex` (hoje só em memória).
 
@@ -94,7 +96,8 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 
 - `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `viewer3d.ts` (o renderer 3D,
   Three.js/WebGL) + `styles.css`.
-- `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon).
+- `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon) e
+  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.

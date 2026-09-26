@@ -42,7 +42,6 @@ enum AddonMessage {
         addon_version: String,
         #[allow(dead_code)]
         baritone_version: String,
-        #[allow(dead_code)]
         mc_version: String,
     },
     Vitals {
@@ -103,10 +102,12 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
         };
 
         match message {
-            AddonMessage::Hello { .. } => {
+            AddonMessage::Hello { mc_version, .. } => {
                 let mut connection = state.connection.lock().unwrap();
                 connection.connected = true;
                 connection.endpoint = Some(peer.clone());
+                drop(connection);
+                *state.mc_version.lock().unwrap() = Some(mc_version);
             }
             AddonMessage::Vitals {
                 health,

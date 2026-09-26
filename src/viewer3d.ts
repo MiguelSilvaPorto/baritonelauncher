@@ -23,6 +23,14 @@ const COLOR_CHUNK = 0x14181d;
 const COLOR_CHUNK_EDGE = 0x262c34;
 const COLOR_TEAL = 0x5eead4;
 
+// O addon ainda não manda qual bloco tem em cada chunk (só presença — ver
+// addon_socket.rs, "chunk_loaded"), então não dá pra texturizar com o bloco
+// real de cada um. Em vez de deixar sem textura nenhuma, usa um
+// representante fixo só pra provar que o atlas extraído do jar local
+// funciona ponta a ponta — vira textura real por chunk assim que o addon
+// mandar o bloco de superfície de verdade.
+const PLACEHOLDER_TEXTURE = "grass_block_top";
+
 export interface ChunkPos {
   x: number;
   z: number;
@@ -32,6 +40,13 @@ export interface BotPos {
   x: number;
   y: number;
   z: number;
+}
+
+export interface UvRect {
+  u0: number;
+  v0: number;
+  u1: number;
+  v1: number;
 }
 
 export class Viewer3D {
@@ -47,6 +62,10 @@ export class Viewer3D {
   private lastBotWorldPos: THREE.Vector3 | null = null;
 
   private labelEl: HTMLDivElement;
+
+  private atlasTexture: THREE.Texture | null = null;
+  private atlasUvByName: Record<string, UvRect> | null = null;
+  private atlasLoading = false;
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement) {
     this.container = container;
@@ -101,6 +120,52 @@ export class Viewer3D {
     return `${pos.x},${pos.z}`;
   }
 
+  hasAtlas(): boolean {
+    return this.atlasTexture !== null;
+  }
+
+  get isLoadingAtlas(): boolean {
+    return this.atlasLoading;
+  }
+
+  /** Recebe o atlas já extraído/empacotado pelo lado Rust (data URL + mapa
+   * de UV) e prepara a textura pro Three.js. Chamado uma vez, quando o
+   * comando `get_texture_atlas` resolve — ver `main.ts`. */
+  setAtlas(dataUrl: string, textures: Record<string, UvRect>) {
+    this.atlasLoading = true;
+    new THREE.TextureLoader().load(
+      dataUrl,
+      (texture) => {
+        // Pixel art do Minecraft: sem suavização, sem mipmap borrando os tiles.
+        texture.magFilter = THREE.NearestFilter;
+        texture.minFilter = THREE.NearestFilter;
+        texture.generateMipmaps = false;
+        texture.colorSpace = THREE.SRGBColorSpace;
+        // As UVs são calculadas em espaço de pixel da imagem (v0 = topo),
+        // então desliga o flip automático do Three pra não inverter de novo.
+        texture.flipY = false;
+        this.atlasTexture = texture;
+        this.atlasUvByName = textures;
+        this.atlasLoading = false;
+      },
+      undefined,
+      (err) => {
+        console.error("[viewer3d] falha ao carregar atlas de texturas:", err);
+        this.atlasLoading = false;
+      }
+    );
+  }
+
+  private remapUv(geometry: THREE.PlaneGeometry, rect: UvRect) {
+    const uv = geometry.attributes.uv;
+    for (let i = 0; i < uv.count; i++) {
+      const u = uv.getX(i);
+      const v = uv.getY(i);
+      uv.setXY(i, rect.u0 + u * (rect.u1 - rect.u0), rect.v0 + v * (rect.v1 - rect.v0));
+    }
+    uv.needsUpdate = true;
+  }
+
   /** Chunks só são adicionados, nunca removidos — ver doc-comment do módulo
    * e de `addon_socket.rs`: é o "já explorado" cumulativo.
    *
@@ -129,6 +194,16 @@ export class Viewer3D {
         new THREE.LineBasicMaterial({ color: COLOR_CHUNK_EDGE })
       );
       group.add(edges);
+
+      const rect = this.atlasUvByName?.[PLACEHOLDER_TEXTURE];
+      if (this.atlasTexture && rect) {
+        const top = new THREE.PlaneGeometry(CHUNK_SIZE - 0.5, CHUNK_SIZE - 0.5);
+        top.rotateX(-Math.PI / 2);
+        this.remapUv(top, rect);
+        const topMesh = new THREE.Mesh(top, new THREE.MeshStandardMaterial({ map: this.atlasTexture, roughness: 0.95 }));
+        topMesh.position.y = 0.21; // logo acima da placa, evita z-fighting
+        group.add(topMesh);
+      }
 
       group.position.set(pos.x * CHUNK_SIZE + CHUNK_SIZE / 2, referenceY, pos.z * CHUNK_SIZE + CHUNK_SIZE / 2);
       this.scene.add(group);

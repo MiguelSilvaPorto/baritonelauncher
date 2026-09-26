@@ -46,6 +46,20 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Pipeline de atlas de texturas** (`src-tauri/src/texture_atlas.rs`): extrai as texturas de bloco do
+  client jar do Minecraft **que o usuário já tem instalado localmente**
+  (`~/.minecraft/versions/<versão>/<versão>.jar`) — nunca baixa nem empacota nada da Mojang neste
+  repositório, por exigência explícita do usuário (licença da Mojang não permite redistribuir assets
+  do jogo). Filtra só texturas 16×16 (pula as animadas, tipo água/lava, que vêm como PNG mais alto com
+  frames empilhados), empacota num atlas em grid, cacheia em `src-tauri/.cache/` (gitignored) como PNG
+  + JSON de UV por nome de textura. Testado com um teste de integração real
+  (`cargo test texture_atlas`) contra o jar de `26.3` já instalado nesta máquina: 500+ texturas
+  extraídas, `grass_block_top` confirmada. Novo comando Tauri `get_texture_atlas`, que usa a versão do
+  MC real reportada pelo `hello` do addon (`AppState.mc_version`), não uma hardcoded.
+- **Placas de chunk agora têm uma textura real por cima**: `viewer3d.ts` carrega o atlas uma vez
+  (quando o addon conecta) e aplica `grass_block_top` como representante em toda placa nova — ainda não
+  é o bloco real de cada chunk (o addon só manda presença, não conteúdo — ver "Known gaps"), mas prova
+  que o pipeline de textura funciona ponta a ponta dentro da cena 3D de verdade.
 - **Scaffold inicial do projeto**: shell Tauri 2 + Vite + TypeScript (sem framework), estrutura de
   pastas espelhando o padrão do launcher (`src/`, `src-tauri/`, `docs/`, `scripts/`, `public/`).
 - **Identidade visual** implementada em `src/styles.css` fiel a `docs/SPEC.md`: fundo `#0a0c0f`,
@@ -126,9 +140,11 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   inventário nem comandos do lado Rust pro addon ainda (ver `mod-addon/README.md`).
 - `SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen` (crafting/fundição) no addon —
   ainda só descrito em `docs/SPEC.md`.
-- Renderer 3D existe (Three.js/WebGL, câmera orbitável, chunks e bot reais), mas sem blocos
-  texturizados — cada chunk é uma placa lisa, não terreno de verdade. Depende do pipeline de atlas de
-  `docs/SPEC.md`, "Blocos 3D", que não existe ainda.
-- Sem ingestão de `minecraft-data`/jar oficial (itens, blocos, receitas, texturas).
+- Pipeline de atlas de texturas existe e funciona, mas ainda usa um representante fixo
+  (`grass_block_top`) em toda placa — não o bloco real de cada chunk, porque `chunk_loaded` ainda não
+  manda conteúdo de bloco (só presença). Sem isso, não dá pra ter terreno de verdade (altura por
+  coluna) nem textura correta por posição.
+- Sem ingestão de `minecraft-data` (itens, blocos, receitas) — diferente do atlas de texturas, que já
+  lê o jar local, essa parte ainda não existe.
 - `StorageIndex` só em memória, sem persistência.
 - Editor de schematic é um painel de placeholder, sem implementação.
