@@ -699,6 +699,7 @@ mod tests {
                 level: 0,
             }],
             indices: vec![0; 4096],
+            light: vec![0xf0; 4096],
         }];
         world.apply_voxels(pos, other.clone(), None);
         assert_eq!(world.chunk_voxels_bytes(pos), encode_voxels(&other, None));
