@@ -12,6 +12,14 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Nuvem passando por cima deixava o viewer num breu**: a camada de nuvens fica em y≈192 e, quando a
+  câmera subia até essa altura (o voo do viewer vai aonde o usuário quiser), a folha de 80% de
+  opacidade ficava **entre a câmera e o terreno** — de dia esbranquiçava a vista, de noite (cor quase
+  preta do multiplicador noturno do jogo) apagava tudo. Agora a camada some suavemente conforme a
+  câmera chega na altura dela (fade ao longo da travessia dos 4 blocos da camada + 8 de folga) e
+  volta ao normal quando a câmera desce — abaixo das nuvens nada muda, continua a nuvem do jogo.
+  Reportado pelo usuário ("se uma nuvem passa por cima fica um breu no viewer").
+
 - **FPS travado conforme o mundo explorado cresce**: todo chunk já visto ficava na cena pra sempre, e
   o custo por frame (draw calls, triângulos, memória) crescia sem limite com a exploração — quanto
   mais chunks apareciam na tela (zoom afastado), pior ficava, até travar. Agora o viewer mantém uma
