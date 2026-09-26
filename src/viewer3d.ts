@@ -243,15 +243,31 @@ export const CHUNKS_PER_REFRESH = 16;
 
 /** Teto de chunks que o backend devolve por consulta (`world_chunks_near`),
  * já ordenados por distância do bot. O viewer filtra os que já tem e pede
- * só o que falta; consultas continuam baratas mesmo com o cache inteiro
- * persistido (que cresce sem limite). */
-export const NEARBY_CHUNK_LIMIT = 1024;
+ * só o que falta; a janela mantida (`CHUNK_KEEP_RADIUS_MAX`) cabe aqui com
+ * folga — consultas continuam baratas mesmo com o cache inteiro persistido
+ * (que cresce sem limite). */
+export const NEARBY_CHUNK_LIMIT = 4096;
 
 /** Orçamento de CPU por frame pra montar malhas de chunk, em ms — padrão do
  * app; a aba Config pode mudar (`applySettings`). Um backfill pode enfileirar
  * centenas de chunks; montar todos de uma vez derruba o fps, então a fila é
  * drenada em pedaços por frame. */
 const MESH_BUDGET_MS = 8;
+
+/** Raio (em chunks) da janela de terreno **mantida desenhada** ao redor das
+ * âncoras (bot e alvo da câmera). O mundo explorado é cumulativo e cresce sem
+ * limite: sem uma janela, todo chunk já visto ficaria na cena pra sempre e o
+ * custo por frame (draw calls, triângulos, memória) cresceria junto com a
+ * exploração. Fora do raio a malha é escondida e, mais além, descartada — o
+ * Rust continua com os voxels e eles voltam a ser pedidos quando o chunk
+ * chega perto de novo. */
+const CHUNK_KEEP_RADIUS_MIN = 10;
+const CHUNK_KEEP_RADIUS_MAX = 26;
+/** Margem (chunks) além do raio mantido antes de descartar de verdade —
+ * histerese: um vai-e-vem na borda não pode desmontar/remontar toda hora. */
+const CHUNK_UNLOAD_MARGIN = 12;
+/** Período da varredura da janela, em ms. */
+const CHUNK_SWEEP_MS = 700;
 
 export interface BotPos {
   x: number;
@@ -576,6 +592,11 @@ export class Viewer3D {
   private maxPixelRatio = 2;
   private fpsCap = 0;
   private lastRenderMs = 0;
+  /** Raio (chunks) da janela de terreno mantida desenhada — derivado de
+   * `fogFar`, ver `updateKeepRadius`. */
+  private keepRadiusChunks = CHUNK_KEEP_RADIUS_MIN;
+  /** Última varredura da janela (ms) — ver `sweepChunkWindow`. */
+  private lastSweepMs = 0;
 
   /** Chunks decodificados (voxels crus), chave = `chunkKey`. */
   private chunks = new Map<number, DecodedChunk>();
@@ -806,6 +827,7 @@ export class Viewer3D {
     this.scene.add(this.targetMarker);
 
     this.resize();
+    this.updateKeepRadius();
     this.animate();
   }
 
@@ -953,6 +975,126 @@ export class Viewer3D {
       x: Math.floor(this.controls.target.x) >> 4,
       z: Math.floor(this.controls.target.z) >> 4,
     };
+  }
+
+  /** Enquadra a câmera num ponto do mundo sem "bot" (usado ao abrir o mundo em
+   * cache com o jogo fechado: a âncora é onde o bot foi visto por último, em
+   * vez de a câmera orbitar a origem e o terreno ficar a centenas de blocos de
+   * distância). Mesmo enquadramento da primeira pose real. */
+  frameOn(pos: BotPos) {
+    if (this.targetBotPos) return; // já tem pose real — não briga com o follow
+    this.controls.target.set(pos.x, pos.y + BOT_CAMERA_HEIGHT, pos.z);
+    this.camera.position.set(pos.x + 40, pos.y + 45, pos.z + 40);
+  }
+
+  /** Coordenada de chunk de um ponto do mundo (pode ser fracionário). */
+  private chunkAt(x: number, z: number): ChunkPos {
+    return { x: Math.floor(x) >> 4, z: Math.floor(z) >> 4 };
+  }
+
+  /** Reconstrói (x, z) a partir da chave numérica — ver `chunkKey`. */
+  private chunkKeyCoords(key: number): ChunkPos {
+    const x = Math.round(key / 30_000_000);
+    return { x, z: key - x * 30_000_000 };
+  }
+
+  /** Âncoras da janela: o bot (quando há pose) e o alvo da câmera — o que
+   * estiver mais perto manda; a união cobre "câmera olhando pra longe do bot"
+   * sem descarregar o que está na frente do usuário. */
+  private viewAnchors(): ChunkPos[] {
+    const anchors: ChunkPos[] = [];
+    if (this.botMarker.visible) {
+      anchors.push(this.chunkAt(this.botMarker.position.x, this.botMarker.position.z));
+    }
+    const focus = this.getFocusChunk();
+    if (!anchors.some((a) => a.x === focus.x && a.z === focus.z)) anchors.push(focus);
+    return anchors;
+  }
+
+  /** Distância (em chunks, Chebyshev — a janela é quadrada) até a âncora mais
+   * próxima. */
+  private chunkDistance(anchors: ChunkPos[], pos: ChunkPos): number {
+    let best = Number.POSITIVE_INFINITY;
+    for (const anchor of anchors) {
+      const distance = Math.max(Math.abs(anchor.x - pos.x), Math.abs(anchor.z - pos.z));
+      if (distance < best) best = distance;
+    }
+    return best;
+  }
+
+  /** `true` se o chunk está dentro da janela mantida (até o raio de descarte).
+   * Fora dela o viewer nem monta — o `main.ts` usa isto pra não pedir voxels
+   * que seriam baixados e descartados no próximo sweep. */
+  isChunkInWindow(x: number, z: number): boolean {
+    return (
+      this.chunkDistance(this.viewAnchors(), { x, z }) <=
+      this.keepRadiusChunks + CHUNK_UNLOAD_MARGIN
+    );
+  }
+
+  /** Recalcula o raio da janela a partir do horizonte configurado. O teto
+   * (`CHUNK_KEEP_RADIUS_MAX`) é o que garante que aumentar o fog não vire
+   * "desenhar o mundo inteiro de novo" — o `updateFog` fecha a neblina antes
+   * da borda do que é desenhado, então o limite não aparece como vazio. */
+  private updateKeepRadius() {
+    const blocks = Math.min(Math.max(this.fogFar, 0), CHUNK_KEEP_RADIUS_MAX * 16);
+    this.keepRadiusChunks = Math.min(
+      CHUNK_KEEP_RADIUS_MAX,
+      Math.max(CHUNK_KEEP_RADIUS_MIN, Math.ceil(blocks / 16) + 2)
+    );
+  }
+
+  /** Esconde o que passou do raio mantido e descarta (malha + voxels) o que
+   * passou da margem de histerese. Roda poucas vezes por segundo: varrer as
+   * chaves da janela é barato, mas não precisa ser por frame. */
+  private sweepChunkWindow(now: number) {
+    if (now - this.lastSweepMs < CHUNK_SWEEP_MS) return;
+    this.lastSweepMs = now;
+    const anchors = this.viewAnchors();
+    const keep = this.keepRadiusChunks;
+    const unload = keep + CHUNK_UNLOAD_MARGIN;
+
+    const toUnload: number[] = [];
+    for (const [key, meshes] of this.chunkMeshes) {
+      const distance = this.chunkDistance(anchors, this.chunkKeyCoords(key));
+      for (const mesh of meshes) mesh.visible = distance <= keep;
+      if (distance > unload) toUnload.push(key);
+    }
+    const toDrop: number[] = [];
+    for (const key of this.chunks.keys()) {
+      if (this.chunkMeshes.has(key)) continue; // já tratado acima
+      if (this.chunkDistance(anchors, this.chunkKeyCoords(key)) > unload) toDrop.push(key);
+    }
+
+    for (const key of toUnload) {
+      // Antes de soltar os dados: os vizinhos que ficam foram montados com as
+      // faces contra este chunk escondidas (oclusão) — precisam ser remontados
+      // pra elas voltarem a aparecer.
+      const chunk = this.chunks.get(key);
+      if (chunk) this.enqueueKeptNeighbors(chunk);
+      this.disposeChunkMeshes(key);
+    }
+    for (const key of [...toUnload, ...toDrop]) this.dropChunkData(key);
+  }
+
+  /** Descarta os voxels (e a malha, se ainda existir) de um chunk fora da
+   * janela. O Rust continua com o payload — o `main.ts` pede de novo quando o
+   * chunk chegar perto (o `hasChunk` volta a ser `false`). */
+  private dropChunkData(key: number) {
+    this.chunks.delete(key);
+    this.queuedChunks.delete(key);
+    this.chunkMeshes.delete(key);
+  }
+
+  /** Enfileira os vizinhos horizontais que continuam na janela — ver o motivo
+   * em `sweepChunkWindow`. Só entra na fila quem tem conteúdo na divisa (a
+   * mesma checagem de `addChunkVoxels`). */
+  private enqueueKeptNeighbors(chunk: DecodedChunk) {
+    for (const [dx, dz] of HORIZONTAL_NEIGHBORS) {
+      if (!this.chunkBorderHasContent(chunk, dx, dz)) continue;
+      const neighborKey = this.chunkKey(chunk.x + dx, chunk.z + dz);
+      if (this.chunkMeshes.has(neighborKey)) this.enqueueMesh(neighborKey);
+    }
   }
 
   /** Recebe o atlas já extraído/empacotado pelo lado Rust (data URL + mapa
@@ -1986,7 +2128,12 @@ export class Viewer3D {
   private updateFog() {
     const distance = this.camera.position.distanceTo(this.controls.target);
     this.fog.near = Math.max(this.fogFar * FOG_NEAR_RATIO, distance * 0.85);
-    this.fog.far = Math.max(this.fogFar, distance * 3);
+    // O fundo nunca passa da borda da janela de chunks desenhada — assim o
+    // terreno some na neblina em vez de terminar num vazio sem fog quando o
+    // usuário afasta o zoom (ver `sweepChunkWindow`).
+    const horizon = Math.min(Math.max(this.fogFar, distance * 3), this.keepRadiusChunks * 16 - 8);
+    this.fog.far = horizon;
+    this.fog.near = Math.min(this.fog.near, horizon * 0.6);
   }
 
   /** Troca o frame das texturas animadas de fluido (água/lava). */
@@ -2427,6 +2574,7 @@ export class Viewer3D {
     this.meshBudgetMs = settings.meshBudgetMs;
     this.maxPixelRatio = settings.maxPixelRatio;
     this.fpsCap = settings.fpsCap;
+    this.updateKeepRadius();
     this.updateFog();
     this.resize(); // o teto de pixel ratio mudou
   }
@@ -2479,6 +2627,7 @@ export class Viewer3D {
     this.updateSky();
     this.updateFog();
     this.updateAnimation(now);
+    this.sweepChunkWindow(now);
     this.drainMeshQueue();
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();

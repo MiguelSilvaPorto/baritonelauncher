@@ -40,6 +40,35 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **FPS travado conforme o mundo explorado cresce**: todo chunk já visto ficava na cena pra sempre, e
+  o custo por frame (draw calls, triângulos, memória) crescia sem limite com a exploração — quanto
+  mais chunks apareciam na tela (zoom afastado), pior ficava, até travar. Agora o viewer mantém uma
+  **janela de chunks ao redor do bot e do alvo da câmera**: o que passa do raio só é escondido, o que
+  passa de uma margem de histerese é descartado (malha + voxels) e volta a ser pedido ao Rust quando
+  o chunk chega perto de novo. O custo por frame fica constante com o tamanho do mundo explorado, e o
+  fog fecha antes da borda da janela pra não aparecer um vazio sem neblina. A distância do horizonte
+  (aba Config) agora vai até 400 blocos, que é o teto do que o viewer mantém montado — acima disso o
+  ajuste não teria efeito visível. Reportado pelo usuário ("o fps fica estremamente travado quanto
+  mais chunks eu vejo").
+- **Travadas periódicas enquanto o bot explorava (gravação do mundo)**: a cada 5 segundos o app
+  reencodava e recomprimia o **cache inteiro** do mundo pra gravar em disco, segurando o cache num
+  mutex durante o processo — O(mundo) de CPU e memória a cada gravação, ficando pior conforme o mundo
+  crescia. Agora o mundo vive num **log append-only** (`world.log`): cada chunk é gravado na hora em
+  que chega, custando o tamanho do chunk (não o do mundo), e registros antigos de chunks reescritos
+  são recuperados por uma compactação automática. Os metadados que mudam o tempo todo (versão do
+  Minecraft e última posição do bot) foram pra um JSON minúsculo (`world.json`). O cache antigo
+  (`world.cache`, snapshot de arquivo único) é importado na primeira abertura no formato novo e
+  preservado no disco.
+- **Memória do backend crescia junto com o mundo**: os voxels de **todo** chunk já explorado ficavam
+  na memória do processo pra sempre. Agora só um conjunto de trabalho recente (2048 chunks) fica em
+  memória; o resto é lido do log sob demanda quando o viewer ou o editor pedem — dá pra explorar por
+  muito mais tempo sem o app inchar.
+- **Viewer abria longe de onde o usuário estava com o jogo fechado**: sem o bot conectado, a câmera
+  orbitava a origem (0,0) e o terreno explorado — que costuma estar a centenas ou milhares de blocos
+  dali — aparecia como uma ilhota distante. Agora a última posição do bot é persistida
+  (`world.json`, `last_bot_pos`) e o viewer abre enquadrado nela (e carrega o terreno ao redor dela),
+  sem esperar o jogo abrir. Reportado pelo usuário ("se meu boneco não tiver no jogo ele leva o meu
+  visualizador para muito distante de onde eu estava").
 - **Controles da câmera: WASD invertia olhando pra baixo, órbita continuava girando e o boneco
   deslizava depois que o bot parava**: três ajustes independentes. (1) Com a câmera quase vertical, a
   projeção da direção de visão no chão degenera — e o fallback usava o eixo local `-Y` (o "para

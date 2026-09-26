@@ -6,6 +6,12 @@
 //! bioma por coluna (`ChunkTints`), que é o que faz grama/folhagem/água terem a
 //! cor real do bioma no viewer.
 //!
+//! O mundo é cumulativo e cresce sem limite, então os voxels vivem no log em
+//! disco (`world_store.rs`) e só um set de trabalho (`HOT_CHUNK_LIMIT`) fica
+//! em memória, carregado sob demanda. O que o viewer/editor pede de um chunk
+//! fora do set é lido do log na hora — a memória do app não cresce junto com a
+//! exploração.
+//!
 //! A mesma codificação binária trafega do addon pro Rust e do Rust pro
 //! frontend (`encode_voxels`/`decode_voxels`) — um formato só, documentado em
 //! `mod-addon/README.md`.
@@ -143,12 +149,29 @@ pub struct Chunk {
     /// Tints de bioma por coluna. `None` = payload antigo (v2) ou chunk sem
     /// essa informação — o viewer cai nas aproximações fixas.
     pub tints: Option<ChunkTints>,
-    pub dirty: bool,
 }
 
+/// Quantos chunks ficam com os voxels na memória ao mesmo tempo. O mundo
+/// explorado é cumulativo (cresce sem limite), mas quase todo ele só é
+/// desenhado de novo quando o bot/câmera volta pra perto — o que não cabe
+/// aqui é lido do log sob demanda (`world_store.rs`). É o que impede a
+/// memória do app de crescer junto com o mundo.
+const HOT_CHUNK_LIMIT: usize = 2048;
+
+/// Cache do mundo explorado: um **set de trabalho** com os voxels em memória
+/// (LRU simples, `HOT_CHUNK_LIMIT`) por cima do log em disco
+/// (`world_store::WorldStore`). Com `store: None` (testes) é um mapa em
+/// memória puro, como antes.
 #[derive(Debug, Default)]
 pub struct WorldCache {
-    pub chunks: HashMap<ChunkPos, Chunk>,
+    store: Option<crate::world_store::WorldStore>,
+    /// Chunks com os voxels em memória (chave = `ChunkPos`). Publico pro
+    /// `lib.rs`/testes; a leitura de verdade passa por `ensure_hot`.
+    pub hot_chunks: HashMap<ChunkPos, Chunk>,
+    /// Último uso de cada chunk do set (`use_counter` crescente) — é o que
+    /// decide quem sai quando o set passa de `HOT_CHUNK_LIMIT`.
+    hot_last_used: HashMap<ChunkPos, u64>,
+    use_counter: u64,
     /// Trechos de água/lava já testados, ver `CrossingStrategy`.
     pub crossing_hints: HashMap<BlockPos, CrossingStrategy>,
 }
@@ -158,37 +181,68 @@ impl WorldCache {
         Self::default()
     }
 
-    pub fn chunk_count(&self) -> usize {
-        self.chunks.len()
+    /// Cache persistente: os chunks vão pro log (`data_dir/world.log`) e o
+    /// set em memória é limitado. Usado pelo app; `new()` fica pros testes.
+    pub fn open(data_dir: &std::path::Path) -> Result<Self, String> {
+        Ok(Self {
+            store: Some(crate::world_store::WorldStore::open(data_dir)?),
+            ..Self::default()
+        })
     }
 
-    pub fn mark_dirty(&mut self, pos: ChunkPos) {
-        if let Some(chunk) = self.chunks.get_mut(&pos) {
-            chunk.dirty = true;
+    pub fn chunk_count(&self) -> usize {
+        match &self.store {
+            Some(store) => store.len(),
+            None => self.hot_chunks.len(),
+        }
+    }
+
+    /// Importa o cache antigo (`world.cache`, snapshot único) pro log novo,
+    /// uma vez — ver `world_store::import_legacy_cache`. Devolve a versão do
+    /// Minecraft que veio nele, se havia.
+    pub fn import_legacy_cache(&mut self, data_dir: &std::path::Path) -> Result<Option<String>, String> {
+        match &mut self.store {
+            Some(store) => crate::world_store::import_legacy_cache(data_dir, store),
+            None => Ok(None),
+        }
+    }
+
+    /// Posições de todos os chunks conhecidos (memória + disco) — o que
+    /// `world_chunks`/`world_chunks_near` usam.
+    pub fn positions(&self) -> Vec<ChunkPos> {
+        match &self.store {
+            Some(store) => store.positions().collect(),
+            None => self.hot_chunks.keys().copied().collect(),
         }
     }
 
     /// Substitui o conteúdo do chunk por um snapshot completo (o addon manda
     /// o chunk inteiro no load). Sem merge: se o chunk for reenviado (ex:
     /// recarregado depois de sair e voltar ao render distance), o snapshot
-    /// novo manda.
+    /// novo manda. Grava no log na hora — o custo é o tamanho do chunk, não o
+    /// do mundo.
     pub fn apply_voxels(
         &mut self,
         pos: ChunkPos,
         sections: Vec<ChunkSection>,
         tints: Option<ChunkTints>,
     ) {
-        let chunk = self.chunks.entry(pos).or_default();
-        chunk.sections = sections;
-        chunk.tints = tints;
-        chunk.dirty = true;
+        if let Some(store) = &mut self.store {
+            if let Err(err) = store.write(pos, &sections, tints.as_ref()) {
+                eprintln!("[world_store] falha ao gravar chunk ({}, {}): {err}", pos.x, pos.z);
+            }
+        }
+        self.hot_chunks.insert(pos, Chunk { sections, tints });
+        self.touch(pos);
     }
 
     /// Payload binário de um chunk pro frontend (mesmo formato do addon, ver
-    /// `encode_voxels`). Vazio se o chunk não existe neste cache — o viewer
-    /// trata isso como "ainda não pronto", não como chunk vazio.
-    pub fn chunk_voxels_bytes(&self, pos: ChunkPos) -> Vec<u8> {
-        match self.chunks.get(&pos) {
+    /// `encode_voxels`). Vazio se o chunk não existe — o viewer trata isso
+    /// como "ainda não pronto", não como chunk vazio. Chunk fora do set de
+    /// trabalho é lido do log e devolvido sem inflar a memória.
+    pub fn chunk_voxels_bytes(&mut self, pos: ChunkPos) -> Vec<u8> {
+        self.ensure_hot(pos);
+        match self.hot_chunks.get(&pos) {
             Some(chunk) => encode_voxels(&chunk.sections, chunk.tints.as_ref()),
             None => Vec::new(),
         }
@@ -198,11 +252,13 @@ impl WorldCache {
     /// (diferente de ar); seção ausente num chunk carregado = ar, como no
     /// jogo. É o que o diff do editor de schematic (`schematic.rs`) usa pra
     /// saber o que existe de verdade antes de gerar a instrução.
-    pub fn block_at(&self, pos: BlockPos) -> Option<&str> {
-        let chunk = self.chunks.get(&ChunkPos {
+    pub fn block_at(&mut self, pos: BlockPos) -> Option<&str> {
+        let chunk_pos = ChunkPos {
             x: pos.x >> 4,
             z: pos.z >> 4,
-        })?;
+        };
+        self.ensure_hot(chunk_pos);
+        let chunk = self.hot_chunks.get(&chunk_pos)?;
         // `>>` com sinal: -1 >> 4 = -1 (seção -1), igual à divisão do jogo.
         let Some(section) = chunk.sections.iter().find(|s| s.y as i32 == pos.y >> 4) else {
             return Some("air");
@@ -213,6 +269,48 @@ impl WorldCache {
             .get(index)
             .and_then(|slot| section.palette.get(*slot as usize));
         Some(entry.map(|e| e.block.as_str()).unwrap_or("air"))
+    }
+
+    /// Garante que os voxels de um chunk estão na memória (lê do log se
+    /// preciso) e move o chunk pro fim da fila de uso.
+    fn ensure_hot(&mut self, pos: ChunkPos) {
+        if self.hot_chunks.contains_key(&pos) {
+            self.touch(pos);
+            return;
+        }
+        let Some(store) = &mut self.store else {
+            return;
+        };
+        match store.read(pos) {
+            Ok(Some(decoded)) => {
+                self.hot_chunks.insert(
+                    pos,
+                    Chunk {
+                        sections: decoded.sections,
+                        tints: decoded.tints,
+                    },
+                );
+                self.touch(pos);
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("[world_store] falha ao ler chunk ({}, {}): {err}", pos.x, pos.z),
+        }
+    }
+
+    fn touch(&mut self, pos: ChunkPos) {
+        if self.store.is_none() {
+            return; // sem log: tudo vive em memória, nada a evictar
+        }
+        self.use_counter += 1;
+        self.hot_last_used.insert(pos, self.use_counter);
+        while self.hot_chunks.len() > HOT_CHUNK_LIMIT {
+            let Some((&oldest, _)) = self.hot_last_used.iter().min_by_key(|(_, used)| **used)
+            else {
+                break;
+            };
+            self.hot_last_used.remove(&oldest);
+            self.hot_chunks.remove(&oldest);
+        }
     }
 }
 
@@ -426,6 +524,9 @@ pub struct WorldSummary {
     pub chunks_explored: u32,
     pub chunks_total_estimate: u32,
     pub bot_pos: Option<BlockPos>,
+    /// Onde o bot foi visto por último (persistido em `world.json`) — a âncora
+    /// do viewer quando o jogo está fechado. `None` = nunca conectou.
+    pub last_bot_pos: Option<BlockPos>,
 }
 
 #[cfg(test)]

@@ -47,6 +47,11 @@ pub(crate) struct AppState {
     /// Última posição (pés do jogador) reportada pelo addon. Mapeada no
     /// grid do viewer em `src/main.ts` (`worldToScreen`).
     pub(crate) bot_pos: Mutex<Option<BlockPos>>,
+    /// Onde o bot foi visto por último — **não** é limpo no disconnect (ao
+    /// contrário de `bot_pos`) e é persistido com o mundo (`world.json`): é a
+    /// âncora do viewer com o jogo fechado, pra câmera abrir onde o usuário
+    /// estava em vez de orbitar a origem (ver `main.ts`).
+    pub(crate) last_bot_pos: Mutex<Option<BlockPos>>,
     /// Mesma posição de `bot_pos` + yaw/pitch do jogador — o viewer usa os
     /// ângulos pra orientar o modelo (ver `addon_socket::BotPose`).
     pub(crate) bot_pose: Mutex<Option<addon_socket::BotPose>>,
@@ -63,10 +68,6 @@ pub(crate) struct AppState {
     /// cache de mundo em disco (`world_store.rs`), pro atlas continuar
     /// funcionando com o jogo fechado.
     pub(crate) mc_version: Mutex<Option<String>>,
-    /// Incrementado a cada chunk novo aplicado (`chunk_voxels`). O gravador
-    /// periódico do `world_store` compara com a última revisão salva e só
-    /// reescreve o arquivo quando algo mudou de verdade.
-    pub(crate) world_revision: AtomicU64,
     /// Lista de blocos de cada schematic aplicado no editor, por id de
     /// instrução (`Mine`/`Build`). Fica fora do `Instruction` de propósito: a
     /// fila é pollada a cada segundo e um schematic inteiro dentro dela
@@ -234,6 +235,7 @@ mod commands {
             chunks_explored: world.chunk_count() as u32,
             chunks_total_estimate: 0,
             bot_pos: *state.bot_pos.lock().unwrap(),
+            last_bot_pos: *state.last_bot_pos.lock().unwrap(),
         }
     }
 
@@ -242,7 +244,7 @@ mod commands {
     /// chunks ainda precisa buscar com `chunk_voxels`.
     #[tauri::command]
     fn world_chunks(state: State<AppState>) -> Vec<ChunkPos> {
-        state.world.lock().unwrap().chunks.keys().copied().collect()
+        state.world.lock().unwrap().positions()
     }
 
     /// Os `limit` chunks em cache mais próximos do ponto dado, já ordenados
@@ -254,13 +256,15 @@ mod commands {
     #[tauri::command]
     fn world_chunks_near(state: State<AppState>, x: i32, z: i32, limit: u32) -> Vec<ChunkPos> {
         let world = state.world.lock().unwrap();
-        world_cache::nearest_chunks(world.chunks.keys(), x, z, (limit as usize).min(4096))
+        let positions = world.positions();
+        world_cache::nearest_chunks(positions.iter(), x, z, (limit as usize).min(4096))
     }
 
     /// Voxels de um chunk (seções com paleta + índices, ver
     /// `world_cache.rs`) como bytes crus — o viewer faz o face culling e monta
     /// a geometria. Resposta vazia = chunk não está no cache; é resposta
     /// binária de propósito (um `Vec<u8>` vira array JSON gigante e lento).
+    /// Chunk fora do set de trabalho é lido do log sob demanda.
     #[tauri::command]
     fn chunk_voxels(state: State<AppState>, x: i32, z: i32) -> tauri::ipc::Response {
         let bytes = state
@@ -377,8 +381,8 @@ mod commands {
         edits: Vec<schematic::BlockEdit>,
     ) -> Result<SchematicApplyResult, String> {
         let diff = {
-            let world = state.world.lock().unwrap();
-            schematic::diff(&world, &edits)
+            let mut world = state.world.lock().unwrap();
+            schematic::diff(&mut world, &edits)
         };
         if diff.is_empty() {
             return Ok(SchematicApplyResult {
@@ -540,29 +544,25 @@ mod commands {
     }
 }
 
-/// De quanto em quanto tempo o mundo é gravado em disco, quando há mudança.
-/// Curto o suficiente pra não perder trabalho de uma sessão, longo o
-/// suficiente pra um backfill de reconexão (centenas de chunks) virar uma
-/// gravação só.
-const WORLD_SAVE_INTERVAL_SECS: u64 = 5;
+/// De quanto em quanto tempo os metadados do mundo (versão do Minecraft do
+/// último `hello` + última posição do bot) são gravados, quando há mudança. O
+/// mundo em si é gravado por chunk, na hora em que chega (`world_store.rs`) —
+/// este timer cuida só do JSON pequeno que o atlas e a âncora do viewer usam.
+const WORLD_META_INTERVAL_SECS: u64 = 5;
 
-/// Caminho do cache de mundo: diretório de dados do app (no Linux,
-/// `~/.local/share/dev.baritone.orchestrator/world.cache`). Fora do repo de
-/// propósito — é dado do usuário, não artefato do projeto.
-fn world_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map(|dir| dir.join("world.cache"))
-        .map_err(|err| err.to_string())
+/// Diretório de dados do app (no Linux,
+/// `~/.local/share/dev.baritone.orchestrator/`): é onde vivem o log do mundo
+/// (`world.log`), os metadados (`world.json`) e as preferências
+/// (`settings.json`). Fora do repo de propósito — é dado do usuário, não
+/// artefato do projeto.
+fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path().app_data_dir().map_err(|err| err.to_string())
 }
 
 /// Caminho das preferências — mesmo diretório de dados do app, ao lado do
-/// `world.cache` (`settings.json`, ver `settings.rs`).
+/// `world.log` (`settings.json`, ver `settings.rs`).
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map(|dir| dir.join("settings.json"))
-        .map_err(|err| err.to_string())
+    app_data_dir(app).map(|dir| dir.join("settings.json"))
 }
 
 /// Carrega as preferências salvas pro `AppState`. Arquivo ausente é normal
@@ -584,59 +584,92 @@ fn load_persisted_settings(app: &tauri::AppHandle) {
     }
 }
 
-/// Carrega o mundo persistido (se existir) no `AppState` e restaura a versão
-/// do MC do último `hello` — é isso que deixa o viewer e o atlas de texturas
-/// funcionarem com o jogo fechado. Cache ausente é normal (primeira
+/// Abre o mundo persistido (log de chunks + metadados) no `AppState` e restaura
+/// a versão do MC do último `hello` — é isso que deixa o viewer e o atlas de
+/// texturas funcionarem com o jogo fechado. Cache ausente é normal (primeira
 /// execução); cache ilegível é logado e ignorado, nunca derruba o app.
 fn load_persisted_world(app: &tauri::AppHandle) {
-    let path = match world_cache_path(app) {
-        Ok(path) => path,
+    let dir = match app_data_dir(app) {
+        Ok(dir) => dir,
         Err(err) => {
             eprintln!("[world_store] sem diretório de dados ({err}); cache desligado");
             return;
         }
     };
-    match world_store::load(&path) {
-        Ok(Some(stored)) => {
-            let chunks = stored.chunks.len();
-            let state = app.state::<AppState>();
-            if let Some(version) = stored.mc_version.clone() {
-                *state.mc_version.lock().unwrap() = Some(version);
-            }
-            stored.apply_to(&mut state.world.lock().unwrap());
-            println!("[world_store] {chunks} chunks carregados de {}", path.display());
+    let state = app.state::<AppState>();
+    let mut world = match WorldCache::open(&dir) {
+        Ok(world) => world,
+        Err(err) => {
+            eprintln!("[world_store] log do mundo indisponível ({err}); sem persistência");
+            return;
         }
-        Ok(None) => {}
-        Err(err) => eprintln!("[world_store] cache ignorado ({err})"),
+    };
+    // Cache antigo (snapshot único reescrito inteiro) → log append-only, uma
+    // vez só: sem isso, atualizar o app perderia o mundo já explorado.
+    let legacy_version = match world.import_legacy_cache(&dir) {
+        Ok(version) => version,
+        Err(err) => {
+            eprintln!("[world_store] importação do cache antigo falhou ({err})");
+            None
+        }
+    };
+
+    let meta = match world_store::load_meta(&dir.join("world.json")) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => world_store::WorldMeta::default(),
+        Err(err) => {
+            eprintln!("[world_store] metadados ignorados ({err}); usando padrões");
+            world_store::WorldMeta::default()
+        }
+    };
+    // A versão do cache antigo só vale se o `world.json` ainda não tiver uma
+    // (migração de uma instalação que nunca abriu no formato novo).
+    let version = meta.mc_version.clone().or(legacy_version);
+    if let Some(version) = version {
+        *state.mc_version.lock().unwrap() = Some(version);
     }
+    *state.last_bot_pos.lock().unwrap() = meta.last_bot_pos;
+
+    let chunks = world.chunk_count();
+    *state.world.lock().unwrap() = world;
+    println!(
+        "[world_store] {chunks} chunks conhecidos em {}",
+        dir.join("world.log").display()
+    );
 }
 
-/// Grava o cache agora, se a revisão mudou desde a última gravação.
-fn save_world_if_dirty(app: &tauri::AppHandle, last_saved: &mut u64) {
+/// Grava os metadados do mundo (versão do MC + última posição do bot), se
+/// mudaram desde a última gravação. O mundo em si já está no disco por chunk;
+/// isto é só o JSON pequeno que o atlas (versão do MC, com o jogo fechado) e a
+/// âncora do viewer (onde o bot foi visto por último) precisam.
+fn save_world_meta_if_changed(
+    app: &tauri::AppHandle,
+    last: &mut Option<world_store::WorldMeta>,
+) {
     let state = app.state::<AppState>();
-    let revision = state.world_revision.load(Ordering::Relaxed);
-    if revision == *last_saved {
+    let meta = world_store::WorldMeta {
+        mc_version: state.mc_version.lock().unwrap().clone(),
+        last_bot_pos: *state.last_bot_pos.lock().unwrap(),
+    };
+    if last.as_ref() == Some(&meta) {
         return;
     }
-    let Ok(path) = world_cache_path(app) else {
+    let Ok(dir) = app_data_dir(app) else {
         return;
     };
-    let version = state.mc_version.lock().unwrap().clone();
-    let world = state.world.lock().unwrap();
-    match world_store::save(&path, &world, version.as_deref()) {
-        Ok(()) => *last_saved = revision,
-        Err(err) => eprintln!("[world_store] falha ao gravar: {err}"),
+    match world_store::save_meta(&dir.join("world.json"), &meta) {
+        Ok(()) => *last = Some(meta),
+        Err(err) => eprintln!("[world_store] falha ao gravar metadados: {err}"),
     }
 }
 
-/// Gravação periódica em background (`setup()`), em vez de a cada chunk: o
-/// handler do socket aplica centenas de chunks num backfill de reconexão, e
-/// gravar por chunk transformaria isso em centenas de arquivos escritos.
-async fn world_store_task(app: tauri::AppHandle) {
-    let mut last_saved = 0u64;
+/// Gravação periódica dos metadados em background (`setup()`). O log de chunks
+/// não precisa disso — cada chunk é gravado quando chega.
+async fn world_meta_task(app: tauri::AppHandle) {
+    let mut last = None;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(WORLD_SAVE_INTERVAL_SECS)).await;
-        save_world_if_dirty(&app, &mut last_saved);
+        tokio::time::sleep(std::time::Duration::from_secs(WORLD_META_INTERVAL_SECS)).await;
+        save_world_meta_if_changed(&app, &mut last);
     }
 }
 
@@ -659,7 +692,7 @@ pub fn run() {
 
             load_persisted_world(app.handle());
             load_persisted_settings(app.handle());
-            tauri::async_runtime::spawn(world_store_task(app.handle().clone()));
+            tauri::async_runtime::spawn(world_meta_task(app.handle().clone()));
             tauri::async_runtime::spawn(addon_socket::listen(app.handle().clone()));
 
             Ok(())
@@ -669,11 +702,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            // Gravação final no fechamento: o intervalo do gravador periódico
-            // pode deixar os últimos segundos de exploração fora do disco.
+            // Gravação final dos metadados no fechamento: o timer periódico
+            // pode deixar os últimos segundos de exploração fora do disco. O
+            // log de chunks já está gravado por chunk.
             if let tauri::RunEvent::Exit = event {
-                let mut last_saved = 0u64;
-                save_world_if_dirty(app, &mut last_saved);
+                let mut last = None;
+                save_world_meta_if_changed(app, &mut last);
             }
         });
 }

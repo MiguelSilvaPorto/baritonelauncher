@@ -18,7 +18,11 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
-    /// Distância (blocos) em que o fog fecha o horizonte do viewer.
+    /// Distância (blocos) em que o fog fecha o horizonte do viewer. O teto não
+    /// é estético: o viewer só mantém montada uma janela de chunks ao redor do
+    /// bot/câmera (`CHUNK_KEEP_RADIUS_MAX` em `viewer3d.ts`), e um fog além
+    /// dela mostraria o vazio em vez de terreno (o `updateFog` fecha a névoa
+    /// antes da borda).
     pub(crate) fog_far: f32,
     /// Teto de tempo por frame (ms) pra montar as malhas dos chunks.
     pub(crate) mesh_budget_ms: f32,
@@ -65,7 +69,7 @@ impl Settings {
     /// não podem chegar no viewer.
     pub(crate) fn sanitized(mut self) -> Self {
         let defaults = Self::default();
-        self.fog_far = clamp_f32(self.fog_far, 100.0, 800.0, defaults.fog_far);
+        self.fog_far = clamp_f32(self.fog_far, 100.0, 400.0, defaults.fog_far);
         self.mesh_budget_ms = clamp_f32(self.mesh_budget_ms, 2.0, 20.0, defaults.mesh_budget_ms);
         self.max_pixel_ratio = clamp_f32(self.max_pixel_ratio, 1.0, 2.0, defaults.max_pixel_ratio);
         self.fps_cap = self.fps_cap.clamp(0, 240);

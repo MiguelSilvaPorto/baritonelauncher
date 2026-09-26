@@ -43,7 +43,7 @@ There is no component framework and no bundled state library: `main.ts` renders 
   everything else stays plain DOM/innerHTML.
 - **Backend:** Rust (edition 2021) · Tauri 2 · `serde`/`serde_json` · `tauri-plugin-opener` ·
   `tauri-plugin-dialog` · `tokio` (powers `addon_socket.rs`, the local TCP server the Java addon
-  connects to) · `flate2` (zlib payloads: `chunk_voxels` and the persisted `world.cache`) ·
+  connects to) · `flate2` (zlib payloads: `chunk_voxels` and the persisted `world.log`) ·
   `image`/`zip`/`base64` (read-only jar/texture extraction in `texture_atlas.rs`, see rule 9 below).
 - **Styling:** one `src/styles.css`, plain CSS custom properties under `:root` — the fixed dark
   identity from `docs/SPEC.md` ("Identidade visual"), not a multi-theme system.
@@ -140,13 +140,21 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
   own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
   `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
-  `resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real
-  face culling (including against already-loaded neighbors); the mesh work is queued and drained with
-  a per-frame budget (`drainMeshQueue`), and `main.ts` asks for the nearest chunks first
-  (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). The
+  `resize()`/`getFocusChunk()`/`frameOn()`/`isChunkInWindow()` on it. Each `chunk_voxels` payload
+  becomes per-bucket meshes with real face culling (including against already-loaded neighbors); the
+  mesh work is queued and drained with a per-frame budget (`drainMeshQueue`), and `main.ts` asks for
+  the nearest chunks first (`world_chunks_near`, anchored on the bot/last known position and on the
+  camera target, which also covers browsing the cached world). The
   day/night cycle (`setWorldTime`/`updateDayNight`) follows the addon's real `world_time`, moving
-  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. Chunks
-  are added once and never removed (cumulative "explored" semantics, matching `WorldCache`). It also
+  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. The
+  world is cumulative (the `WorldCache` keeps everything on disk), but the viewer only keeps a
+  **window** of it mounted: `sweepChunkWindow` runs a few times per second and, around the anchors
+  (bot + camera target), hides meshes past `keepRadiusChunks` and drops meshes + decoded voxels past
+  that plus `CHUNK_UNLOAD_MARGIN` (unloads remesh the kept neighbors, whose faces against the removed
+  chunk were culled; `main.ts` re-requests dropped chunks when they come near again — `hasChunk`
+  goes back to `false`). That window is what keeps the per-frame cost flat as exploration grows; the
+  radius follows `fogFar` (Config) and the fog closes before the window edge so the boundary never
+  shows as a void. It also
   hosts the **schematic editor**: voxel DDA picking (`pickBlock` — meshes are merged per chunk, so a
   `Raycaster` can't map back to a block), the edit layer (`edits` + `rebuildGhosts`, amber
   translucent ghost, never mutates `WorldCache`), region selection/hover wire boxes, and `mountTo()`
@@ -167,7 +175,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
   `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`world_time`/
-  `player_skin`, `settings` (Config tab), plus
+  `player_skin`, `last_bot_pos` (persisted in `world.json`, the viewer's offline anchor),
+  `settings` (Config tab), plus
   `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
@@ -176,9 +185,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `get_texture_atlas`, `settings_get`, `settings_set`, `settings_reset`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
-  handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world
-  (`world_store::load`) and spawns `world_store_task`, which saves when `world_revision` changes;
-  `RunEvent::Exit` does a final save.
+  handler and when an instruction reaches a terminal status. `setup()` also opens the persisted world
+  (`WorldCache::open`, legacy cache import included) and spawns `world_meta_task`, which writes the
+  small `world.json` (mc_version + last bot position) when it changes — chunk data is written per
+  chunk as it arrives, not by the timer; `RunEvent::Exit` does a final meta write.
 - `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line, **both
   directions**. Addon → app: `hello` (marks `AppState.connection` as connected + dispatches queued
   instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos` and
@@ -203,21 +213,31 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   default one) — **never** fetched from Mojang's CDN, same rule as `texture_atlas.rs`.
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
   + indices per 16×16×16 section, plus per-column biome tints since payload v3 — see `ChunkTints`).
-  Also `CrossingStrategy` for the learned water/lava crossing policy.
-- **`world_store.rs`** — persists `WorldCache` + the last `mc_version` to `world.cache` in the app
-  data dir (`~/.local/share/dev.baritone.orchestrator/` on Linux), zlib-compressed with a magic +
-  version header and atomic writes (`tmp` + rename). Loaded in `setup()`; saved every 5s only when
-  `AppState.world_revision` changed (bumped by `addon_socket` per chunk) and once on
-  `RunEvent::Exit`. Reuses `encode_voxels`/`decode_voxels` — one binary format for socket, IPC and
-  disk. `crossing_hints` are **not** persisted yet.
+  The map is a bounded working set (`HOT_CHUNK_LIMIT`, least-recently-used eviction) over the disk
+  log — `block_at`/`chunk_voxels_bytes` load a cold chunk on demand, so `WorldCache` methods that
+  need voxels take `&mut self` (`schematic::diff` included). Also `CrossingStrategy` for the learned
+  water/lava crossing policy.
+- **`world_store.rs`** — persistence in the app data dir
+  (`~/.local/share/dev.baritone.orchestrator/` on Linux): `world.log` is an **append-only chunk log**
+  (one zlib-compressed `encode_voxels` payload per record, `x/z/raw_len/compressed_len` header, magic +
+  version at the top); writing a chunk costs the chunk, not the world, so there's no periodic
+  full-cache re-encode and no `world_revision`/save timer anymore. The index (pos → newest record
+  offset) is rebuilt on open; a truncated tail is cut at the last intact record; when the log doubles
+  the size of its live data (`MIN_COMPACT_BYTES` floor) `compact()` rewrites it with one record per
+  chunk, copying records as-is. `world.json` holds the small, fast-changing metadata
+  (`WorldMeta` = mc_version + last bot position, atomic writes) and `import_legacy_cache` brings in
+  the old `world.cache` snapshot once (skipping payloads it can't decode, never deleting the file).
+  `crossing_hints` are **not** persisted yet.
 - **`settings.rs`** — user preferences (Config tab) as pretty JSON in `settings.json`, in the same
-  app data dir as `world.cache`, written atomically (`tmp` + rename) on every change. Plain JSON is
+  app data dir as `world.log`, written atomically (`tmp` + rename) on every change. Plain JSON is
   deliberate here: the file is tiny and `#[serde(default)]` tolerates model evolution — a new field
   falls back to its default instead of invalidating the user's file. Defaults mirror the constants
   the frontend used before the tab existed; `Settings::sanitized` clamps every field to the accepted
   range (the backend is the source of truth — a hand-edited file can't set fog to 5 blocks or polling
   to 1 ms) and the commands return the **effective** value, so the UI never shows a value the backend
-  refused. Unit tests cover round-trip, missing/corrupt file, clamping and partial JSON.
+  refused. `fog_far` is capped at 400 blocks because that's the viewer's chunk window
+  (`CHUNK_KEEP_RADIUS_MAX`) — more fog than that would show the void, not terrain. Unit tests cover
+  round-trip, missing/corrupt file, clamping and partial JSON.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
   `src-tauri/.cache/` (gitignored; the cache name carries `ATLAS_CACHE_VERSION`). **Never download or
@@ -286,8 +306,15 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
 - **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*
-  persisted now — one global `world.cache` per app, so switching between servers/worlds mixes their
+  persisted now — one global `world.log` per app, so switching between servers/worlds mixes their
   chunks in the same cache; there's no per-world separation yet.)
+- **The viewer draws a bounded window of the explored world, not all of it.** `sweepChunkWindow`
+  hides/drops chunks beyond `keepRadiusChunks` (follows the Config fog distance, up to
+  `CHUNK_KEEP_RADIUS_MAX` = 26 chunks) around the bot and the camera target, and `fog_far` is capped
+  at 400 blocks for that reason. Zooming far out shows that window as a patch of terrain fading into
+  fog — the alternative (drawing every chunk ever seen) is what made the frame rate collapse as
+  exploration grew. Chunks outside it are still on disk and come back when the bot/camera returns;
+  in-flight requests for them are skipped (`isChunkInWindow`).
 - **The schematic editor's blockstate/litematic/executor gaps.** The base editor works (visual
   palette from the atlas textures, region selection, place/break with an amber ghost layer, diff →
   queued instruction), but: every block renders as a full cube (no stair/log-axis/slab states, so no

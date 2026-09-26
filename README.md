@@ -100,7 +100,10 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   paleta vinda de um registro real de blocos (hoje é derivada dos nomes de textura do atlas) e
   executor de `Mine`/`Build` no addon (a instrução fica na fila) — ver `docs/CHANGELOG.md`.
 - **Persistência** do `StorageIndex` (hoje só em memória) — o **mundo explorado** já é salvo em
-  disco e reaparece com o jogo fechado (ver `src-tauri/src/world_store.rs`).
+  disco (`world.log`, gravado chunk a chunk; `world.json` com a versão do jogo e a última posição do
+  bot) e reaparece com o jogo fechado (ver `src-tauri/src/world_store.rs`). O viewer desenha uma
+  **janela** desse mundo ao redor do bot/câmera (o resto fica no disco e volta quando você chega
+  perto) — é o que mantém o fps estável por mais que você explore.
 
 ## Estrutura do repositório
 
@@ -108,8 +111,8 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   Three.js/WebGL) + `styles.css`.
 - `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon),
   `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada),
-  `world_store.rs` (grava/carrega o mundo explorado em disco) e `settings.rs` (preferências da aba
-  Config, em `settings.json` no diretório de dados do app).
+  `world_store.rs` (log de chunks do mundo explorado + metadados em disco) e `settings.rs`
+  (preferências da aba Config, em `settings.json` no diretório de dados do app).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.

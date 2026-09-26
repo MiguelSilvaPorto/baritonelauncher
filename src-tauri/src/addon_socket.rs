@@ -281,7 +281,11 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 // `bot_pos` continua sendo a posição "de grade" que
                 // `world_summary` expõe; `bot_pose` é a mesma posição + o
                 // olhar, que só o modelo do jogador usa.
-                *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
+                let pos = BlockPos { x, y, z };
+                *state.bot_pos.lock().unwrap() = Some(pos);
+                // A posição "última vista" não é limpa no disconnect — é a
+                // âncora do viewer com o jogo fechado (`world.json`).
+                *state.last_bot_pos.lock().unwrap() = Some(pos);
                 *state.bot_pose.lock().unwrap() = Some(BotPose { x, y, z, yaw, pitch });
             }
             AddonMessage::WorldTime { day_time } => {
@@ -304,9 +308,6 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                         .lock()
                         .unwrap()
                         .apply_voxels(ChunkPos { x, z }, sections, tints);
-                    // Avisa o gravador periódico (`lib.rs`, `world_store`)
-                    // que há coisa nova pra persistir.
-                    state.world_revision.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => eprintln!("[addon_socket] chunk_voxels inválido em ({x}, {z}): {err}"),
             },
