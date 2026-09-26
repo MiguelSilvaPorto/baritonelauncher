@@ -28,6 +28,8 @@ import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.MultifaceBlock;
+import net.minecraft.world.level.block.VineBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
@@ -745,7 +747,7 @@ public class BaritoneOrchestratorAddonClient {
     private static int voxelFlags(BlockState state) {
         boolean liquid = state.getBlock() instanceof LiquidBlock;
         boolean fluid = liquid && !state.getFluidState().isEmpty();
-        boolean render = !state.isAir() && (fluid || !state.canBeReplaced());
+        boolean render = !state.isAir() && (fluid || !isReplaceableDecoration(state));
         if (!render) {
             return 0;
         }
@@ -756,6 +758,22 @@ public class BaritoneOrchestratorAddonClient {
             flags |= VOXEL_FLAG_OCCLUDES;
         }
         return flags;
+    }
+
+    /**
+     * Bloco substituível que o viewer escolhe não desenhar como cubo cheio:
+     * grama alta, flor, muda (modelos em cruz) ficam fora — viram cubos e
+     * poluiriam a cena. <b>Mas nem todo {@code canBeReplaced()} é planta</b>:
+     * videira e os blocos de face ({@link MultifaceBlock}: líquen brilhante,
+     * veia de sculk) também são {@code .replaceable()} no registro vanilla e
+     * são geometria visível colada nas paredes. Sem esta exceção eles saíam do
+     * payload com flags zero e um bioma de selva aparecia sem videira nenhuma.
+     */
+    private static boolean isReplaceableDecoration(BlockState state) {
+        if (!state.canBeReplaced()) {
+            return false;
+        }
+        return !(state.getBlock() instanceof VineBlock || state.getBlock() instanceof MultifaceBlock);
     }
 
     /**
