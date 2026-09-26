@@ -12,6 +12,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Carregamento de chunks em ordem arbitrária, sem priorizar o que está ao redor do bot**: o viewer
+  pedia `world_chunks` (o cache inteiro, que cresce sem limite) e usava os primeiros quatro na ordem
+  em que o `HashMap` devolvia — o terreno ao redor do bot podia ser o último a chegar. Agora o
+  backend expõe `world_chunks_near` (os N chunks mais próximos, já ordenados por distância) e o
+  viewer carrega primeiro o que está ao redor do bot; com o jogo fechado, a âncora passa a ser o
+  ponto que a câmera orbita, então o mundo em cache abre onde o usuário está olhando. Reportado pelo
+  usuário ("começe a carregar as chunks ao meu redor primeiro antes de buscar algo novo em cache").
+- **Montagem de malha travando o frame e custo alto por face**: cada chunk recebido remontava ele e
+  os 4 vizinhos na hora (até 20 remontagens no mesmo tick com o polling antigo), e o laço de meshing
+  refazia string/rect/cor e alocava arrays a cada face. Agora as malhas entram numa fila drenada com
+  orçamento de ~8 ms por frame (um backfill de centenas de chunks aparece em frames seguidos, sem
+  engasgo), um vizinho só é remontado se a borda do chunk que chegou tem algo desenhável, o laço de
+  meshing usa cache de UV/tint por (bloco, face), UVs de fluido pré-rotacionadas e acesso local ao
+  chunk sendo montado, e as meshes estáticas não recalculam matriz por frame
+  (`matrixAutoUpdate = false`). Reportado pelo usuário ("melhore a perfomance das chunks").
 - **Folhas, plantas e tochas saíam com o fundo preto**: o material do terreno não tinha `alphaTest`,
   então o canal alpha das texturas "cutout" do jogo era ignorado e os pixels vazios viravam quadrados
   opacos pretos — visível nas copas das árvores, que ficavam escuras por dentro. `alphaTest: 0.5` no
@@ -154,6 +169,50 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   *fog* passou a usar a cor do horizonte: o terreno distante se dissolve no céu em vez de virar um
   borrão escuro. É um céu fixo de dia claro — o addon ainda não manda a hora do mundo, então ele não
   cicla com o dia/noite do jogo (ver "Known gaps").
+- **Editor de schematic (estilo WorldEdit): pintar, quebrar e selecionar região** — o modo Editor
+  agora usa o mesmo renderer do viewer (o canvas é movido pra view ativa, sem abrir um segundo
+  contexto WebGL) com: paleta lateral **visual** (busca + categorias, cada bloco com o ícone real
+  tirado do atlas), ferramentas **Selecionar** (dois cliques fecham a região, como no WorldEdit),
+  **Colocar** (bloco escolhido, na face clicada) e **Quebrar**, com o bloco/posição sob o cursor
+  destacado por um cubo de arame teal e a região por um cubo âmbar. O picking é ray casting em
+  voxels (DDA) sobre os chunks decodificados — as malhas são fundidas por chunk, então não dá pra
+  mapear um `Raycaster` de volta pra um bloco. O que é pintado vira uma **camada de edição
+  separada** do mundo real: ghost âmbar translúcido com a textura real (opacidade menor pra quebrar,
+  maior pra colocar), e o `WorldCache` **nunca é mutado** — o app nunca mostra como existente algo
+  que o bot ainda não construiu. "Aplicar" manda a camada pro Rust, onde o diff contra o mundo real
+  (`schematic.rs`, com testes) vira instruções `Mine`/`Build` na fila; a lista de blocos fica
+  guardada em `AppState.schematics` por id (a fila é pollada a cada segundo e não carrega centenas
+  de blocos). Detalhe honesto: o addon ainda **não executa** build/mina, então a instrução fica
+  `Queued` esperando executor — e, por isso, o dispatch da fila deixou de travar em instruções sem
+  executor: ele pula pra próxima que sabe rodar em vez de pegar a mesma pra sempre. Reportado pelo
+  usuário ("quero que vc adicione o sistema de poder posicionar blocos e destruir selecionar areas
+  para quebrar" / "faça do jeito que o documento relata").
+- **Explorar com raio e estilo (círculos/zigue-zague)**: o "Explorar" só tinha o modo nativo do
+  Baritone (`explore(origem)`), que anda pro chunk nunca visto mais próximo sem forma definida — e
+  ficava sem fim e sem progresso. Agora dá pra escolher o **raio** em blocos (16–5000) e o **padrão**:
+  *círculos* (anéis concêntricos) ou *zigue-zague* (faixas de ida e volta), com *automático* mantendo
+  o comportamento nativo. O addon gera os waypoints a partir da origem (o passo entre faixas/anéis vem
+  da render distance efetiva do cliente — passar por dentro dela já carrega os chunks, então passos
+  menores só fariam o bot andar mais devagar sem revelar nada novo) e percorre um a um com `GoalXZ`,
+  reportando progresso real (waypoint atual / total); waypoint inalcançável é pulado em vez de travar
+  a exploração inteira. Os controles ficam no popup do alvo ("Explorar daqui") e no painel da fila, ao
+  lado do botão "Explorar". Reportado pelo usuário ("melhore o explorar daqui para poder escrever o
+  raio e o estilo").
+- **Card cancelado some sozinho da fila**: cancelar deixava o card "cancelado" na lista pra sempre,
+  acumulando lixo visual. Agora ele fica ~4s visível (o suficiente pra confirmar que o cancelamento
+  valeu) e depois sai da lista — o backend continua com o histórico, isso é só apresentação.
+  Reportado pelo usuário ("se vc cancela ele não fica um pouco na fila e depois some").
+- **Instruções sem digitar coordenada: clique no terreno pra mirar o destino** — a fila já executava
+  de verdade, mas a única forma de criar uma instrução era digitar x/z no composer, o que não combina
+  com a proposta de simplicidade do app. Agora um clique parado no terreno (a distinção com o arrastar
+  de órbita do `OrbitControls` é movimento/tempo, não botão) marca o bloco com uma caixa âmbar e abre
+  um popup no próprio ponto clicado com "Ir para" e "Explorar daqui" — o alvo vira instrução real e o
+  marcador sai de cena. `Esc` (ou clicar no céu, ou o ×) limpa o alvo. A digitação continua como
+  caminho secundário, com `Enter` confirmando o "Ir para". De quebra, toda instrução com alvo na fila
+  aparece no mundo como caixa de arame — âmbar enquanto espera, teal enquanto o bot executa —, então
+  a fila deixa de ser só uma lista lateral: dá pra ver onde cada destino fica antes de o bot chegar.
+  Reportado pelo usuário ("o sistema foi feito para ser simples e não pode simplesmente fazer o
+  usuário escrever todas as instruções automaticamente").
 - **Mundo de verdade no viewer — cada chunk vem inteiro, não mais uma placa lisa**: quando o cliente
   carrega um chunk, o addon serializa todas as seções 16×16×16 não-vazias (paleta de blocos com o
   level de fluido + 4096 índices por seção, a mesma divisão e a mesma ordem do `PalettedContainer` do

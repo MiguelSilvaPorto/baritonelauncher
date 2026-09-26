@@ -38,6 +38,27 @@ pub struct InstructionTarget {
     pub z: i32,
 }
 
+/// Padrão de varredura da exploração com raio (`ExploreParams`). O Baritone
+/// sozinho só tem `explore(origem)` (anda pro chunk nunca visto mais próximo,
+/// sem forma definida); os padrões abaixo são uma sequência de waypoints que o
+/// addon percorre, com progresso real.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExploreStyle {
+    /// Anéis concêntricos a partir da origem.
+    Circles,
+    /// Faixas de ida e volta cobrindo o quadrado do raio.
+    Zigzag,
+}
+
+/// Exploração com área definida: raio em blocos + padrão. `radius` é validado
+/// no comando (`queue_push`) porque um raio absurdo viraria uma lista de
+/// waypoints enorme no addon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExploreParams {
+    pub radius: u32,
+    pub style: ExploreStyle,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instruction {
     pub id: String,
@@ -49,6 +70,9 @@ pub struct Instruction {
     /// Ausente em instruções sem alvo no mundo (ex: `Explore` sem origem
     /// explícita — o addon usa a posição atual do bot).
     pub target: Option<InstructionTarget>,
+    /// Só para `Explore`: raio + padrão de varredura. `None` = exploração
+    /// nativa do Baritone (sem forma definida, até ser cancelada).
+    pub explore: Option<ExploreParams>,
 }
 
 #[derive(Debug, Default)]
@@ -73,11 +97,22 @@ impl InstructionQueue {
         self.items.iter_mut().find(|i| i.id == id)
     }
 
-    /// Tira a próxima `Queued` da fila e a marca como `Active`, devolvendo uma
-    /// cópia (o chamador precisa dela pra montar a mensagem do socket depois
-    /// de soltar o lock). `None` = fila vazia.
-    pub fn activate_next_queued(&mut self) -> Option<Instruction> {
-        let next = self.items.iter_mut().find(|i| i.status == InstructionStatus::Queued)?;
+    /// Tira a próxima `Queued` que o chamador sabe executar e a marca como
+    /// `Active`, devolvendo uma cópia (o chamador precisa dela pra montar a
+    /// mensagem do socket depois de soltar o lock). `None` = fila vazia (ou
+    /// nada executável). Instruções sem executor hoje (ex: `Mine`/`Build` do
+    /// editor de schematic) são **puladas** em vez de seguradas na cabeça —
+    /// antes o dispatch ativava uma delas, falhava ao codificar e a devolvia
+    /// pra fila, então ela voltava a ser a próxima pra sempre e travava
+    /// `TravelTo`/`Explore` atrás dela.
+    pub fn activate_next_queued(
+        &mut self,
+        can_execute: impl Fn(&Instruction) -> bool,
+    ) -> Option<Instruction> {
+        let next = self
+            .items
+            .iter_mut()
+            .find(|i| i.status == InstructionStatus::Queued && can_execute(i))?;
         next.status = InstructionStatus::Active;
         next.progress = 0.0;
         Some(next.clone())

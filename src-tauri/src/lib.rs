@@ -2,6 +2,7 @@ mod addon_socket;
 mod instructions;
 mod items;
 mod player_skin;
+mod schematic;
 mod storage_index;
 mod texture_atlas;
 mod time_estimate;
@@ -9,9 +10,13 @@ mod vitals;
 mod world_cache;
 mod world_store;
 
-use instructions::{Instruction, InstructionKind, InstructionQueue, InstructionStatus, InstructionTarget};
+use instructions::{
+    ExploreParams, ExploreStyle, Instruction, InstructionKind, InstructionQueue, InstructionStatus,
+    InstructionTarget,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -58,11 +63,21 @@ pub(crate) struct AppState {
     /// periódico do `world_store` compara com a última revisão salva e só
     /// reescreve o arquivo quando algo mudou de verdade.
     pub(crate) world_revision: AtomicU64,
+    /// Lista de blocos de cada schematic aplicado no editor, por id de
+    /// instrução (`Mine`/`Build`). Fica fora do `Instruction` de propósito: a
+    /// fila é pollada a cada segundo e um schematic inteiro dentro dela
+    /// inflaria o IPC — o card mostra só contagem/centro.
+    pub(crate) schematics: Mutex<HashMap<String, Vec<schematic::SchematicBlock>>>,
 }
 
 /// Ids de instrução são gerados aqui (nunca pelo addon) — só precisam ser
 /// únicos dentro de uma sessão do app.
 static NEXT_INSTRUCTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Limites do raio de exploração em blocos — validados em `queue_push`. O teto
+/// existe porque cada faixa/anél vira waypoint no addon.
+const MIN_EXPLORE_RADIUS: u32 = 16;
+const MAX_EXPLORE_RADIUS: u32 = 5000;
 
 /// Manda uma linha JSON pro addon, se houver alguém conectado. Silencioso de
 /// propósito quando não há: quem chama decide o que fazer com a instrução
@@ -90,15 +105,19 @@ pub(crate) fn dispatch_next_instruction(state: &AppState) {
         if queue.active().is_some() {
             return;
         }
-        queue.activate_next_queued()
+        // Só instruções com executor (ver `encode_instruction`): as outras
+        // (Mine/Build do editor de schematic) ficam na fila sem bloquear as
+        // que sabem rodar — ver o doc-comment de `activate_next_queued`.
+        queue.activate_next_queued(|instruction| encode_instruction(instruction).is_some())
     };
     let Some(instruction) = next else {
         return;
     };
 
     let Some(line) = encode_instruction(&instruction) else {
-        // Tipo sem executor ainda — devolve pra fila em vez de mentir que
-        // está ativo.
+        // Inalcançável enquanto o predicado acima e `encode_instruction`
+        // andarem juntos, mas devolver pra fila é melhor que mentir `Active`
+        // se um dia saírem de sincronia.
         let mut queue = state.queue.lock().unwrap();
         if let Some(item) = queue.by_id_mut(&instruction.id) {
             item.status = InstructionStatus::Queued;
@@ -126,21 +145,34 @@ fn encode_instruction(instruction: &Instruction) -> Option<String> {
                 "z": target.z,
             }).to_string())
         }
-        InstructionKind::Explore => Some(match instruction.target {
-            Some(target) => json!({
-                "type": "instruction",
-                "id": id,
-                "kind": "explore",
-                "x": target.x,
-                "z": target.z,
-            }),
-            // Sem alvo: o addon usa a posição atual do bot como origem.
-            None => json!({
-                "type": "instruction",
-                "id": id,
-                "kind": "explore",
-            }),
-        }.to_string()),
+        InstructionKind::Explore => Some({
+            let mut payload = match instruction.target {
+                Some(target) => json!({
+                    "type": "instruction",
+                    "id": id,
+                    "kind": "explore",
+                    "x": target.x,
+                    "z": target.z,
+                }),
+                // Sem alvo: o addon usa a posição atual do bot como origem.
+                None => json!({
+                    "type": "instruction",
+                    "id": id,
+                    "kind": "explore",
+                }),
+            };
+            // Com raio + estilo, o addon percorre uma lista de waypoints em vez
+            // de usar o `explore` nativo (que não tem forma definida).
+            if let Some(params) = instruction.explore {
+                payload["radius"] = json!(params.radius);
+                payload["style"] = json!(match params.style {
+                    ExploreStyle::Circles => "circles",
+                    ExploreStyle::Zigzag => "zigzag",
+                });
+            }
+            payload.to_string()
+        }),
+
         _ => None,
     }
 }
@@ -150,6 +182,29 @@ pub(crate) struct ConnectionStatus {
     pub(crate) connected: bool,
     /// Preenchido quando `connected` é `true` — endereço do addon Java.
     pub(crate) endpoint: Option<String>,
+}
+
+/// Resposta de `schematic_apply`: só contagens e ids. A lista de blocos em si
+/// fica no `AppState` (`schematics`) — a fila é pollada a cada segundo e
+/// carregar centenas de blocos na resposta inflaria o IPC sem necessidade.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SchematicApplyResult {
+    pub(crate) breaks: usize,
+    pub(crate) builds: usize,
+    pub(crate) instruction_ids: Vec<String>,
+}
+
+/// Centro horizontal (x, z) de um schematic — só pro card da fila mostrar de
+/// onde ele é; o destino real é a lista de blocos.
+fn schematic_center(blocks: &[schematic::SchematicBlock]) -> Option<InstructionTarget> {
+    let min_x = blocks.iter().map(|b| b.x).min()?;
+    let max_x = blocks.iter().map(|b| b.x).max()?;
+    let min_z = blocks.iter().map(|b| b.z).min()?;
+    let max_z = blocks.iter().map(|b| b.z).max()?;
+    Some(InstructionTarget {
+        x: (min_x + max_x) / 2,
+        z: (min_z + max_z) / 2,
+    })
 }
 
 mod commands {
@@ -181,6 +236,18 @@ mod commands {
         state.world.lock().unwrap().chunks.keys().copied().collect()
     }
 
+    /// Os `limit` chunks em cache mais próximos do ponto dado, já ordenados
+    /// por distância (`world_cache::nearest_chunks`). É o que o viewer usa
+    /// pra carregar o terreno ao redor do bot primeiro, em vez de pedir o
+    /// cache inteiro — que cresce sem limite — em ordem arbitrária de
+    /// `HashMap`. `limit` tem teto pra uma chamada malformada não devolver
+    /// o mundo todo.
+    #[tauri::command]
+    fn world_chunks_near(state: State<AppState>, x: i32, z: i32, limit: u32) -> Vec<ChunkPos> {
+        let world = state.world.lock().unwrap();
+        world_cache::nearest_chunks(world.chunks.keys(), x, z, (limit as usize).min(4096))
+    }
+
     /// Voxels de um chunk (seções com paleta + índices, ver
     /// `world_cache.rs`) como bytes crus — o viewer faz o face culling e monta
     /// a geometria. Resposta vazia = chunk não está no cache; é resposta
@@ -203,21 +270,45 @@ mod commands {
     /// Enfileira uma instrução e devolve a fila atualizada. Se o addon está
     /// conectado e nada está ativo, ela já sai despachada na mesma hora
     /// (`dispatch_next_instruction`); senão fica `Queued` até a vez.
+    /// `explore` só vale para `Explore` (raio + padrão de varredura).
     #[tauri::command]
     fn queue_push(
         state: State<AppState>,
         kind: InstructionKind,
         target: Option<InstructionTarget>,
+        explore: Option<ExploreParams>,
     ) -> Result<Vec<Instruction>, String> {
+        if let Some(params) = explore {
+            if !(MIN_EXPLORE_RADIUS..=MAX_EXPLORE_RADIUS).contains(&params.radius) {
+                return Err(format!(
+                    "Raio de exploração precisa ficar entre {MIN_EXPLORE_RADIUS} e {MAX_EXPLORE_RADIUS} blocos."
+                ));
+            }
+        }
+
         let label = match kind {
             InstructionKind::TravelTo => {
                 let target = target.ok_or("Ir para precisa de coordenadas (x, z).")?;
                 format!("Ir para ({}, {})", target.x, target.z)
             }
-            InstructionKind::Explore => match target {
-                Some(target) => format!("Explorar a partir de ({}, {})", target.x, target.z),
-                None => "Explorar".to_string(),
-            },
+            InstructionKind::Explore => {
+                let origin = match target {
+                    Some(target) => format!(" a partir de ({}, {})", target.x, target.z),
+                    None => String::new(),
+                };
+                match explore {
+                    Some(params) => format!(
+                        "Explorar {} blocos em {}{}",
+                        params.radius,
+                        match params.style {
+                            ExploreStyle::Circles => "círculos",
+                            ExploreStyle::Zigzag => "zigue-zague",
+                        },
+                        origin
+                    ),
+                    None => format!("Explorar{origin}"),
+                }
+            }
             // A UI ainda não cria esses tipos; falha alto em vez de enfileirar
             // algo que nenhum lado sabe executar.
             _ => return Err("Esse tipo de instrução ainda não é executável.".to_string()),
@@ -230,6 +321,7 @@ mod commands {
             status: InstructionStatus::Queued,
             progress: 0.0,
             target,
+            explore,
         };
         state.queue.lock().unwrap().push(instruction);
         dispatch_next_instruction(&state);
@@ -262,6 +354,71 @@ mod commands {
             dispatch_next_instruction(&state);
         }
         state.queue.lock().unwrap().items.clone()
+    }
+
+    /// Aplica a camada de edição do editor de schematic: o diff contra o
+    /// `WorldCache` real (feito em `schematic.rs`, não no frontend) vira
+    /// instruções `Mine`/`Build` na fila. Elas ficam `Queued` de verdade —
+    /// o addon ainda não tem executor pra esses tipos (ver "Known gaps"),
+    /// mas o schematic fica guardado em `AppState.schematics` pro dia em que
+    /// tiver. Devolve só as contagens/ids; a lista de blocos não volta.
+    #[tauri::command]
+    fn schematic_apply(
+        state: State<AppState>,
+        edits: Vec<schematic::BlockEdit>,
+    ) -> Result<SchematicApplyResult, String> {
+        let diff = {
+            let world = state.world.lock().unwrap();
+            schematic::diff(&world, &edits)
+        };
+        if diff.is_empty() {
+            return Ok(SchematicApplyResult {
+                breaks: 0,
+                builds: 0,
+                instruction_ids: Vec::new(),
+            });
+        }
+
+        let mut ids = Vec::new();
+        {
+            let mut queue = state.queue.lock().unwrap();
+            for (kind, blocks) in [
+                (InstructionKind::Mine, &diff.break_blocks),
+                (InstructionKind::Build, &diff.build_blocks),
+            ] {
+                if blocks.is_empty() {
+                    continue;
+                }
+                let id = format!("i{}", NEXT_INSTRUCTION_ID.fetch_add(1, Ordering::Relaxed));
+                let label = match kind {
+                    InstructionKind::Mine => format!("Quebrar {} blocos (editor)", blocks.len()),
+                    _ => format!("Construir {} blocos (editor)", blocks.len()),
+                };
+                queue.push(Instruction {
+                    id: id.clone(),
+                    kind,
+                    label,
+                    status: InstructionStatus::Queued,
+                    progress: 0.0,
+                    target: schematic_center(blocks),
+                    // Não é explore: o editor manda a lista de blocos
+                    // (`AppState.schematics`), não raio/padrão de varredura.
+                    explore: None,
+                });
+                state
+                    .schematics
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), blocks.clone());
+                ids.push(id);
+            }
+        }
+        dispatch_next_instruction(&state);
+        Ok(SchematicApplyResult {
+            breaks: diff.break_blocks.len(),
+            builds: diff.build_blocks.len(),
+            instruction_ids: ids,
+        })
     }
 
     #[tauri::command]
@@ -310,10 +467,12 @@ mod commands {
             connection_status,
             world_summary,
             world_chunks,
+            world_chunks_near,
             chunk_voxels,
             queue_snapshot,
             queue_push,
             queue_cancel,
+            schematic_apply,
             storage_totals,
             vitals_snapshot,
             bot_pose,

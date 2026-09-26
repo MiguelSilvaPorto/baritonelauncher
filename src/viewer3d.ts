@@ -41,7 +41,17 @@ const SKY_HORIZON = "#c2d6e8";
 /** Raio do domo de céu: dentro do `far` da câmera (5000) e maior que o
  * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
 const SKY_RADIUS = 3000;
-const COLOR_TEAL = 0x5eead4;
+const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso")
+// token `--amber` do SPEC ("ação planejada"): camada de edição do editor e
+// alvo clicado da fila.
+const COLOR_AMBER = 0xf2b155;
+const MAX_EDIT_VOLUME = 50_000; // teto de blocos por operação de região (um clique só)
+
+// Clique vs. arrastar: o botão esquerdo orbita (OrbitControls) e também edita
+// (editor) ou escolhe o alvo da fila — só conta como clique se o ponteiro quase
+// não andou (um clique lento, mas parado, continua valendo).
+const CLICK_MAX_MOVE_PX = 6;
+const CLICK_MAX_MS = 800;
 
 // Movimento por teclado ("voo" pela cena): o OrbitControls sozinho só responde
 // ao mouse, então qualquer deslocamento exigia arrastar/orbitar — e o alvo da
@@ -155,9 +165,22 @@ const VOXEL_FLAG_FLUID = 4;
  * "Known gaps" no README). */
 const FLUID_FRAME_MS = 120;
 
-/** Quantos chunks o viewer pede por tick de polling (ver `main.ts`). Meshing
- * é CPU na thread principal; pedir o backfill inteiro de uma vez travaria. */
-export const CHUNKS_PER_REFRESH = 4;
+/** Quantos chunks o viewer pede por tick de polling (ver `main.ts`). As
+ * malhas entram numa fila e são montadas com orçamento por frame
+ * (`drainMeshQueue`), então pedir mais não trava o render — só acelera o
+ * preenchimento ao redor do bot. */
+export const CHUNKS_PER_REFRESH = 16;
+
+/** Teto de chunks que o backend devolve por consulta (`world_chunks_near`),
+ * já ordenados por distância do bot. O viewer filtra os que já tem e pede
+ * só o que falta; consultas continuam baratas mesmo com o cache inteiro
+ * persistido (que cresce sem limite). */
+export const NEARBY_CHUNK_LIMIT = 1024;
+
+/** Orçamento de CPU por frame pra montar malhas de chunk, em ms. Um backfill
+ * pode enfileirar centenas de chunks; montar todos de uma vez derruba o fps,
+ * então a fila é drenada em pedaços por frame. */
+const MESH_BUDGET_MS = 8;
 
 export interface BotPos {
   x: number;
@@ -184,6 +207,33 @@ export interface UvRect {
   v0: number;
   u1: number;
   v1: number;
+}
+
+export interface BlockPos {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Ferramenta ativa do editor de schematic. `null` = viewer puro (clique não
+ * edita nada). */
+export type EditMode = "select" | "place" | "break";
+
+/** Uma edição da camada de pintura: `block = null` = quebrar (vira ar). O
+ * frontend manda isso inteiro em `schematic_apply` e o diff real acontece no
+ * Rust (`schematic.rs`) contra o `WorldCache`. */
+export interface BlockEdit {
+  x: number;
+  y: number;
+  z: number;
+  block: string | null;
+}
+
+/** Resultado do picking: bloco atingido + face clicada (normal, pra saber
+ * onde um bloco colocado encosta). */
+export interface PickedBlock {
+  pos: BlockPos;
+  normal: readonly [number, number, number];
 }
 
 interface PaletteEntry {
@@ -277,6 +327,27 @@ const HORIZONTAL_NEIGHBORS: readonly (readonly [number, number])[] = [
   [0, -1],
 ];
 
+/** UVs de cada face em flat (u0,v0,u1,v1,…) — evita alocar arrays por face
+ * no laço de meshing. */
+const FACE_UV_FLAT: readonly (readonly number[])[] = FACES.map((face) => face.uv.flat());
+
+/** As 4 rotações de 90° de cada face, pré-computadas: `[faceIndex][rotation]`
+ * é o UV flat correspondente, usado pra alinhar a textura do fluido com a
+ * correnteza sem fazer `map`/`[u, v]` por face. */
+const FLUID_ROTATED_UV: number[][][] = FACE_UV_FLAT.map((flat) => {
+  const rotations: number[][] = [flat.slice()];
+  for (let r = 1; r < 4; r++) {
+    const previous = rotations[r - 1];
+    const next: number[] = new Array(8);
+    for (let i = 0; i < 4; i++) {
+      next[i * 2] = 1 - previous[i * 2 + 1];
+      next[i * 2 + 1] = previous[i * 2];
+    }
+    rotations.push(next);
+  }
+  return rotations;
+});
+
 const AIR: PaletteEntry = { block: "air", flags: 0, level: 0 };
 const DOWN = new THREE.Vector3(0, -1, 0);
 const ZERO = new THREE.Vector3(0, 0, 0);
@@ -298,6 +369,17 @@ interface MeshBuffers {
   indices: number[];
 }
 
+/** UVs já no espaço do atlas (flat) + tint linear, cacheados por (bloco,
+ * face do cubo) — o laço de meshing roda uma vez por face exposta e refazer
+ * string + rect + conversão de cor a cada iteração era o grosso do custo
+ * num chunk denso. */
+interface FaceRender {
+  uv: number[];
+  r: number;
+  g: number;
+  b: number;
+}
+
 /** Rect resolvido de uma face + se veio de textura real do atlas (`known`)
  * ou do fallback (tile branco / bloco sem textura) — ver `faceRect`. */
 interface ResolvedFace {
@@ -308,7 +390,6 @@ interface ResolvedFace {
 /** Um decoder UTF-8 só pro módulo — o payload tem uma entrada de paleta por
  * bloco distinto, não faz sentido alocar um `TextDecoder` por entrada. */
 const UTF8_DECODER = new TextDecoder();
-
 function byteReader(bytes: Uint8Array) {
   let pos = 0;
   const take = (n: number) => {
@@ -369,6 +450,10 @@ export class Viewer3D {
   private chunks = new Map<number, DecodedChunk>();
   /** Malhas de um chunk, uma por bucket de material — ver `buildChunkMesh`. */
   private chunkMeshes = new Map<number, THREE.Mesh[]>();
+  /** Fila de chunks esperando malha (chave numérica) + dedupe; drenada por
+   * frame com orçamento em `drainMeshQueue`. */
+  private meshQueue: number[] = [];
+  private queuedChunks = new Set<number>();
   private botMarker: THREE.Group;
   /** Modelo do jogador dentro de `botMarker` — ver `player_model.ts`. */
   private playerModel = new MinecraftPlayerModel();
@@ -378,6 +463,34 @@ export class Viewer3D {
   private botPitch = 0;
 
   private labelEl: HTMLDivElement;
+
+  /** Alvo escolhido clicando no terreno (âmbar) + popup de ações — ver
+   * `pickTargetAt`/`setTarget`. `null` = nenhum alvo. */
+  private targetMarker: THREE.Group;
+  private targetEl: HTMLDivElement;
+  private targetBlock: { x: number; y: number; z: number } | null = null;
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly pointerNdc = new THREE.Vector2();
+  private pointerDownAt: { x: number; y: number; time: number } | null = null;
+
+  /** Instruções da fila com alvo, desenhadas no mundo (uma caixa de arame por
+   * instrução): âmbar = `Queued`, teal = `Active` — ver `setInstructionTargets`. */
+  private readonly instructionMarkers = new Map<string, THREE.Mesh>();
+  private readonly ghostGeometry = new THREE.BoxGeometry(1.04, 1.04, 1.04);
+  private readonly ghostQueuedMaterial = new THREE.MeshBasicMaterial({
+    color: COLOR_AMBER,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.45,
+    fog: false,
+  });
+  private readonly ghostActiveMaterial = new THREE.MeshBasicMaterial({
+    color: COLOR_TEAL,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.75,
+    fog: false,
+  });
 
   // Estado do voo por teclado — ver `handleKeyDown`/`applyMovement`.
   private keysDown = new Set<string>();
@@ -392,6 +505,36 @@ export class Viewer3D {
   private atlasImage: HTMLImageElement | null = null;
   private atlasTexture: THREE.Texture | null = null;
   private atlasUvByName: Record<string, UvRect> | null = null;
+
+  // ---- Editor de schematic (ver `docs/SPEC.md`, "Como isso vira o editor
+  // estilo WorldEdit") ----
+  /** Camada de edição, separada do `chunks` (mundo real): chave = x,y,z.
+   * `block = null` = quebrar. Nunca muta o terreno verdadeiro — o diff e a
+   * instrução são gerados no Rust (`schematic.rs`). */
+  private edits = new Map<string, BlockEdit>();
+  private editMode: EditMode | null = null;
+  private placeBlock: string | null = null;
+  private selectionA: BlockPos | null = null;
+  private selectionB: BlockPos | null = null;
+  private hovered: PickedBlock | null = null;
+  /** Cubo de arame do bloco sob o cursor / destino da colocação. */
+  private hoverHelper: THREE.LineSegments;
+  /** Cubo de arame da região selecionada (âmbar = planejado). */
+  private selectionHelper: THREE.LineSegments;
+  private ghostGroup = new THREE.Group();
+  /** Ghosts instanciados por (bloco, quebrar|colocar). */
+  private ghostMeshes = new Map<string, THREE.InstancedMesh>();
+  private iconCache = new Map<string, string>();
+  private readonly scratchMatrix = new THREE.Matrix4();
+  /** Chamado quando a camada de edição ou a seleção muda — a UI usa pra
+   * atualizar contadores/botões. */
+  onEditChange: (() => void) | null = null;
+  /** Chamado quando o atlas termina de carregar — é quando a paleta (ícones
+   * reais) pode ser montada. */
+  onAtlasReady: (() => void) | null = null;
+  /** Avisos honestos pra UI (ex: seleção grande demais). */
+  onNotice: ((message: string) => void) | null = null;
+
   /** Atlas tentado e falhou (jar ausente, extração quebrada): o mundo é
    * desenhado em modo degradado (cor sólida, sem textura) e `main.ts` para de
    * tentar — ver `needsAtlas`/`setAtlasUnavailable`. */
@@ -404,6 +547,9 @@ export class Viewer3D {
    * mesmo tile. `null` = atlas carregado mas sem essa textura. Enquanto o
    * atlas não carregou nada é cacheado — ver `getTileTexture`. */
   private tileTextureCache = new Map<string, THREE.Texture | null>();
+  /** UV+tint por (bloco, face do cubo) — ver `FaceRender`. Invalidado quando
+   * o atlas (re)carrega, em `buildMaterials`. */
+  private faceRenderCache = new Map<string, FaceRender | null>();
   /** Material do terreno opaco: um só pra tudo, com UV apontando pro tile
    * certo do atlas por face e cor por vértice (tint). */
   private opaqueMaterial: THREE.MeshStandardMaterial | null = null;
@@ -418,9 +564,10 @@ export class Viewer3D {
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
 
-  constructor(container: HTMLElement, labelEl: HTMLDivElement) {
+  constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
     this.labelEl = labelEl;
+    this.targetEl = targetEl;
 
     this.scene = new THREE.Scene();
     this.fog = new THREE.Fog(SKY_HORIZON, FOG_NEAR_BASE, FOG_FAR_BASE);
@@ -460,6 +607,19 @@ export class Viewer3D {
     window.addEventListener("keyup", this.handleKeyUp);
     window.addEventListener("blur", this.clearKeys);
 
+    // Clique parado no terreno escolhe o destino; arrastar continua orbitando
+    // (o OrbitControls escuta os mesmos eventos, então nada de preventDefault
+    // aqui — a distinção é só o movimento/tempo). O mesmo clique vira edição
+    // quando há uma ferramenta do editor ativa — ver `handlePointerUp`.
+    const canvas = this.renderer.domElement;
+    canvas.addEventListener("pointerdown", this.handlePointerDown);
+    canvas.addEventListener("pointerup", this.handlePointerUp);
+    canvas.addEventListener("pointermove", this.handlePointerMove);
+    canvas.addEventListener("pointerleave", () => {
+      this.hovered = null;
+      this.hoverHelper.visible = false;
+    });
+
     this.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
     const sun = new THREE.DirectionalLight(0xffffff, 0.5);
     sun.position.set(80, 120, 40);
@@ -472,8 +632,51 @@ export class Viewer3D {
     this.botMarker.visible = false;
     this.scene.add(this.botMarker);
 
+    // Editor: helpers de arame (hover/seleção) e o grupo dos ghosts — ver
+    // `rebuildGhosts`.
+    this.scene.add(this.ghostGroup);
+    this.hoverHelper = this.buildWireBox(COLOR_TEAL);
+    this.selectionHelper = this.buildWireBox(COLOR_AMBER);
+
+    // Alvo clicado da fila (instruções) — caixa âmbar sobre o bloco escolhido.
+    this.targetMarker = this.buildTargetMarker();
+    this.scene.add(this.targetMarker);
+
     this.resize();
     this.animate();
+  }
+
+  /** Cubo de arame 1×1×1 (escalado depois) do hover e da região selecionada.
+   * `depthTest: false` = sempre visível, mesmo atrás do terreno — é um cursor,
+   * não um objeto da cena. */
+  private buildWireBox(color: number): THREE.LineSegments {
+    const geometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002));
+    const material = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.95, depthTest: false });
+    const box = new THREE.LineSegments(geometry, material);
+    box.renderOrder = 3; // por cima do terreno
+    box.visible = false;
+    this.scene.add(box);
+    return box;
+  }
+
+  /** Caixa de arame âmbar sobre o bloco clicado — planejado, ainda não
+   * enviado (a cor segue a identidade: âmbar = ação/planejado). O preenchimento
+   * translúcido existe só pra dar volume; `fog: false` pra nunca sumir no
+   * horizonte, igual o marcador do bot. */
+  private buildTargetMarker(): THREE.Group {
+    const group = new THREE.Group();
+    const geometry = new THREE.BoxGeometry(1.02, 1.02, 1.02);
+    const fill = new THREE.Mesh(
+      geometry,
+      new THREE.MeshBasicMaterial({ color: COLOR_AMBER, transparent: true, opacity: 0.14, depthWrite: false, fog: false })
+    );
+    const wire = new THREE.Mesh(
+      geometry,
+      new THREE.MeshBasicMaterial({ color: COLOR_AMBER, wireframe: true, transparent: true, opacity: 0.9, fog: false })
+    );
+    group.add(fill, wire);
+    group.visible = false;
+    return group;
   }
 
   /** Grupo do jogador: o modelo do Minecraft + um anel teal raso no chão. O
@@ -569,6 +772,15 @@ export class Viewer3D {
     return this.chunks.has(this.chunkKey(x, z));
   }
 
+  /** Chunk do ponto que a câmera orbita — âncora de prioridade quando não há
+   * bot conectado (mundo em cache sendo navegado com o jogo fechado). */
+  getFocusChunk(): ChunkPos {
+    return {
+      x: Math.floor(this.controls.target.x) >> 4,
+      z: Math.floor(this.controls.target.z) >> 4,
+    };
+  }
+
   /** Recebe o atlas já extraído/empacotado pelo lado Rust (data URL + mapa
    * de UV) e guarda a imagem crua + o mapa de UV. Chamado uma vez, quando o
    * comando `get_texture_atlas` resolve — ver `main.ts`.
@@ -597,6 +809,11 @@ export class Viewer3D {
         this.atlasLoading = false;
         this.buildMaterials();
         this.rebuildAllMeshes();
+        // Edições feitas antes do atlas (ícone/ghost dependem dele) aparecem
+        // agora — e o `onEditChange` avisa a UI pra montar a paleta.
+        this.rebuildGhosts();
+        this.onEditChange?.();
+        this.onAtlasReady?.();
       },
       undefined,
       (err) => {
@@ -727,6 +944,7 @@ export class Viewer3D {
   private buildMaterials() {
     this.animatedMaterials = [];
     this.bucketMaterials.clear();
+    this.faceRenderCache.clear();
     this.faceRectCache.clear();
     // `alphaTest` recorta as texturas com transparência (folhas, plantas,
     // tochas): sem ele o alpha é ignorado e os pixels vazios saem pretos.
@@ -787,9 +1005,13 @@ export class Viewer3D {
   }
 
   /** Recebe um chunk em voxels (payload binário de `chunk_voxels`, ver
-   * `world_cache.rs`) e (re)constrói as malhas dele e dos 4 vizinhos já
-   * carregados — sem isso, as faces na divisa ficariam desenhadas até o
-   * vizinho chegar (e o fluxo da água na borda ficaria sem direção). */
+   * `world_cache.rs`) e enfileira a malha dele pra montagem orçada por frame
+   * (`drainMeshQueue`) — um backfill enfileira centenas de chunks de uma vez
+   * e montar tudo aqui travava o render.
+   *
+   * Vizinhos já montados só entram na fila se a borda que dá pra eles tem
+   * algo desenhável (oclusão/fluido na divisa mudam a malha do vizinho); a
+   * checagem é muito mais barata que remontar 4 chunks por chunk que chega. */
   addChunkVoxels(x: number, z: number, bytes: Uint8Array) {
     if (bytes.length === 0) return; // ainda não pronto no Rust — tenta de novo depois
     let chunk: DecodedChunk;
@@ -800,10 +1022,36 @@ export class Viewer3D {
       return;
     }
     this.chunks.set(this.chunkKey(x, z), chunk);
-    for (const [cx, cz] of [[x, z], [x + 1, z], [x - 1, z], [x, z + 1], [x, z - 1]] as const) {
-      const neighbor = this.chunks.get(this.chunkKey(cx, cz));
-      if (neighbor) this.buildChunkMesh(neighbor);
+    this.enqueueMesh(this.chunkKey(x, z));
+    for (const [dx, dz] of HORIZONTAL_NEIGHBORS) {
+      if (!this.chunkBorderHasContent(chunk, dx, dz)) continue;
+      const neighborKey = this.chunkKey(x + dx, z + dz);
+      if (this.chunkMeshes.has(neighborKey)) this.enqueueMesh(neighborKey);
     }
+  }
+
+  private enqueueMesh(key: number) {
+    if (this.queuedChunks.has(key)) return;
+    this.queuedChunks.add(key);
+    this.meshQueue.push(key);
+  }
+
+  /** `true` se a camada de borda do chunk (a que encosta no vizinho em
+   * `(dx, dz)` — cada um em −1/0/1) tem algum bloco desenhável. Borda só de
+   * ar não muda a malha nem o fluxo do vizinho, então remontá-lo seria
+   * trabalho jogado fora. */
+  private chunkBorderHasContent(chunk: DecodedChunk, dx: number, dz: number): boolean {
+    for (const section of chunk.sections.values()) {
+      for (let a = 0; a < 16; a++) {
+        const lx = dx < 0 ? 0 : dx > 0 ? 15 : a;
+        const lz = dz < 0 ? 0 : dz > 0 ? 15 : a;
+        for (let ly = 0; ly < 16; ly++) {
+          const entry = section.palette[section.indices[(ly << 8) | (lz << 4) | lx]];
+          if (entry && (entry.flags & VOXEL_FLAG_RENDER) !== 0) return true;
+        }
+      }
+    }
+    return false;
   }
 
   /** Bloco em coordenada de mundo. `null` = desconhecido (chunk ainda não
@@ -846,18 +1094,16 @@ export class Viewer3D {
   }
 
   /** Qual das 4 rotações de 90° da textura alinha o "desce" da imagem (V+)
-   * com o fluxo projetado na face — [0]=V, [1]=U, [2]=−V, [3]=−U. */
-  private flowRotation(face: FaceDef, flow: THREE.Vector3): number {
-    const candidates = [face.vDir, face.uDir, face.vDir.map((v) => -v) as [number, number, number], face.uDir.map((v) => -v) as [number, number, number]];
+   * com o fluxo projetado na face — [0]=V, [1]=U, [2]=−V, [3]=−U. Roda uma
+   * vez por face de fluido visível, então evita alocar arrays de direção. */
+  private flowRotation(faceIndex: number, flow: THREE.Vector3): number {
+    const face = FACES[faceIndex];
+    const vDot = flow.x * face.vDir[0] + flow.y * face.vDir[1] + flow.z * face.vDir[2];
+    const uDot = flow.x * face.uDir[0] + flow.y * face.uDir[1] + flow.z * face.uDir[2];
+    const candidates = [vDot, uDot, -vDot, -uDot];
     let best = 0;
-    let bestDot = -Infinity;
-    for (let i = 0; i < candidates.length; i++) {
-      const [cx, cy, cz] = candidates[i];
-      const dot = flow.x * cx + flow.y * cy + flow.z * cz;
-      if (dot > bestDot) {
-        bestDot = dot;
-        best = i;
-      }
+    for (let i = 1; i < 4; i++) {
+      if (candidates[i] > candidates[best]) best = i;
     }
     return best;
   }
@@ -871,30 +1117,61 @@ export class Viewer3D {
     return buffers;
   }
 
-  /** Adiciona um quad (2 triângulos) de uma face. `low`/`high` recortam a
-   * altura local (0..1) — usado pra superfície rebaixada de fluido. */
-  private pushQuad(
+  /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
+   * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
+   * usado pra superfície rebaixada de fluido. */
+  private pushQuadFlat(
     buffers: MeshBuffers,
-    face: FaceDef,
+    faceIndex: number,
     x: number,
     y: number,
     z: number,
     low: number,
     high: number,
-    uvs: readonly (readonly [number, number])[],
-    color: number
+    uv: readonly number[],
+    r: number,
+    g: number,
+    b: number
   ) {
+    const face = FACES[faceIndex];
     const base = buffers.positions.length / 3;
-    this.scratchColor.setHex(color);
-    const { r, g, b } = this.scratchColor;
     for (let i = 0; i < 4; i++) {
       const corner = face.corners[i];
       buffers.positions.push(x + corner[0], y + (corner[1] === 1 ? high : low), z + corner[2]);
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
-      buffers.uvs.push(uvs[i][0], uvs[i][1]);
+      buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
       buffers.colors.push(r, g, b);
     }
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+
+  /** UVs (flat, já no espaço do atlas) + tint linear de uma face do bloco,
+   * com cache por (bloco, face). `null` = face sem textura resolvida, pulada
+   * sem quebrar o chunk. */
+  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+    const key = `${blockName}|${faceIndex}`;
+    if (this.faceRenderCache.has(key)) return this.faceRenderCache.get(key)!;
+
+    const face = FACES[faceIndex];
+    const resolved = this.faceRect(blockName, face.kind);
+    let render: FaceRender | null = null;
+    if (resolved) {
+      const rect = resolved.rect;
+      const uv = new Array<number>(8);
+      for (let i = 0; i < 4; i++) {
+        const [u, v] = face.uv[i];
+        uv[i * 2] = rect.u0 + u * (rect.u1 - rect.u0);
+        uv[i * 2 + 1] = rect.v0 + v * (rect.v1 - rect.v0);
+      }
+      // Sem textura real (bloco de mod, atlas degradado): cinza neutro em vez
+      // da textura de outro bloco.
+      this.scratchColor.setHex(
+        resolved.known ? this.faceTint(blockName, face.kind) : COLOR_UNKNOWN_BLOCK
+      );
+      render = { uv, r: this.scratchColor.r, g: this.scratchColor.g, b: this.scratchColor.b };
+    }
+    this.faceRenderCache.set(key, render);
+    return render;
   }
 
   /** Uma face visível de fluido: mesma culling dos sólidos, mas face entre o
@@ -902,7 +1179,7 @@ export class Viewer3D {
    * a altura sai do nível em vez de 0..1. */
   private meshFluidFace(
     buffers: MeshBuffers,
-    face: FaceDef,
+    faceIndex: number,
     x: number,
     y: number,
     z: number,
@@ -923,69 +1200,93 @@ export class Viewer3D {
       if ((neighbor.flags & VOXEL_FLAG_OCCLUDES) !== 0) return;
     }
 
-    let uvs = face.uv;
-    const rotation = flow ? this.flowRotation(face, flow) : 0;
-    for (let i = 0; i < rotation; i++) {
-      uvs = uvs.map(([u, v]) => [1 - v, u] as [number, number]);
-    }
-    this.pushQuad(buffers, face, x, y, z, low, high, uvs, 0xffffff);
+    const rotation = flow ? this.flowRotation(faceIndex, flow) : 0;
+    this.pushQuadFlat(
+      buffers,
+      faceIndex,
+      x,
+      y,
+      z,
+      low,
+      high,
+      FLUID_ROTATED_UV[faceIndex][rotation],
+      1,
+      1,
+      1
+    );
   }
 
   /** Monta as malhas de um chunk (um mesh por bucket usado) e substitui as
    * antigas. Sem atlas carregado não faz nada até o atlas resolver (ou até o
-   * modo degradado ligar) — `setAtlas`/`setAtlasUnavailable` remontam tudo. */
+   * modo degradado ligar) — `setAtlas`/`setAtlasUnavailable` remontam tudo.
+   *
+   * Roda dentro da fila orçada (`drainMeshQueue`), nunca direto no refresh:
+   * é o trabalho pesado do viewer (varre 4096 blocos por seção) e montar
+   * vários chunks no mesmo tick derrubava o fps. */
   private buildChunkMesh(chunk: DecodedChunk) {
     const key = this.chunkKey(chunk.x, chunk.z);
     this.disposeChunkMeshes(key);
     if (!this.atlasUvByName && !this.atlasUnavailable) return;
 
     const buckets = new Map<string, MeshBuffers>();
+    const buffered = (bucket: string) => this.buffersFor(buckets, bucket);
+
     for (const section of chunk.sections.values()) {
+      // Acesso local ao chunk/seção corrente: num chunk denso quase todas as
+      // consultas de vizinho caem aqui (sem dois `Map.get` por face); só a
+      // divisa de chunk cai no caminho global (`entryAt`).
+      const sectionY = section.y;
+      const sectionPalette = section.palette;
+      const sectionIndices = section.indices;
+      const blockAt = (x: number, y: number, z: number): PaletteEntry | null => {
+        if ((x >> 4) === chunk.x && (z >> 4) === chunk.z) {
+          if ((y >> 4) === sectionY) {
+            return sectionPalette[sectionIndices[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]] ?? AIR;
+          }
+          const other = chunk.sections.get(y >> 4);
+          if (!other) return AIR;
+          return other.palette[other.indices[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)]] ?? AIR;
+        }
+        return this.entryAt(x, y, z);
+      };
+
       for (let ly = 0; ly < 16; ly++) {
         for (let lz = 0; lz < 16; lz++) {
           for (let lx = 0; lx < 16; lx++) {
-            const entry = section.palette[section.indices[(ly << 8) | (lz << 4) | lx]];
+            const entry = sectionPalette[sectionIndices[(ly << 8) | (lz << 4) | lx]];
             if (!entry || (entry.flags & VOXEL_FLAG_RENDER) === 0) continue;
 
             const x = chunk.x * 16 + lx;
-            const y = section.y * 16 + ly;
+            const y = sectionY * 16 + ly;
             const z = chunk.z * 16 + lz;
             const isFluid = (entry.flags & VOXEL_FLAG_FLUID) !== 0;
-            const flow = isFluid && entry.level !== 0 ? this.fluidFlowVector(x, y, z, entry) : null;
+            const fluidBucket = isFluid ? `${entry.block}_${entry.level === 0 ? "still" : "flow"}` : "opaque";
+            // Direção da correnteza só é calculada se alguma face de fluido
+            // realmente precisar — evita varrer 4 vizinhos de água enterrada.
+            let flow: THREE.Vector3 | null = null;
+            let flowNeeded = isFluid && entry.level !== 0;
 
-            for (const face of FACES) {
-              const neighbor = this.entryAt(x + face.dir[0], y + face.dir[1], z + face.dir[2]);
+            for (let f = 0; f < 6; f++) {
+              const face = FACES[f];
+              const neighbor = blockAt(x + face.dir[0], y + face.dir[1], z + face.dir[2]);
               if (isFluid) {
-                const buffers = this.buffersFor(buckets, `${entry.block}_${entry.level === 0 ? "still" : "flow"}`);
-                this.meshFluidFace(buffers, face, x, y, z, entry, neighbor, flow);
+                if (flowNeeded) {
+                  flow = this.fluidFlowVector(x, y, z, entry);
+                  flowNeeded = false;
+                }
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow);
                 continue;
               }
-              // Sólido: face some se o vizinho é oclusor (ou se nem é
-              // desenhável); oclusão entre chunks ainda não carregados não
-              // conta — o vizinho é `null` e a face fica desenhada até o
-              // chunk chegar (aí este chunk é remontado).
+              // Sólido: face some se o vizinho é oclusor; oclusão entre
+              // chunks ainda não carregados não conta — o vizinho é `null` e
+              // a face fica desenhada até o chunk chegar (aí este chunk é
+              // remontado).
               if (neighbor !== null && (neighbor.flags & VOXEL_FLAG_RENDER) !== 0) {
                 if ((neighbor.flags & VOXEL_FLAG_OCCLUDES) !== 0) continue;
               }
-              const resolved = this.faceRect(entry.block, face.kind);
-              if (!resolved) continue;
-              const rect = resolved.rect;
-              const uvs = face.uv.map(
-                ([u, v]) => [rect.u0 + u * (rect.u1 - rect.u0), rect.v0 + v * (rect.v1 - rect.v0)] as [number, number]
-              );
-              this.pushQuad(
-                this.buffersFor(buckets, "opaque"),
-                face,
-                x,
-                y,
-                z,
-                0,
-                1,
-                uvs,
-                // Sem textura real (bloco de mod, atlas degradado): cinza
-                // neutro em vez da textura de outro bloco.
-                resolved.known ? this.faceTint(entry.block, face.kind) : COLOR_UNKNOWN_BLOCK
-              );
+              const render = this.faceRender(entry.block, f);
+              if (!render) continue;
+              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, render.r, render.g, render.b);
             }
           }
         }
@@ -1005,10 +1306,31 @@ export class Viewer3D {
       geometry.setIndex(buffers.indices);
       const mesh = new THREE.Mesh(geometry, material);
       mesh.frustumCulled = true;
+      // Malha estática: nunca se move depois de criada, então não precisa
+      // recalcular a matriz por frame (são centenas de meshes no mundo).
+      mesh.matrixAutoUpdate = false;
+      mesh.updateMatrix();
       this.scene.add(mesh);
       meshes.push(mesh);
     }
     this.chunkMeshes.set(key, meshes);
+  }
+
+  /** Monta no máximo `MESH_BUDGET_MS` de malhas por frame. Um backfill (ou o
+   * mundo persistido abrindo) enfileira centenas de chunks de uma vez;
+   * montar tudo num tick só derrubava o fps, então a fila anda em pedaços —
+   * o resto aparece nos frames seguintes, começando pelos mais próximos do
+   * bot (a fila é alimentada na ordem que o backend manda, já por
+   * distância). */
+  private drainMeshQueue() {
+    if (this.meshQueue.length === 0) return;
+    const start = performance.now();
+    do {
+      const key = this.meshQueue.shift()!;
+      this.queuedChunks.delete(key);
+      const chunk = this.chunks.get(key);
+      if (chunk && this.atlasUvByName) this.buildChunkMesh(chunk);
+    } while (this.meshQueue.length > 0 && performance.now() - start < MESH_BUDGET_MS);
   }
 
   private disposeChunkMeshes(key: number) {
@@ -1022,9 +1344,10 @@ export class Viewer3D {
   }
 
   /** Chamado quando o atlas termina de carregar (as UVs/materiais dependem
-   * dele) — remonta todos os chunks já recebidos. */
+   * dele) — enfileira todos os chunks já recebidos pra remontagem orçada, em
+   * vez de montar centenas de uma vez travando o primeiro frame. */
   private rebuildAllMeshes() {
-    for (const chunk of this.chunks.values()) this.buildChunkMesh(chunk);
+    for (const key of this.chunks.keys()) this.enqueueMesh(key);
   }
 
   /** Recebe a pose real do jogador (comando `bot_pose`) e usa como alvo: o
@@ -1101,6 +1424,110 @@ export class Viewer3D {
     return this.container.clientWidth > 0 && this.container.clientHeight > 0;
   }
 
+  private handlePointerDown = (event: PointerEvent) => {
+    if (event.button !== 0) return;
+    this.pointerDownAt = { x: event.clientX, y: event.clientY, time: performance.now() };
+  };
+
+  private handlePointerUp = (event: PointerEvent) => {
+    const down = this.pointerDownAt;
+    this.pointerDownAt = null;
+    if (!down || event.button !== 0) return;
+    const moved = Math.hypot(event.clientX - down.x, event.clientY - down.y);
+    if (moved > CLICK_MAX_MOVE_PX || performance.now() - down.time > CLICK_MAX_MS) return;
+    // Com uma ferramenta do editor ativa o clique é edição; o alvo da fila
+    // fica de fora (nada de mirar instrução sem querer enquanto se pinta).
+    if (this.editMode) {
+      const hit = this.pickBlock(event.clientX, event.clientY);
+      if (hit) this.applyToolAt(hit);
+      return;
+    }
+    this.pickTargetAt(event.clientX, event.clientY);
+  };
+
+  /** Raycast do clique contra as malhas dos chunks. A geometria é composta de
+   * quads em coordenadas de mundo, então recuar meio bloco contra a normal
+   * (`-0.5 × normal`) cai dentro do bloco clicado — serve tanto pra face de
+   * topo quanto pra lateral (e a face rebaixada de fluido, que fica abaixo de
+   * y+1). Clicar no céu limpa o alvo. */
+  private pickTargetAt(clientX: number, clientY: number) {
+    if (!this.isViewerVisible()) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointerNdc.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
+    );
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+
+    const meshes: THREE.Object3D[] = [];
+    for (const list of this.chunkMeshes.values()) meshes.push(...list);
+    const hit = this.raycaster.intersectObjects(meshes, false)[0];
+    if (!hit || !hit.face) {
+      this.setTarget(null);
+      return;
+    }
+    const inside = hit.point.clone().addScaledVector(hit.face.normal, -0.5);
+    this.setTarget({ x: Math.floor(inside.x), y: Math.floor(inside.y), z: Math.floor(inside.z) });
+  }
+
+  /** Define (ou limpa, com `null`) o alvo do clique — movimento do marcador,
+   * popup de ações e coordenadas. Público porque o `main.ts` limpa o alvo
+   * depois de enfileirar a instrução. */
+  setTarget(pos: { x: number; y: number; z: number } | null) {
+    this.targetBlock = pos;
+    if (!pos) {
+      this.targetMarker.visible = false;
+      this.targetEl.style.display = "none";
+      return;
+    }
+    this.targetMarker.position.set(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);
+    this.targetMarker.visible = true;
+    this.targetEl.style.display = "flex";
+    const coords = this.targetEl.querySelector<HTMLElement>(".target-coords");
+    if (coords) coords.textContent = `${pos.x}, ${pos.y}, ${pos.z}`;
+  }
+
+  getTarget(): { x: number; y: number; z: number } | null {
+    return this.targetBlock;
+  }
+
+  /** Reflete a fila real no mundo: cada instrução com alvo (`Queued`/`Active`)
+   * vira uma caixa de arame na superfície do bloco apontado — âmbar enquanto
+   * espera, teal enquanto o bot executa (mesma semântica de cor do app). Alvo
+   * fora do que já foi carregado no cache não desenha nada: melhor nada do que
+   * chutar uma altura. */
+  setInstructionTargets(items: { id: string; active: boolean; x: number; z: number }[]) {
+    const seen = new Set<string>();
+    for (const item of items) {
+      const y = this.surfaceYAt(item.x, item.z);
+      if (y === null) continue;
+      seen.add(item.id);
+      let mesh = this.instructionMarkers.get(item.id);
+      if (!mesh) {
+        mesh = new THREE.Mesh(this.ghostGeometry, this.ghostQueuedMaterial);
+        this.scene.add(mesh);
+        this.instructionMarkers.set(item.id, mesh);
+      }
+      mesh.material = item.active ? this.ghostActiveMaterial : this.ghostQueuedMaterial;
+      mesh.position.set(item.x + 0.5, y + 0.5, item.z + 0.5);
+    }
+    for (const [id, mesh] of this.instructionMarkers) {
+      if (seen.has(id)) continue;
+      this.scene.remove(mesh);
+      this.instructionMarkers.delete(id);
+    }
+  }
+
+  /** Primeiro bloco desenhável descendo a coluna — mesma varredura que o
+   * addon fazia por coluna, agora em cima do cache de voxels já recebido. */
+  private surfaceYAt(x: number, z: number): number | null {
+    for (let y = 319; y >= -64; y--) {
+      const entry = this.entryAt(x, y, z);
+      if (entry && (entry.flags & VOXEL_FLAG_RENDER) !== 0) return y;
+    }
+    return null;
+  }
+
   private handleKeyDown = (event: KeyboardEvent) => {
     // Nunca roubar teclas de quem está digitando num campo de texto (não
     // existe campo no viewer hoje, mas o app tem modal/prompt planejados).
@@ -1116,6 +1543,11 @@ export class Viewer3D {
     }
     // Ctrl/Cmd+F etc. continuam sendo atalhos da janela, não da câmera.
     if (event.ctrlKey || event.metaKey || !this.isViewerVisible()) return;
+
+    if (event.code === "Escape") {
+      this.setTarget(null);
+      return;
+    }
 
     this.turboKey = event.shiftKey;
     this.preciseKey = event.altKey;
@@ -1221,15 +1653,414 @@ export class Viewer3D {
     }
   }
 
+  // ---- Editor de schematic (ver `docs/SPEC.md`, "Como isso vira o editor
+  // estilo WorldEdit") ----------------------------------------------------
+
+  private editKey(x: number, y: number, z: number): string {
+    return `${x},${y},${z}`;
+  }
+
+  /** Ferramenta ativa — `null` deixa o clique só orbitando (viewer puro). */
+  setEditMode(mode: EditMode | null) {
+    this.editMode = mode;
+    if (!mode) {
+      this.hovered = null;
+      this.hoverHelper.visible = false;
+    }
+    this.onEditChange?.();
+  }
+
+  getEditMode(): EditMode | null {
+    return this.editMode;
+  }
+
+  setPlaceBlock(block: string | null) {
+    this.placeBlock = block;
+    this.onEditChange?.();
+  }
+
+  getPlaceBlock(): string | null {
+    return this.placeBlock;
+  }
+
+  /** Blocos que a paleta oferece: derivados dos nomes de textura do atlas
+   * (`_top`/`_side`/`_bottom`/frames viram o nome base). Aproximação honesta
+   * enquanto não existe o registro de blocos do `minecraft-data`: a paleta
+   * lista o que temos textura real pra desenhar. */
+  getEditableBlocks(): string[] {
+    const atlas = this.atlasUvByName;
+    if (!atlas) return [];
+    const blocks = new Set<string>();
+    for (const name of Object.keys(atlas)) {
+      if (/_f\d+$/.test(name)) continue;
+      if (/^destroy_stage|^debug/.test(name)) continue; // não são blocos colocáveis
+      // Tira sufixos em cadeia: `grass_block_side_overlay` -> `grass_block`.
+      let base = name;
+      for (;;) {
+        const next = base.replace(/_(top|side|bottom|overlay|still|flow)$/, "");
+        if (next === base) break;
+        base = next;
+      }
+      blocks.add(base);
+    }
+    // Fluidos ficam fora da paleta: o editor quebra/coloca bloco sólido, e
+    // fluido tem nível/regras próprias (ver "Known gaps").
+    for (const skip of ["air", "water", "lava", "fire", "soul_fire"]) blocks.delete(skip);
+    return Array.from(blocks).sort();
+  }
+
+  /** Ícone 32×32 (data URL) do tile de topo do bloco — a paleta é visual, com
+   * a textura real, não uma lista de texto (como o spec pede). */
+  blockIconDataUrl(block: string): string | null {
+    const cached = this.iconCache.get(block);
+    if (cached) return cached;
+    const face = this.faceRect(block, "top");
+    // `known: false` = caiu no tile sintético (textura faltando no atlas) — a
+    // paleta mostra o nome sem ícone em vez de fingir uma textura.
+    if (!face || !face.known || !this.atlasImage) return null;
+    const rect = face.rect;
+    const canvas = document.createElement("canvas");
+    canvas.width = 32;
+    canvas.height = 32;
+    const ctx = canvas.getContext("2d")!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      this.atlasImage,
+      rect.u0 * this.atlasImage.width,
+      rect.v0 * this.atlasImage.height,
+      (rect.u1 - rect.u0) * this.atlasImage.width,
+      (rect.v1 - rect.v0) * this.atlasImage.height,
+      0,
+      0,
+      32,
+      32
+    );
+    const url = canvas.toDataURL();
+    this.iconCache.set(block, url);
+    return url;
+  }
+
+  getEditStats(): { total: number; breaks: number; builds: number } {
+    let breaks = 0;
+    for (const edit of this.edits.values()) {
+      if (edit.block === null) breaks++;
+    }
+    return { total: this.edits.size, breaks, builds: this.edits.size - breaks };
+  }
+
+  getEdits(): BlockEdit[] {
+    return Array.from(this.edits.values());
+  }
+
+  clearEdits() {
+    if (this.edits.size === 0) return;
+    this.edits.clear();
+    this.rebuildGhosts();
+    this.onEditChange?.();
+  }
+
+  clearSelection() {
+    if (!this.selectionA && !this.selectionB) return;
+    this.selectionA = null;
+    this.selectionB = null;
+    this.refreshSelectionHelper();
+    this.onEditChange?.();
+  }
+
+  /** Região selecionada normalizada (min/max) — `null` se ainda não fechou. */
+  getSelection(): { min: BlockPos; max: BlockPos } | null {
+    if (!this.selectionA || !this.selectionB) return null;
+    const a = this.selectionA;
+    const b = this.selectionB;
+    return {
+      min: { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), z: Math.min(a.z, b.z) },
+      max: { x: Math.max(a.x, b.x), y: Math.max(a.y, b.y), z: Math.max(a.z, b.z) },
+    };
+  }
+
+  /** Move o canvas (e o contexto WebGL) pra outro host — o editor usa o mesmo
+   * renderer do viewer, como o spec descreve ("mesmo motor de render"), sem
+   * abrir um segundo contexto WebGL. O `container` acompanha: é dele que saem
+   * as dimensões de `resize()` e o teste de "view visível" do teclado. */
+  mountTo(host: HTMLElement) {
+    if (this.renderer.domElement.parentElement === host) return;
+    host.appendChild(this.renderer.domElement);
+    this.container = host;
+    this.resize();
+  }
+
+  private handlePointerMove = (event: PointerEvent) => {
+    if (!this.editMode) return;
+    this.hovered = this.pickBlock(event.clientX, event.clientY);
+    this.refreshHoverHelper();
+  };
+
+  private refreshHoverHelper() {
+    const hit = this.hovered;
+    if (!hit || !this.editMode) {
+      this.hoverHelper.visible = false;
+      return;
+    }
+    // Em "colocar" o cursor mostra onde o bloco vai encostar (face clicada);
+    // nas outras ferramentas, o próprio bloco atingido.
+    const target =
+      this.editMode === "place"
+        ? {
+            x: hit.pos.x + hit.normal[0],
+            y: hit.pos.y + hit.normal[1],
+            z: hit.pos.z + hit.normal[2],
+          }
+        : hit.pos;
+    this.hoverHelper.position.set(target.x + 0.5, target.y + 0.5, target.z + 0.5);
+    this.hoverHelper.visible = true;
+  }
+
+  /** Bloco sob o cursor via DDA em voxels (Amanatides & Woo) sobre os chunks
+   * decodificados — as malhas são fundidas por chunk, então não dá pra mapear
+   * um `Raycaster` de volta pra um bloco. `null` = nada desenhável no caminho
+   * (ou chunk desconhecido, onde não dá pra saber o que tem). */
+  pickBlock(clientX: number, clientY: number): PickedBlock | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((clientY - rect.top) / rect.height) * 2 + 1;
+    const origin = this.camera.position;
+    const direction = new THREE.Vector3(ndcX, ndcY, 0.5).unproject(this.camera).sub(origin);
+    if (direction.lengthSq() === 0) return null;
+    direction.normalize();
+
+    let x = Math.floor(origin.x);
+    let y = Math.floor(origin.y);
+    let z = Math.floor(origin.z);
+    const stepX = Math.sign(direction.x);
+    const stepY = Math.sign(direction.y);
+    const stepZ = Math.sign(direction.z);
+    const deltaX = stepX !== 0 ? Math.abs(1 / direction.x) : Infinity;
+    const deltaY = stepY !== 0 ? Math.abs(1 / direction.y) : Infinity;
+    const deltaZ = stepZ !== 0 ? Math.abs(1 / direction.z) : Infinity;
+    let maxX = stepX > 0 ? (x + 1 - origin.x) * deltaX : stepX < 0 ? (origin.x - x) * deltaX : Infinity;
+    let maxY = stepY > 0 ? (y + 1 - origin.y) * deltaY : stepY < 0 ? (origin.y - y) * deltaY : Infinity;
+    let maxZ = stepZ > 0 ? (z + 1 - origin.z) * deltaZ : stepZ < 0 ? (origin.z - z) * deltaZ : Infinity;
+
+    let normal: [number, number, number] = [0, 0, 0];
+    // 512 passos cobre o alcance prático da câmera (mesmo com o zoom livre);
+    // depois disso o raio já se perdeu no vazio.
+    for (let step = 0; step < 512; step++) {
+      const entry = this.entryAt(x, y, z);
+      if (entry === null) return null; // chunk desconhecido
+      if ((entry.flags & VOXEL_FLAG_RENDER) !== 0) {
+        return { pos: { x, y, z }, normal };
+      }
+      if (maxX < maxY && maxX < maxZ) {
+        x += stepX;
+        maxX += deltaX;
+        normal = [-stepX, 0, 0];
+      } else if (maxY < maxZ) {
+        y += stepY;
+        maxY += deltaY;
+        normal = [0, -stepY, 0];
+      } else {
+        z += stepZ;
+        maxZ += deltaZ;
+        normal = [0, 0, -stepZ];
+      }
+    }
+    return null;
+  }
+
+  private applyToolAt(hit: PickedBlock) {
+    if (!this.editMode) return;
+
+    if (this.editMode === "select") {
+      // Dois cliques, como o WorldEdit: o primeiro marca o canto A, o segundo
+      // fecha a região (um terceiro começa outra).
+      if (!this.selectionA || this.selectionB) {
+        this.selectionA = hit.pos;
+        this.selectionB = null;
+      } else {
+        this.selectionB = hit.pos;
+      }
+      this.refreshSelectionHelper();
+      this.onEditChange?.();
+      return;
+    }
+
+    const breaking = this.editMode === "break";
+    const block = breaking ? null : this.placeBlock;
+    if (!breaking && !block) {
+      this.onNotice?.("Escolha um bloco na paleta antes de colocar.");
+      return;
+    }
+
+    const region = this.getSelection();
+    if (region) {
+      this.applyToRegion(region, block);
+    } else {
+      if (breaking) {
+        // Água/lava não se "quebra" (nem no jogo) — o editor trabalha com
+        // bloco sólido, ver "Known gaps".
+        const entry = this.entryAt(hit.pos.x, hit.pos.y, hit.pos.z);
+        if (!entry || (entry.flags & VOXEL_FLAG_FLUID) !== 0) return;
+      }
+      const pos = breaking
+        ? hit.pos
+        : {
+            x: hit.pos.x + hit.normal[0],
+            y: hit.pos.y + hit.normal[1],
+            z: hit.pos.z + hit.normal[2],
+          };
+      this.setEdit(pos.x, pos.y, pos.z, block);
+    }
+    this.rebuildGhosts();
+    this.onEditChange?.();
+  }
+
+  /** Pinta a região inteira com uma edição — o `//set` do WorldEdit: quebrar
+   * tudo que existe ou colocar/substituir pelo bloco escolhido. Volume grande
+   * demais é recusado com aviso em vez de travar a UI. */
+  private applyToRegion(region: { min: BlockPos; max: BlockPos }, block: string | null) {
+    const volume =
+      (region.max.x - region.min.x + 1) *
+      (region.max.y - region.min.y + 1) *
+      (region.max.z - region.min.z + 1);
+    if (volume > MAX_EDIT_VOLUME) {
+      this.onNotice?.(`Seleção grande demais (${volume} blocos; o teto é ${MAX_EDIT_VOLUME}).`);
+      return;
+    }
+    for (let y = region.min.y; y <= region.max.y; y++) {
+      for (let z = region.min.z; z <= region.max.z; z++) {
+        for (let x = region.min.x; x <= region.max.x; x++) {
+          if (block === null) {
+            // Quebrar só o que existe e é sólido; ar e fluido ficam de fora (o
+            // editor trabalha com bloco sólido — ver "Known gaps").
+            const entry = this.entryAt(x, y, z);
+            if (entry === null) continue;
+            if ((entry.flags & VOXEL_FLAG_RENDER) === 0) continue;
+            if ((entry.flags & VOXEL_FLAG_FLUID) !== 0) continue;
+          }
+          this.setEdit(x, y, z, block);
+        }
+      }
+    }
+  }
+
+  private setEdit(x: number, y: number, z: number, block: string | null) {
+    if (this.entryAt(x, y, z) === null) return; // chunk desconhecido: não pinta
+    this.edits.set(this.editKey(x, y, z), { x, y, z, block });
+  }
+
+  /** Reconstrói a camada ghost (âmbar translúcido), separada do mundo real —
+   * é o que dá pra distinguir "o que existe" de "o que foi desenhado" sem
+   * construir nada. Cada (bloco, quebrar|colocar) vira um `InstancedMesh`. */
+  private rebuildGhosts() {
+    for (const mesh of this.ghostMeshes.values()) {
+      this.ghostGroup.remove(mesh);
+      mesh.geometry.dispose(); // geometria própria (UVs do tile), não a compartilhada
+      (mesh.material as THREE.Material).dispose();
+    }
+    this.ghostMeshes.clear();
+    if (!this.atlasTexture) return;
+
+    const groups = new Map<string, { block: string; breaking: boolean; positions: BlockPos[] }>();
+    for (const edit of this.edits.values()) {
+      const breaking = edit.block === null;
+      const block = breaking ? (this.entryAt(edit.x, edit.y, edit.z)?.block ?? null) : edit.block;
+      if (!block) continue;
+      const key = `${breaking ? "break" : "build"}|${block}`;
+      let group = groups.get(key);
+      if (!group) {
+        group = { block, breaking, positions: [] };
+        groups.set(key, group);
+      }
+      group.positions.push({ x: edit.x, y: edit.y, z: edit.z });
+    }
+
+    for (const [key, group] of groups) {
+      const geometry = this.buildGhostGeometry(group.block);
+      if (!geometry) continue;
+      const mesh = new THREE.InstancedMesh(geometry, this.ghostMaterial(group.breaking), group.positions.length);
+      mesh.count = group.positions.length;
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 2;
+      group.positions.forEach((pos, index) => {
+        this.scratchMatrix.makeTranslation(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);
+        mesh.setMatrixAt(index, this.scratchMatrix);
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      this.ghostGroup.add(mesh);
+      this.ghostMeshes.set(key, mesh);
+    }
+  }
+
+  /** Cubo com UVs apontando pro tile do bloco no atlas (topo em todas as
+   * faces — o ghost é aproximação, não o modelo real). */
+  private buildGhostGeometry(block: string): THREE.BufferGeometry | null {
+    const face = this.faceRect(block, "top");
+    if (!face) return null;
+    const rect = face.rect;
+    const geometry = new THREE.BoxGeometry(1, 1, 1);
+    const uv = geometry.getAttribute("uv") as THREE.BufferAttribute;
+    for (let i = 0; i < uv.count; i++) {
+      const u = uv.getX(i);
+      const v = 1 - uv.getY(i); // atlas usa v=0 no topo (flipY=false)
+      uv.setXY(i, rect.u0 + u * (rect.u1 - rect.u0), rect.v0 + v * (rect.v1 - rect.v0));
+    }
+    uv.needsUpdate = true;
+    return geometry;
+  }
+
+  private ghostMaterial(breaking: boolean): THREE.MeshStandardMaterial {
+    return new THREE.MeshStandardMaterial({
+      map: this.atlasTexture,
+      color: COLOR_AMBER,
+      transparent: true,
+      // Quebrar é a marca mais fraca (o bloco ainda existe, só vai sair);
+      // colocar é o que vai aparecer de verdade.
+      opacity: breaking ? 0.32 : 0.55,
+      depthWrite: false,
+      roughness: 0.9,
+      metalness: 0,
+      emissive: COLOR_AMBER,
+      emissiveIntensity: breaking ? 0.25 : 0.1,
+    });
+  }
+
+  private refreshSelectionHelper() {
+    const region = this.getSelection();
+    if (!region) {
+      this.selectionHelper.visible = false;
+      return;
+    }
+    const sizeX = region.max.x - region.min.x + 1;
+    const sizeY = region.max.y - region.min.y + 1;
+    const sizeZ = region.max.z - region.min.z + 1;
+    this.selectionHelper.scale.set(sizeX, sizeY, sizeZ);
+    this.selectionHelper.position.set(
+      region.min.x + sizeX / 2,
+      region.min.y + sizeY / 2,
+      region.min.z + sizeZ / 2
+    );
+    this.selectionHelper.visible = true;
+  }
+
   /** Sem chunks nem bot ainda — estado honesto, não mostra uma cena vazia
    * como se fosse "carregada". Chamado quando o addon desconecta. */
   clear() {
     for (const key of Array.from(this.chunkMeshes.keys())) this.disposeChunkMeshes(key);
     this.chunks.clear();
+    this.meshQueue = [];
+    this.queuedChunks.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
+    this.clearEdits();
+    this.clearSelection();
     this.targetBotPos = null;
     this.playerModel.resetWalk();
+    this.setTarget(null);
+    for (const [id, mesh] of this.instructionMarkers) {
+      this.scene.remove(mesh);
+      this.instructionMarkers.delete(id);
+    }
     // Uma nova conexão tenta o atlas de novo (ex: a versão do jogo foi
     // instalada nesse meio tempo) — a falha anterior não é definitiva.
     this.atlasUnavailable = false;
@@ -1272,9 +2103,27 @@ export class Viewer3D {
     this.updateSky();
     this.updateFog();
     this.updateAnimation(now);
+    this.drainMeshQueue();
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
+    this.updateTargetPosition();
   };
+
+  /** Mantém o popup do alvo grudado no bloco clicado (mesma projeção do
+   * rótulo do bot); some quando o ponto fica atrás da câmera. */
+  private updateTargetPosition() {
+    if (!this.targetBlock) return;
+    const vector = this.targetMarker.position.clone().project(this.camera);
+    if (vector.z > 1) {
+      this.targetEl.style.display = "none";
+      return;
+    }
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    this.targetEl.style.display = "flex";
+    this.targetEl.style.left = `${(vector.x * 0.5 + 0.5) * width}px`;
+    this.targetEl.style.top = `${(-vector.y * 0.5 + 0.5) * height}px`;
+  }
 
   private updateLabelPosition() {
     if (!this.botMarker.visible) return;

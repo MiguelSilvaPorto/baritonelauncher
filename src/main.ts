@@ -1,6 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, CHUNKS_PER_REFRESH, type BotPos, type BotPose, type ChunkPos, type UvRect } from "./viewer3d";
+import {
+  Viewer3D,
+  CHUNKS_PER_REFRESH,
+  NEARBY_CHUNK_LIMIT,
+  type BotPos,
+  type BotPose,
+  type ChunkPos,
+  type UvRect,
+  type EditMode,
+} from "./viewer3d";
+
 interface TextureAtlas {
   image_data_url: string;
   textures: Record<string, UvRect>;
@@ -41,6 +51,13 @@ interface InstructionTarget {
   z: number;
 }
 
+/** Padrão de varredura da exploração com raio — espelha `ExploreStyle`. */
+type ExploreStyle = "Circles" | "Zigzag";
+interface ExploreParams {
+  radius: number;
+  style: ExploreStyle;
+}
+
 interface Instruction {
   id: string;
   kind: InstructionKind;
@@ -48,6 +65,7 @@ interface Instruction {
   status: InstructionStatus;
   progress: number;
   target: InstructionTarget | null;
+  explore: ExploreParams | null;
 }
 
 interface ItemTotal {
@@ -81,9 +99,16 @@ const $$ = <T extends Element = Element>(sel: string) => Array.from(document.que
 function setMode(mode: string) {
   $$(".view").forEach((el) => el.classList.toggle("active", el.id === `view-${mode}`));
   $$(".rail-btn").forEach((el) => el.classList.toggle("active", (el as HTMLElement).dataset.mode === mode));
-  // A view-viewer fica display:none nos outros modos — o WebGLRenderer não
-  // vê isso, então o tamanho do canvas fica desatualizado até isso rodar.
-  if (mode === "viewer") viewer3d?.resize();
+  // O mesmo renderer WebGL serve viewer e editor (spec: "mesmo motor de
+  // render") — o canvas é movido pra view ativa em vez de abrir um segundo
+  // contexto WebGL. A view trocada fica display:none, então o tamanho só pode
+  // ser corrigido depois da troca.
+  if (mode === "editor") {
+    viewer3d?.mountTo($<HTMLElement>("#editor-canvas"));
+  } else if (mode === "viewer") {
+    viewer3d?.mountTo($<HTMLElement>("#viewer-3d"));
+  }
+  if (mode === "editor" || mode === "viewer") viewer3d?.resize();
 }
 
 function bootstrapRail() {
@@ -116,9 +141,12 @@ const STATUS_LABEL: Record<InstructionStatus, string> = {
 function queueCard(instruction: Instruction): string {
   const statusClass = `status-${instruction.status.toLowerCase()}`;
   const cancellable = instruction.status === "Queued" || instruction.status === "Active";
-  // `Explore` é contínuo e não tem progresso mensurável (o addon não manda
-  // `progress`) — barra só onde existe progresso real, nada de fingir 0%.
-  const showBar = !(instruction.kind === "Explore" && instruction.status === "Active");
+  // Barra só onde existe progresso real: `Explore` sem raio/estilo é contínuo
+  // (o addon não manda `progress`) e cancelado/falhou não têm o que medir.
+  const showBar =
+    instruction.status !== "Canceled" &&
+    instruction.status !== "Failed" &&
+    !(instruction.kind === "Explore" && instruction.status === "Active" && !instruction.explore);
   return `
     <div class="queue-card ${statusClass}">
       <div class="row1">
@@ -137,7 +165,7 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
     list.innerHTML = `
       <div class="empty-state">
         <span class="headline">Fila vazia</span>
-        <span class="detail">Enfileire uma instrução acima: "Ir para" manda o bot viajar até as coordenadas x/z e "Explorar" cobre a área a partir de onde ele está — o addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
+        <span class="detail">Clique num bloco do terreno pra mirar um destino ("Ir para" ou "Explorar daqui"), ou digite as coordenadas x/z acima. O addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
       </div>
     `;
   } else {
@@ -146,19 +174,73 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
   if (countId) $(`#${countId}`).textContent = String(items.length);
 }
 
+/** Cancelado fica um tempinho visível (pra você ver que o cancelamento valeu)
+ *  e depois some sozinho da fila — senão os cards cancelados se acumulam pra
+ *  sempre. O backend mantém o histórico; isso é só apresentação. */
+const CANCELED_LINGER_MS = 4000;
+const canceledSeenAt = new Map<string, number>();
+
+function visibleQueue(items: Instruction[]): Instruction[] {
+  const now = performance.now();
+  const visible: Instruction[] = [];
+  for (const item of items) {
+    if (item.status !== "Canceled") {
+      visible.push(item);
+      continue;
+    }
+    const seenAt = canceledSeenAt.get(item.id) ?? now;
+    canceledSeenAt.set(item.id, seenAt);
+    if (now - seenAt < CANCELED_LINGER_MS) visible.push(item);
+  }
+  return visible;
+}
+
 function renderQueue(items: Instruction[]) {
-  renderQueueInto("queue-list", "queue-count", items);
-  renderQueueInto("queue-list-full", "queue-count-full", items);
+  const visible = visibleQueue(items);
+  renderQueueInto("queue-list", "queue-count", visible);
+  renderQueueInto("queue-list-full", "queue-count-full", visible);
+}
+
+/** Raio + estilo do "Explorar" a partir dos controles do painel/popup.
+ *  `null` = exploração nativa do Baritone (sem raio, sem progresso); "auto" no
+ *  select é essa opção, e sem raio digitado o padrão é 256 blocos. */
+function readExploreParams(scope: HTMLElement): ExploreParams | null {
+  const styleValue = scope.querySelector<HTMLSelectElement>('select[name="style"]')?.value ?? "auto";
+  if (styleValue === "auto") return null;
+  const rawRadius = Number(scope.querySelector<HTMLInputElement>('input[name="radius"]')?.value);
+  const radius = Number.isFinite(rawRadius) && rawRadius > 0 ? Math.round(rawRadius) : 256;
+  return {
+    radius: Math.min(Math.max(radius, 16), 5000),
+    style: styleValue === "Zigzag" ? "Zigzag" : "Circles",
+  };
+}
+
+/** Enfileira e re-renderiza a fila na hora — o comando devolve o estado
+ *  atualizado, então a UI não espera o polling de 1s. */
+function pushQueueInstruction(kind: InstructionKind, target: InstructionTarget | null, explore: ExploreParams | null = null) {
+  return invoke<Instruction[]>("queue_push", { kind, target, explore })
+    .then((queue) => {
+      renderQueue(queue);
+      return queue;
+    })
+    .catch((err) => {
+      console.error("[fila] enfileirar falhou:", err);
+      return null;
+    });
 }
 
 /** Mesma instrução "Ir para"/"Explorar" nos dois painéis de fila (viewer e
- *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar". */
+ *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar".
+ *  Digitar continua sendo o caminho secundário: o principal é clicar no
+ *  terreno (ver `bootstrapTargetPopup`). */
 function bootstrapQueueComposers() {
   $$<HTMLElement>(".queue-composer").forEach((composer) => {
     const xInput = composer.querySelector<HTMLInputElement>('input[name="x"]');
     const zInput = composer.querySelector<HTMLInputElement>('input[name="z"]');
+    const travelBtn = composer.querySelector<HTMLButtonElement>('[data-queue-action="travel"]');
+    const exploreBtn = composer.querySelector<HTMLButtonElement>('[data-queue-action="explore"]');
 
-    composer.querySelector('[data-queue-action="travel"]')?.addEventListener("click", () => {
+    const travel = () => {
       // Campo vazio não é zero: `Number("")` é 0 e passaria pelo
       // `Number.isFinite`, enfileirando "ir para (0, 0)" sem o usuário pedir.
       const xRaw = xInput?.value.trim() ?? "";
@@ -173,16 +255,51 @@ function bootstrapQueueComposers() {
         zInput?.focus();
         return;
       }
-      invoke<Instruction[]>("queue_push", { kind: "TravelTo", target: { x: Math.round(x), z: Math.round(z) } })
-        .then(renderQueue)
-        .catch((err) => console.error("[fila] ir para falhou:", err));
-    });
+      pushQueueInstruction("TravelTo", { x: Math.round(x), z: Math.round(z) });
+    };
 
-    composer.querySelector('[data-queue-action="explore"]')?.addEventListener("click", () => {
-      const target = lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null;
-      invoke<Instruction[]>("queue_push", { kind: "Explore", target })
-        .then(renderQueue)
-        .catch((err) => console.error("[fila] explorar falhou:", err));
+    travelBtn?.addEventListener("click", travel);
+    // Enter no campo confirma o "Ir para" — digitar coordenada não deveria
+    // exigir tirar a mão do teclado.
+    for (const input of [xInput, zInput]) {
+      input?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          travel();
+        }
+      });
+    }
+
+    exploreBtn?.addEventListener("click", () => {
+      pushQueueInstruction(
+        "Explore",
+        lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null,
+        readExploreParams(composer)
+      );
+    });
+  });
+}
+
+/** Ações do alvo escolhido clicando no terreno (ver `viewer3d.setTarget`):
+ *  "Ir para", "Explorar daqui" (com raio/estilo do próprio popup) e
+ *  "dispensar". Só existe um popup, então o listener é único. */
+function bootstrapTargetPopup() {
+  const popup = $<HTMLElement>("#target-popup");
+  popup.addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-target-action]");
+    const target = viewer3d?.getTarget();
+    if (!btn || !viewer3d || !target) return;
+
+    const action = btn.dataset.targetAction;
+    if (action === "dismiss") {
+      viewer3d.setTarget(null);
+      return;
+    }
+    const kind: InstructionKind = action === "travel" ? "TravelTo" : "Explore";
+    const explore = kind === "Explore" ? readExploreParams(popup) : null;
+    pushQueueInstruction(kind, { x: target.x, z: target.z }, explore).then((queue) => {
+      // Alvo virou instrução real: o marcador âmbar sai de cena.
+      if (queue) viewer3d?.setTarget(null);
     });
   });
 }
@@ -285,6 +402,197 @@ function renderViewer(status: ConnectionStatus, world: WorldSummary) {
   }
 }
 
+/* ---------- Editor de schematic ---------- */
+
+interface SchematicApplyResult {
+  breaks: number;
+  builds: number;
+  instruction_ids: string[];
+}
+
+/** Categorias são conveniência de UI (agrupamento por nome), não dado do
+ * jogo — o registro de blocos do `minecraft-data` ainda não existe. A ordem
+ * importa: o primeiro padrão que casar define a categoria. */
+const PALETTE_CATEGORIES: { id: string; label: string; match: RegExp | null }[] = [
+  { id: "all", label: "Todas", match: null },
+  { id: "terrain", label: "Terreno", match: /(dirt|grass|sand|gravel|clay|mud|snow|podzol|mycelium|moss|farmland|path)/ },
+  { id: "stone", label: "Pedra", match: /(stone|cobble|deepslate|andesite|diorite|granite|tuff|basalt|obsidian|brick|terracotta|calcite|dripstone|quartz|prismarine|blackstone)/ },
+  { id: "wood", label: "Madeira", match: /(planks|log|wood|stem|hyphae|bamboo)/ },
+  { id: "plants", label: "Plantas", match: /(leaves|sapling|flower|grass|fern|vine|cactus|mushroom|wheat|kelp|seagrass|lily|berry|azalea|torchflower|pitcher)/ },
+  { id: "glass", label: "Vidro", match: /(glass|pane)/ },
+  { id: "wool", label: "Lã", match: /(wool|carpet)/ },
+  { id: "metal", label: "Metal", match: /(iron|gold|copper|netherite|anvil|chain|rail|lantern)/ },
+  { id: "other", label: "Outros", match: null },
+];
+
+/** Teto de itens desenhados por vez — a busca filtra o resto (o atlas tem
+ * centenas de texturas). */
+const PALETTE_LIMIT = 120;
+
+let paletteCategory = "all";
+let paletteQuery = "";
+
+function paletteCategoryOf(block: string): string {
+  for (const category of PALETTE_CATEGORIES) {
+    if (category.id !== "all" && category.match?.test(block)) return category.id;
+  }
+  return "other";
+}
+
+function setEditorStatus(message: string) {
+  $("#editor-status").textContent = message;
+}
+
+function renderPalette() {
+  const grid = $("#palette-grid");
+  const categoriesEl = $("#palette-categories");
+  const countEl = $("#palette-count");
+  const blocks = viewer3d?.getEditableBlocks() ?? [];
+
+  if (blocks.length === 0) {
+    countEl.textContent = "0";
+    grid.innerHTML = `
+      <div class="empty-state">
+        <span class="headline">Paleta vazia</span>
+        <span class="detail">
+          A paleta é montada com as texturas reais do atlas, que só existe depois da primeira
+          conexão do addon (é de lá que vem a versão do Minecraft).
+        </span>
+      </div>
+    `;
+    return;
+  }
+
+  // Só categorias com pelo menos um bloco — nada de botão que não filtra nada.
+  const present = new Set(blocks.map(paletteCategoryOf));
+  categoriesEl.innerHTML = PALETTE_CATEGORIES.filter(
+    (category) => category.id === "all" || present.has(category.id)
+  )
+    .map(
+      (category) =>
+        `<button type="button" class="palette-category${category.id === paletteCategory ? " active" : ""}" data-palette-category="${category.id}">${category.label}</button>`
+    )
+    .join("");
+
+  const query = paletteQuery.trim().toLowerCase();
+  const filtered = blocks.filter((block) => {
+    if (paletteCategory !== "all" && paletteCategoryOf(block) !== paletteCategory) return false;
+    return query === "" || block.toLowerCase().includes(query);
+  });
+
+  countEl.textContent = String(filtered.length);
+  const shown = filtered.slice(0, PALETTE_LIMIT);
+  const selected = viewer3d?.getPlaceBlock() ?? null;
+  grid.innerHTML =
+    shown
+      .map((block) => {
+        const icon = viewer3d?.blockIconDataUrl(block);
+        const active = block === selected ? " active" : "";
+        return `
+          <button type="button" class="palette-item${active}" data-palette-block="${block}" title="${block}">
+            ${icon ? `<img src="${icon}" alt="" />` : ""}
+            <span>${block.replace(/_/g, " ")}</span>
+          </button>
+        `;
+      })
+      .join("") +
+    (filtered.length > shown.length
+      ? `<div class="palette-more">+${filtered.length - shown.length} blocos — refine a busca</div>`
+      : "");
+}
+
+function updateEditorStatus() {
+  const stats = viewer3d?.getEditStats() ?? { total: 0, breaks: 0, builds: 0 };
+  const region = viewer3d?.getSelection() ?? null;
+  const place = viewer3d?.getPlaceBlock() ?? null;
+  const parts: string[] = [];
+  if (stats.total === 0) parts.push("nenhuma edição");
+  else parts.push(`${stats.total} edições (${stats.breaks} quebrar / ${stats.builds} colocar)`);
+  if (region) {
+    const size = `${region.max.x - region.min.x + 1}×${region.max.y - region.min.y + 1}×${region.max.z - region.min.z + 1}`;
+    parts.push(`região ${size} em (${region.min.x},${region.min.y},${region.min.z})`);
+  }
+  if (place) parts.push(`bloco: ${place}`);
+  setEditorStatus(parts.join(" · "));
+  $<HTMLButtonElement>("#editor-apply").disabled = stats.total === 0;
+}
+
+async function applyEdits() {
+  if (!viewer3d) return;
+  const edits = viewer3d.getEdits();
+  if (edits.length === 0) return;
+  try {
+    const result = await invoke<SchematicApplyResult>("schematic_apply", { edits });
+    viewer3d.clearEdits();
+    viewer3d.clearSelection();
+    if (result.breaks === 0 && result.builds === 0) {
+      setEditorStatus("As edições já batem com o mundo real — nada pra enfileirar.");
+      return;
+    }
+    setEditorStatus(
+      `Na fila: ${result.breaks} blocos pra quebrar e ${result.builds} pra construir. ` +
+        "O addon ainda não executa build/mina — a instrução espera um executor (ver Known gaps)."
+    );
+  } catch (err) {
+    console.error("[editor] aplicar falhou:", err);
+    setEditorStatus("Falha ao aplicar as edições — veja o console.");
+  }
+}
+
+function bootstrapEditor() {
+  if (!viewer3d) return;
+  viewer3d.onEditChange = updateEditorStatus;
+  viewer3d.onNotice = (message) => setEditorStatus(message);
+  viewer3d.onAtlasReady = renderPalette;
+
+  $$<HTMLButtonElement>("[data-editor-tool]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tool = btn.dataset.editorTool as EditMode;
+      // Clicar de novo na ferramenta ativa desliga (volta a só orbitar).
+      const next = viewer3d?.getEditMode() === tool ? null : tool;
+      viewer3d?.setEditMode(next);
+      $$("[data-editor-tool]").forEach((el) =>
+        el.classList.toggle("active", el === btn && next !== null)
+      );
+      if (next === "place" && !viewer3d?.getPlaceBlock()) {
+        setEditorStatus("Escolha um bloco na paleta pra colocar.");
+      }
+    });
+  });
+
+  $("#editor-apply").addEventListener("click", () => void applyEdits());
+  $("#editor-clear-edits").addEventListener("click", () => viewer3d?.clearEdits());
+  $("#editor-clear-selection").addEventListener("click", () => viewer3d?.clearSelection());
+
+  $("#palette-search").addEventListener("input", (event) => {
+    paletteQuery = (event.target as HTMLInputElement).value;
+    renderPalette();
+  });
+
+  $("#palette-categories").addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-palette-category]");
+    if (!btn) return;
+    paletteCategory = btn.dataset.paletteCategory ?? "all";
+    renderPalette();
+  });
+
+  // Delegação: o grid é innerHTML recriado a cada render.
+  $("#palette-grid").addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-palette-block]");
+    if (!btn) return;
+    viewer3d?.setPlaceBlock(btn.dataset.paletteBlock ?? null);
+    // Escolher bloco já arma a ferramenta de colocar; clicar de novo nela fecha.
+    viewer3d?.setEditMode("place");
+    $$("[data-editor-tool]").forEach((el) =>
+      el.classList.toggle("active", (el as HTMLElement).dataset.editorTool === "place")
+    );
+    renderPalette();
+  });
+
+  renderPalette();
+  updateEditorStatus();
+}
+
 /* ---------- HUD de vitais ---------- */
 
 function armorClass(pct: number): string {
@@ -364,10 +672,9 @@ function requestChunk(pos: ChunkPos) {
 }
 
 async function refreshState() {
-  const [status, world, chunks, queue, totals, vitals, skin] = await Promise.all([
+  const [status, world, queue, totals, vitals, skin] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
-    invoke<ChunkPos[]>("world_chunks"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
@@ -401,17 +708,41 @@ async function refreshState() {
     // modelo sem textura em vez de inventar uma skin.
     viewer3d.setPlayerSkin(skin ? { model: skin.model, imageDataUrl: skin.image_data_url } : null);
 
-    // Voxels são buscados aos poucos: montar malha é CPU na thread
-    // principal, então um backfill de centenas de chunks numa tacada
-    // travaria o viewer. O resto fica na fila implícita do Rust e chega
-    // nos próximos refreshes — vale igual pro mundo vindo do cache em
-    // disco, que também chega inteiro de uma vez em `world_chunks`.
-    let budget = CHUNKS_PER_REFRESH;
-    for (const pos of chunks) {
-      if (budget <= 0) break;
-      if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
-      requestChunk(pos);
-      budget--;
+    // Instruções com alvo viram caixas de arame no mundo (âmbar = na fila,
+    // teal = ativa) — o viewer reflete a fila real, não uma decoração.
+    const ghosts: { id: string; active: boolean; x: number; z: number }[] = [];
+    for (const item of queue) {
+      if (!item.target || (item.status !== "Queued" && item.status !== "Active")) continue;
+      ghosts.push({ id: item.id, active: item.status === "Active", x: item.target.x, z: item.target.z });
+    }
+    viewer3d.setInstructionTargets(ghosts);
+
+    // Prioridade: chunks ao redor do bot primeiro. O backend devolve os N
+    // mais próximos já ordenados (`world_chunks_near`); antes disso o cache
+    // inteiro vinha em ordem arbitrária de `HashMap` e o terreno ao redor do
+    // bot podia chegar por último. Com o jogo fechado (mundo em cache sendo
+    // navegado) a âncora passa a ser o ponto que a câmera orbita.
+    const anchor: ChunkPos = world.bot_pos
+      ? { x: world.bot_pos.x >> 4, z: world.bot_pos.z >> 4 }
+      : viewer3d.getFocusChunk();
+    try {
+      const chunks = await invoke<ChunkPos[]>("world_chunks_near", {
+        x: anchor.x,
+        z: anchor.z,
+        limit: NEARBY_CHUNK_LIMIT,
+      });
+      // Voxels são buscados aos poucos; a montagem em si já é orçada por
+      // frame no viewer (`drainMeshQueue`), então pedir vários por refresh
+      // não trava — só acelera o preenchimento ao redor do bot.
+      let budget = CHUNKS_PER_REFRESH;
+      for (const pos of chunks) {
+        if (budget <= 0) break;
+        if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
+        requestChunk(pos);
+        budget--;
+      }
+    } catch (err) {
+      console.warn("[chunks] prioridade por distância indisponível:", err);
     }
   }
   renderHud(vitals);
@@ -441,9 +772,15 @@ window.addEventListener("DOMContentLoaded", () => {
   bootstrapTitlebar();
   bootstrapQueueComposers();
   bootstrapQueueActions();
+  bootstrapTargetPopup();
 
-  viewer3d = new Viewer3D($<HTMLElement>("#viewer-3d"), $<HTMLDivElement>("#bot-label"));
+  viewer3d = new Viewer3D(
+    $<HTMLElement>("#viewer-3d"),
+    $<HTMLDivElement>("#bot-label"),
+    $<HTMLDivElement>("#target-popup")
+  );
   window.addEventListener("resize", () => viewer3d?.resize());
+  bootstrapEditor();
 
   refreshState();
   setInterval(refreshState, REFRESH_INTERVAL_MS);

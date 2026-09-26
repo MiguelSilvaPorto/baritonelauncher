@@ -134,6 +134,50 @@ impl WorldCache {
             None => Vec::new(),
         }
     }
+
+    /// Nome do bloco numa posição de mundo. `None` = chunk desconhecido
+    /// (diferente de ar); seção ausente num chunk carregado = ar, como no
+    /// jogo. É o que o diff do editor de schematic (`schematic.rs`) usa pra
+    /// saber o que existe de verdade antes de gerar a instrução.
+    pub fn block_at(&self, pos: BlockPos) -> Option<&str> {
+        let chunk = self.chunks.get(&ChunkPos {
+            x: pos.x >> 4,
+            z: pos.z >> 4,
+        })?;
+        // `>>` com sinal: -1 >> 4 = -1 (seção -1), igual à divisão do jogo.
+        let Some(section) = chunk.sections.iter().find(|s| s.y as i32 == pos.y >> 4) else {
+            return Some("air");
+        };
+        let index = (((pos.y & 15) << 8) | ((pos.z & 15) << 4) | (pos.x & 15)) as usize;
+        let entry = section
+            .indices
+            .get(index)
+            .and_then(|slot| section.palette.get(*slot as usize));
+        Some(entry.map(|e| e.block.as_str()).unwrap_or("air"))
+    }
+}
+
+/// Chunks em cache mais próximos de um ponto (coordenadas de chunk),
+/// ordenados por distância em linha reta e limitados a `limit`.
+///
+/// O viewer usa isso pra priorizar o terreno ao redor do bot: `WorldCache`
+/// cresce de forma cumulativa e um `HashMap` não tem ordem, então sem isso a
+/// fila de carregamento saía em ordem arbitrária — chunks distantes podiam
+/// chegar antes do chão onde o bot está.
+pub fn nearest_chunks<'a>(
+    positions: impl Iterator<Item = &'a ChunkPos>,
+    x: i32,
+    z: i32,
+    limit: usize,
+) -> Vec<ChunkPos> {
+    let mut chunks: Vec<ChunkPos> = positions.copied().collect();
+    chunks.sort_by_key(|pos| {
+        let dx = (pos.x - x) as i64;
+        let dz = (pos.z - z) as i64;
+        dx * dx + dz * dz
+    });
+    chunks.truncate(limit);
+    chunks
 }
 
 /// Avança por bytes com checagem de limites — payload vindo do socket nunca
@@ -363,5 +407,36 @@ mod tests {
         assert!((water(7).fluid_height() - 1.0 / 9.0).abs() < f32::EPSILON);
         assert!((water(8).fluid_height() - 8.0 / 9.0).abs() < f32::EPSILON); // caindo
         assert!((water(15).fluid_height() - 8.0 / 9.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn nearest_chunks_sorts_by_distance_and_truncates() {
+        let chunks = [
+            ChunkPos { x: 0, z: 0 },
+            ChunkPos { x: 3, z: 0 },
+            ChunkPos { x: 1, z: 0 },
+            ChunkPos { x: -1, z: 0 },
+            ChunkPos { x: 0, z: 5 },
+        ];
+
+        // Distâncias de (0,0): 0, 1, 1, 9, 25 — empate em 1 mantém a ordem
+        // original (sort estável), então (1,0) vem antes de (-1,0).
+        assert_eq!(
+            nearest_chunks(chunks.iter(), 0, 0, 3),
+            vec![
+                ChunkPos { x: 0, z: 0 },
+                ChunkPos { x: 1, z: 0 },
+                ChunkPos { x: -1, z: 0 },
+            ]
+        );
+
+        // A âncora é o alvo, não a origem.
+        assert_eq!(
+            nearest_chunks(chunks.iter(), 3, 0, 1),
+            vec![ChunkPos { x: 3, z: 0 }]
+        );
+
+        // `limit` maior que o conjunto devolve tudo.
+        assert_eq!(nearest_chunks(chunks.iter(), 0, 0, 99).len(), chunks.len());
     }
 }
