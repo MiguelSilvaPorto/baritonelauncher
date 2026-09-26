@@ -564,7 +564,7 @@ async function applyEdits() {
     }
     setEditorStatus(
       `Na fila: ${result.breaks} blocos pra quebrar e ${result.builds} pra construir. ` +
-        "O addon ainda não executa build/mina — a instrução espera um executor (ver Known gaps)."
+        "No criativo o bot pega os blocos sozinho; no survival ele só constrói o que já tem no inventário."
     );
   } catch (err) {
     console.error("[editor] aplicar falhou:", err);

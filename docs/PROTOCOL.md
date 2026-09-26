@@ -56,8 +56,9 @@ tints, e um jar do addon antigo segue funcionando (o app avisa no console).
   (`ChunkEvent.Load`) mais o backfill de reconexão (2 chunks por tick). `data` é o payload binário
   descrito abaixo (com as cores de bioma do formato 3), comprimido com zlib.
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` — estado da instrução
-  ativa (`active`/`done`/`failed`; `progress` só quando existe, ex: `travel_to`; `explore` é contínuo
-  e não manda progresso).
+  ativa (`active`/`paused`/`done`/`failed`; `progress` só quando existe, ex: `travel_to`; `explore` é
+  contínuo e não manda progresso). `paused` = o `BuilderProcess` parou por falta de material
+  (`Missing materials` no chat) — não é terminal, volta a `active` se o material aparecer.
 
 ## App → addon
 
@@ -73,9 +74,13 @@ tints, e um jar do addon antigo segue funcionando (o app avisa no console).
   esparso e cobre exatamente as posições da lista (`OrchestratorSchematic`). `mine` é o mesmo payload
   com `"block":"air"` em cada posição: o builder quebra o que estiver lá — o mesmo caminho que o
   `clearArea` usa. O nome do bloco é o path do registry sem namespace (`stone`, `oak_planks`); nome
-  desconhecido é ignorado (e se nenhum sobrar, a instrução falha em vez de mentir sucesso). Essas duas
+  desconhecido é ignorado (e se nenhum sobrar, a instrução falha em vez de mentir sucesso). No
+  **criativo** o addon entrega antes no inventário os blocos que faltam (pacote criativo,
+  `handleCreativeModeItemAdd` — o builder do Baritone não busca materiais e o inventário criativo
+  normalmente não tem o bloco escolhido) e só então chama o `build`. Essas duas
   não têm progresso medível — o `BuilderProcess` não expõe contagem — então reportam `active` sem
-  `progress` e fecham em `done` quando o processo para (ou `failed` se ele nunca começar).
+  `progress` e fecham em `done` quando o processo para (ou `failed` se ele nunca começar; e
+  `paused` se o builder parar por falta de material).
 - `{"type":"cancel","id":"i1"}` — cancela a instrução no jogo: `cancelEverything` no pathing e
   `onLostControl` no builder (ele não para só com o cancelamento do pathing).
 

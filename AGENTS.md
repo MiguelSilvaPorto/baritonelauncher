@@ -240,8 +240,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
   + indices per 16×16×16 section, plus per-column biome tints since payload v3, per-section light
   since v4 and each entry's **blockstate props** since v5 — see
-  `ChunkTints`/`PaletteEntry::props`). The map is a bounded working set (`HOT_CHUNK_LIMIT`,
-  least-recently-used eviction) over the disk log — `block_at`/`chunk_voxels_bytes` load a cold chunk
+  `ChunkTints`/`PaletteEntry::props`). Payloads whose light is zero everywhere are repaired as
+  daylight on decode (pre-light-engine captures; see the changelog). The map is a bounded working set
+  (`HOT_CHUNK_LIMIT`, least-recently-used eviction) over the disk log — `block_at`/`chunk_voxels_bytes` load a cold chunk
   on demand, so `WorldCache` methods that need voxels take `&mut self` (`schematic::diff` included).
   Also `CrossingStrategy` for the learned water/lava crossing policy.
 - **`block_models.rs`** — bakes real block geometry from the **local client jar**:
@@ -316,7 +317,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   texture cache/resource pack), the world clock (`world_time`, 1x/s, from
   `getOverworldClockTime()`), and subscribes to `ChunkEvent.Load` (filtered to `ClientLevel`) to
   send one `chunk_voxels` per chunk (sections + per-column biome tints resolved with the client's own
-  `BiomeColors`, sampled at the top block of each column) — separate from the tick loop. It also drains
+  `BiomeColors`, sampled at the top block of each column) — separate from the tick loop. The chunk
+  only leaves the queue after the client's light engine goes idle **and** the section light layers
+  exist (5 s cap, then a daylight fallback): serializing right at the event captured all-zero light
+  and painted the ground black forever. It also drains
   the reverse channel on the client thread (`travel_to`/`explore`/`mine`/`build`): the `mine`/`build`
   ones turn the block list into a sparse `OrchestratorSchematic` and call
   `baritone.getBuilderProcess().build(...)`, reporting `active`/`done`/`failed` from the process itself.
