@@ -81,6 +81,11 @@ const CLOUD_CELL_SIZE = 12;
 const CLOUD_THICKNESS = 4;
 const CLOUD_HEIGHT = 192.33;
 const CLOUD_ALPHA = 0.8;
+/** Folga (blocos) acima do teto da camada em que as nuvens somem de vez: com
+ * a câmera na altura delas, a folha de 80% de opacidade (quase preta à noite)
+ * fica entre a câmera e o terreno e o viewer virava breu — ver
+ * `updateClouds`. Abaixo da camada nada muda: é a nuvem do jogo. */
+const CLOUD_FADE_ABOVE = 8;
 const CLOUD_ALPHA_CUTOFF = 10;
 const CLOUD_DRIFT_PER_SECOND = 0.6;
 const CLOUD_Z_OFFSET = 3.96;
@@ -1347,6 +1352,18 @@ export class Viewer3D {
       CLOUD_HEIGHT,
       nearest(anchorZ, this.camera.position.z)
     );
+
+    // A camada some quando a câmera chega na altura dela: de baixo, as nuvens
+    // são o céu (nada é ocluído); de cima, elas ficariam entre a câmera e o
+    // mundo e, à noite (cor quase preta), escondem o terreno — foi o "breu"
+    // reportado. O fade cobre a travessia da camada (4 blocos) + a folga.
+    const fadeTop = CLOUD_HEIGHT + CLOUD_THICKNESS + CLOUD_FADE_ABOVE;
+    const fade = Math.min(
+      1,
+      Math.max(0, (fadeTop - this.camera.position.y) / (fadeTop - CLOUD_HEIGHT))
+    );
+    group.visible = fade > 0.02;
+    if (this.cloudMaterial) this.cloudMaterial.opacity = CLOUD_ALPHA * fade;
   }
 
   /** Redesenha o gradiente do domo (2×256) e reenvia pra GPU. Só é chamado a
