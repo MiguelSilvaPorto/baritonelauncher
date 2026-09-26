@@ -11,8 +11,8 @@
 //!   `player_skin` (PNG da skin do próprio jogador, quando muda — ver
 //!   `player_skin.rs`), `entities` (snapshot dos mobs vivos ao redor do
 //!   jogador, ~4x/segundo — ver `mobs.rs`) e `chunk_voxels` (o chunk inteiro,
-//!   seção por seção, comprimido — ver abaixo). Baús ainda não trafegam por
-//!   aqui.
+//!   seção por seção, mais os tints de bioma por coluna, comprimido — ver
+//!   abaixo). Baús ainda não trafegam por aqui.
 //! - Canal reverso (app → addon, mesmo socket): `instruction` (`travel_to` ou
 //!   `explore`) e `cancel` (id da instrução). O addon responde com
 //!   `instruction_status` (`active` com `progress`, ou `done`/`failed`), que
@@ -22,26 +22,29 @@
 //! `chunk_voxels` carrega o conteúdo real do chunk — paleta + índices por
 //! seção 16×16×16, com o campo `"data"` em base64 de um payload zlib (layout
 //! em `world_cache.rs`, `decode_voxels`) —, não só a superfície: é o que deixa
-//! o viewer mostrar relevo, cavernas e o que mais estiver embaixo. O cache é
-//! cumulativo (`WorldCache.chunks[pos]`): chunk que sai do render distance do
-//! client **não** é removido daqui, de propósito — `WorldCache` é sobre o que
-//! já foi explorado, não sobre o que está visível agora. Blocos que mudam
-//! depois do load (o bot minerando, por exemplo) ainda não são reenviados —
-//! cada chunk é um snapshot do momento em que carregou.
+//! o viewer mostrar relevo, cavernas e o que mais estiver embaixo. Junto vão os
+//! **tints de bioma por coluna** (grama, folhagem e água, já resolvidos pelo
+//! `BiomeColors` do client), que é o que faz cada bioma ter a cor que tem no
+//! jogo em vez de um verde fixo. O cache é cumulativo (`WorldCache.chunks[pos]`):
+//! chunk que sai do render distance do client **não** é removido daqui, de
+//! propósito — `WorldCache` é sobre o que já foi explorado, não sobre o que
+//! está visível agora. Blocos que mudam depois do load (o bot minerando, por
+//! exemplo) ainda não são reenviados — cada chunk é um snapshot do momento em
+//! que carregou.
 //!
 //! O addon Java correspondente está em
 //! `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
 
 use crate::instructions::InstructionStatus as QueueInstructionStatus;
 use crate::vitals::Vitals;
-use crate::world_cache::{decode_voxels, BlockPos, ChunkPos, ChunkSection};
+use crate::world_cache::{decode_voxels, BlockPos, ChunkPos, DecodedVoxels, VOXEL_FORMAT_VERSION_LEGACY};
 use crate::AppState;
 use base64::Engine;
 use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -53,6 +56,11 @@ const SOCKET_ADDR: &str = "127.0.0.1:31173";
 /// abaixo disso (poucas dezenas de KB); o teto existe só pra um payload
 /// corrompido não virar alocação gigante.
 const MAX_CHUNK_PAYLOAD_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Aviso de payload v2 (addon antigo, sem tints de bioma) uma vez por
+/// processo — o jar desatualizado manda um por chunk e não faz sentido repetir
+/// a mesma linha centenas de vezes.
+static LEGACY_CHUNK_WARNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -82,6 +90,13 @@ enum AddonMessage {
         yaw: f32,
         #[serde(default)]
         pitch: f32,
+    },
+    /// Hora do mundo em ticks (0..=23999) — 0 = nascer do sol, 6000 =
+    /// meio-dia, 12000 = pôr do sol, 18000 = meia-noite. O viewer usa pro
+    /// ciclo de dia/noite; o addon manda 1x/s (mesma cadência dos vitais) e
+    /// o app interpola entre as mensagens.
+    WorldTime {
+        day_time: u32,
     },
     /// Skin do próprio jogador (PNG em base64) — ver `player_skin.rs`. O
     /// addon só manda quando a textura muda.
@@ -278,6 +293,11 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
                 *state.bot_pose.lock().unwrap() = Some(BotPose { x, y, z, yaw, pitch });
             }
+            AddonMessage::WorldTime { day_time } => {
+                // Normaliza por via das dúvidas (um valor fora de 0..24000
+                // viraria um ângulo de sol maluco, não um erro claro).
+                *state.world_time.lock().unwrap() = Some(day_time % 24_000);
+            }
             AddonMessage::PlayerSkin {
                 name,
                 model,
@@ -287,12 +307,12 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 Err(err) => eprintln!("[addon_socket] player_skin inválido: {err}"),
             },
             AddonMessage::ChunkVoxels { x, z, data } => match decode_chunk_payload(&data) {
-                Ok(sections) => {
+                Ok(DecodedVoxels { sections, tints }) => {
                     state
                         .world
                         .lock()
                         .unwrap()
-                        .apply_voxels(ChunkPos { x, z }, sections);
+                        .apply_voxels(ChunkPos { x, z }, sections, tints);
                     // Avisa o gravador periódico (`lib.rs`, `world_store`)
                     // que há coisa nova pra persistir.
                     state.world_revision.fetch_add(1, Ordering::Relaxed);
@@ -363,6 +383,9 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
     // varredura, e o viewer não pode continuar mostrando a última posição
     // deles como se fossem atuais.
     *state.mobs.lock().unwrap() = None;
+    // A hora do mundo também para de ser conhecida sem o jogo; o viewer
+    // congela na última hora real em vez de inventar um ciclo.
+    *state.world_time.lock().unwrap() = None;
     // A skin fica: é um dado real do jogador, e mantê-la evita o modelo
     // piscar de volta pro placeholder a cada reconexão.
 }
@@ -370,7 +393,7 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
 /// base64 → zlib → `decode_voxels`. O payload do addon vai comprimido porque
 /// um chunk inteiro cru passa de 100 KB; zlib derruba isso pra poucos KB no
 /// terreno típico.
-fn decode_chunk_payload(data: &str) -> Result<Vec<ChunkSection>, String> {
+fn decode_chunk_payload(data: &str) -> Result<DecodedVoxels, String> {
     let compressed = base64::engine::general_purpose::STANDARD
         .decode(data)
         .map_err(|err| format!("base64 inválido: {err}"))?;
@@ -382,6 +405,18 @@ fn decode_chunk_payload(data: &str) -> Result<Vec<ChunkSection>, String> {
         .map_err(|err| format!("zlib inválido: {err}"))?;
     if raw.len() as u64 == MAX_CHUNK_PAYLOAD_BYTES {
         return Err("payload descomprimido passou do teto".to_string());
+    }
+
+    // v2 = jar do addon de antes dos tints de bioma: o terreno continua
+    // válido, só não vem cor de bioma nenhuma — avisa uma vez, senão o usuário
+    // fica sem entender por que o mundo está com as cores fixas antigas.
+    if raw.first() == Some(&VOXEL_FORMAT_VERSION_LEGACY)
+        && !LEGACY_CHUNK_WARNED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[addon_socket] chunk_voxels no formato 2 (sem tints de bioma) — o jar do addon \
+             está desatualizado; rebuilde pra ver as cores reais de bioma"
+        );
     }
 
     decode_voxels(&raw)

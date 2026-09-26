@@ -758,7 +758,7 @@ function requestChunk(pos: ChunkPos) {
 }
 
 async function refreshState() {
-  const [status, world, queue, totals, vitals, skin, mobs] = await Promise.all([
+  const [status, world, queue, totals, vitals, skin, mobs, worldTime] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
     invoke<Instruction[]>("queue_snapshot"),
@@ -766,6 +766,7 @@ async function refreshState() {
     invoke<Vitals | null>("vitals_snapshot"),
     invoke<PlayerSkin | null>("player_skin"),
     invoke<MobSnapshot | null>("nearby_mobs"),
+    invoke<number | null>("world_time"),
   ]);
 
   lastBotPos = world.bot_pos ?? null;
@@ -798,6 +799,10 @@ async function refreshState() {
     // Mobs ao redor do bot: o snapshot alimenta o painel (hostis primeiro,
     // distância). Os marcadores no mundo andam em `refreshPose`, na cadência
     // do addon — aqui é só o resumo de 1s.
+
+    // Hora real do mundo pro ciclo de dia/noite. `null` (jogo fechado, logo
+    // após abrir) não zera nada: o viewer congela na última hora real.
+    viewer3d.setWorldTime(worldTime);
 
     // Instruções com alvo viram caixas de arame no mundo (âmbar = na fila,
     // teal = ativa) — o viewer reflete a fila real, não uma decoração.

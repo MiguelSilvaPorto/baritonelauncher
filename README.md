@@ -90,9 +90,11 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   entidade ainda não existe (o atlas atual cobre só texturas de bloco).
 - **Terreno real com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
   (`src/viewer3d.ts`, Three.js/WebGL) renderiza os voxels reais do `chunk_voxels` em coordenadas
-  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`); o que
-  falta é blockstate (escada/eixo de tora/slab) e tint real por bioma — hoje todo bloco é um cubo com
-  tint fixo aproximado. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio
+  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`) e tint de
+  bioma real por coluna (grama/folhagem/água, resolvido pelo `BiomeColors` do client no addon); o que
+  falta é blockstate (escada/eixo de tora/slab) — hoje todo bloco é um cubo cheio, e o bioma é
+  amostrado no topo da coluna (bloco subterrâneo usa o bioma da superfície). (O spec descreve esse
+  renderer como wgpu nativo; aqui é WebGL dentro do próprio
   webview do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela
   separada sem conseguir validar visualmente.)
 - **Ingestão do `minecraft-data`** (itens/blocos/receitas) — os structs Rust (`Item`, `Block`,

@@ -31,16 +31,57 @@ import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
  */
 
 const BLOCK_TEXTURE_PX = 16; // resolução dos tiles do atlas (frames 32×32 são reduzidos lá)
-// Céu: o addon ainda não manda a hora do mundo, então o viewer não cicla
-// dia/noite (ver "Known gaps" no README) — este gradiente é uma aproximação
-// fixa de dia claro. O horizonte é também a cor do fog e do canvas: é nele
-// que o terreno distante se dissolve.
-const SKY_ZENITH = "#2f6ba8";
-const SKY_MID = "#6f9cc9";
-const SKY_HORIZON = "#c2d6e8";
+// Céu e ciclo de dia/noite: o addon manda a hora real do mundo 1x/s
+// (`world_time`, ticks 0..23999 — 0 = nascer do sol, 6000 = meio-dia, 12000 =
+// pôr do sol, 18000 = meia-noite), o viewer interpola a 20 ticks/s (como o
+// jogo) e move sol, lua, luz ambiente e o gradiente do céu. Sem hora
+// conhecida (jogo fechado, app recém-aberto), fica no meio-dia fixo — não
+// inventa um ciclo. O horizonte é também a cor do fog e do canvas: é nele que
+// o terreno distante se dissolve.
+const SKY_DAY = { zenith: 0x2f6ba8, mid: 0x6f9cc9, horizon: 0xc2d6e8 };
+const SKY_NIGHT = { zenith: 0x050a18, mid: 0x0a1226, horizon: 0x141d30 };
+/** Tom quente do horizonte no nascer/pôr do sol (pico quando o sol cruza o
+ * horizonte) — é o laranja que o céu do jogo ganha nesses momentos. */
+const SKY_TWILIGHT = 0xe8955a;
+/** Paletas de luz do ciclo: `LOW` = sol rasante, `HIGH` = meio-dia. */
+const SUN_COLOR_LOW = 0xff9e63;
+const SUN_COLOR_HIGH = 0xfff4e0;
+const MOON_COLOR = 0x9db4e8;
+const AMBIENT_DAY = 0.55; // era a luz fixa antiga
+const AMBIENT_NIGHT = 0.13;
+const MOON_INTENSITY = 0.1;
+// 1 dia do jogo = 24000 ticks = 20 min reais; a hora local anda 20 ticks por
+// segundo entre as mensagens do addon.
+const TICKS_PER_SECOND = 20;
+const TICKS_PER_DAY = 24000;
+const DEFAULT_DAY_TIME = 6000; // meio-dia fixo quando não há hora real
+/** Céu/fog não precisam ser recoloridos a cada frame — o ciclo é lento. */
+const SKY_REPAINT_MS = 500;
+const SUN_DISTANCE = 300;
 /** Raio do domo de céu: dentro do `far` da câmera (5000) e maior que o
  * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
 const SKY_RADIUS = 3000;
+
+// Cores pré-alocadas do ciclo: `updateDayNight` roda por frame e não pode
+// alocar `THREE.Color` a cada chamada.
+const SKY_DAY_ZENITH = new THREE.Color(SKY_DAY.zenith);
+const SKY_DAY_MID = new THREE.Color(SKY_DAY.mid);
+const SKY_DAY_HORIZON = new THREE.Color(SKY_DAY.horizon);
+const SKY_NIGHT_ZENITH = new THREE.Color(SKY_NIGHT.zenith);
+const SKY_NIGHT_MID = new THREE.Color(SKY_NIGHT.mid);
+const SKY_NIGHT_HORIZON = new THREE.Color(SKY_NIGHT.horizon);
+const SKY_TWILIGHT_COLOR = new THREE.Color(SKY_TWILIGHT);
+const SUN_COLOR_LOW_C = new THREE.Color(SUN_COLOR_LOW);
+const SUN_COLOR_HIGH_C = new THREE.Color(SUN_COLOR_HIGH);
+const AMBIENT_DAY_COLOR = new THREE.Color(0xffffff);
+const AMBIENT_NIGHT_COLOR = new THREE.Color(MOON_COLOR);
+
+/** Interpolação suave (Hermite) entre dois limiares — usada pra transformar
+ * a elevação do sol num fator de luz do dia contínuo. */
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
 const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso")
 // token `--amber` do SPEC ("ação planejada"): camada de edição do editor e
 // alvo clicado da fila.
@@ -110,32 +151,48 @@ const MOB_FOLLOW_RATE = 10; // 1/s
 const MOB_TELEPORT_DISTANCE = 16; // blocos
 const MOB_LABEL_GAP = 0.4; // acima da hitbox do mob (que já tem altura própria)
 
-// Aproximação, não tint real por bioma (isso exigiria saber o bioma da
-// coluna e amostrar o colormap/JSON de bioma — não implementado, ver
-// docs/SPEC.md "Blocos 3D"). "grass_block_top" vem cinza no jar por design
-// (RGB médio 147,147,147, R=G=B); sem isso ficaria tudo cinza de novo.
-// Só o topo leva tint: o lado ("grass_block_side") já vem com a franja verde
-// impressa na própria textura, sobre a terra.
+// Cores reais de bioma chegam no payload v3, por coluna (`ChunkTints`): grama,
+// folhagem e água com a mesma cor que o `BiomeColors` do jogo resolve pra
+// renderização (colormap + modificador de bioma já aplicados). Os valores
+// abaixo são só o fallback de payload antigo/sem tint — um tom temperado
+// médio, nunca a cor de um bioma específico. Ver docs/SPEC.md "Blocos 3D".
 const GRASS_TINT = 0x79c05a;
-
-// Mesma ideia do GRASS_TINT, pras outras texturas que vêm cinza no jar e que
-// o jogo colore em runtime: tom de folhagem/água "floresta/plains", não a cor
-// exata do bioma da coluna. Espécies cuja textura já vem colorida no arquivo
-// (cerejeira, azaleia, carvalho-pálido) ficam de fora de propósito — tint
-// nelas só escureceria uma cor que já está certa.
 const FOLIAGE_TINT = 0x59ae30;
 const WATER_TINT = 0x3f76e4;
+
+/** Blocos cuja cor o jogo resolve pelo `BlockColors` (26.3): `grass` e
+ * `foliage` vêm do tint de bioma da coluna; sem tint no payload, caem no
+ * fallback acima. Espécies cuja textura já vem colorida no arquivo (cerejeira,
+ * azaleia, carvalho-pálido) ficam de fora de propósito — tint nelas só
+ * escureceria uma cor que já está certa. O topo do `grass_block` é tingido; o
+ * lado leva tint só na camada de overlay (ver `GRASS_SIDE_OVERLAY`). */
+const BLOCK_TINT_KIND: Record<string, "grass" | "foliage"> = {
+  grass_block: "grass",
+  lily_pad: "grass", // o jogo usa a cor de grama no lírio
+  sugar_cane: "grass",
+  oak_leaves: "foliage",
+  jungle_leaves: "foliage",
+  acacia_leaves: "foliage",
+  dark_oak_leaves: "foliage",
+  mangrove_leaves: "foliage",
+  vine: "foliage",
+};
+
+/** Cores fixas do jogo pra blocos que não dependem de bioma — mesmos valores
+ * de `BlockColors.createDefault()` no 26.3 (em `0xRRGGBB`). */
 const BLOCK_TINTS: Record<string, number> = {
-  oak_leaves: FOLIAGE_TINT,
-  jungle_leaves: FOLIAGE_TINT,
-  acacia_leaves: FOLIAGE_TINT,
-  dark_oak_leaves: FOLIAGE_TINT,
-  mangrove_leaves: FOLIAGE_TINT,
-  vine: FOLIAGE_TINT,
-  lily_pad: GRASS_TINT, // o jogo usa a cor de grama no lírio
-  spruce_leaves: 0x619961, // cor fixa no jogo, não vem do bioma
+  spruce_leaves: 0x619961,
   birch_leaves: 0x80a755,
 };
+
+/** Segunda camada do lado do `grass_block` no modelo vanilla: a base
+ * (`grass_block_side`) é terra com uma franja clara, e por cima vem
+ * `grass_block_side_overlay` — cinza no arquivo, tingida com a cor de grama do
+ * bioma. Sem ela os lados da grama não acompanhavam o bioma (só o topo). O
+ * jogo desenha as duas coincidentes; aqui a de cima sai um fio ao longo da
+ * normal pra não brigar no z-buffer. */
+const GRASS_SIDE_OVERLAY = "grass_block_side_overlay";
+const GRASS_SIDE_OVERLAY_OFFSET = 0.002;
 
 /** Blocos cujo nome não bate com o nome da textura no jar: água/lava/fogo
  * são animados (`water_still`, `fire_0`) e o atlas guarda todos os frames,
@@ -172,8 +229,11 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
  * `map`, então o valor não importa — só precisa existir. */
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
-// Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-const VOXEL_FORMAT_VERSION = 2;
+// Flags/versão do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
+// v3 = seções + tints de bioma por coluna; v2 (sem tints) ainda é aceito na
+// leitura pro `world.cache` gravado antes, e cai no fallback fixo.
+const VOXEL_FORMAT_VERSION = 3;
+const VOXEL_FORMAT_VERSION_LEGACY = 2;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
@@ -304,11 +364,26 @@ interface DecodedSection {
   indices: Uint16Array;
 }
 
+/** Tints de bioma por coluna (payload v3): cor `0xRRGGBB` por coluna
+ * (`lx + lz*16`, a mesma ordem dos índices das seções), já resolvida pelo
+ * addon com o `BiomeColors` do client. `null` = payload v2 ou sem dados — o
+ * viewer cai nas cores fixas (`GRASS_TINT` e companhia). */
+interface ChunkTints {
+  grass: Uint32Array;
+  foliage: Uint32Array;
+  water: Uint32Array;
+}
+
+/** Uma coluna do chunk tem `x + z*16` — os tint maps seguem essa ordem. */
+const TINT_COLUMNS = 256;
+
 interface DecodedChunk {
   x: number;
   z: number;
   /** Seção Y (mundo / 16) → seção; ausente = ar. */
   sections: Map<number, DecodedSection>;
+  /** Tints de bioma por coluna; `null` = chunk sem essa informação. */
+  tints: ChunkTints | null;
 }
 
 /** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido e
@@ -435,15 +510,16 @@ interface MeshBuffers {
   indices: number[];
 }
 
-/** UVs já no espaço do atlas (flat) + tint linear, cacheados por (bloco,
- * face do cubo) — o laço de meshing roda uma vez por face exposta e refazer
- * string + rect + conversão de cor a cada iteração era o grosso do custo
- * num chunk denso. */
+/** UVs já no espaço do atlas (flat) + se veio de textura real, cacheados por
+ * (bloco, face do cubo) — o laço de meshing roda uma vez por face exposta e
+ * refazer string + rect a cada iteração era o grosso do custo num chunk denso.
+ * A cor não entra aqui: desde os tints por coluna ela varia dentro do chunk
+ * (ver `faceTint`). */
 interface FaceRender {
   uv: number[];
-  r: number;
-  g: number;
-  b: number;
+  /** Veio de textura real do atlas (`faceRect`) — bloco sem textura sai cinza
+   * neutro em vez de fingir que é outro bloco. */
+  known: boolean;
 }
 
 /** Rect resolvido de uma face + se veio de textura real do atlas (`known`)
@@ -476,11 +552,12 @@ function byteReader(bytes: Uint8Array) {
   };
 }
 
-/** Decodifica o payload de `chunk_voxels` (formato 2, ver `world_cache.rs`). */
+/** Decodifica o payload de `chunk_voxels` (formato 3, ver `world_cache.rs` —
+ * v2, sem tints, ainda é aceito pro cache antigo). */
 function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
   const reader = byteReader(bytes);
   const version = reader.u8();
-  if (version !== VOXEL_FORMAT_VERSION) {
+  if (version !== VOXEL_FORMAT_VERSION && version !== VOXEL_FORMAT_VERSION_LEGACY) {
     throw new Error(`versão de payload desconhecida: ${version}`);
   }
   const sectionCount = reader.u8();
@@ -501,7 +578,27 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
     sections.set(y, { y, palette, indices });
   }
-  return { x, z, sections };
+
+  let tints: ChunkTints | null = null;
+  if (version === VOXEL_FORMAT_VERSION) {
+    const hasTints = reader.u8();
+    if (hasTints === 1) {
+      const readColumns = () => {
+        const columns = new Uint32Array(TINT_COLUMNS);
+        for (let column = 0; column < TINT_COLUMNS; column++) {
+          const r = reader.u8();
+          const g = reader.u8();
+          const b = reader.u8();
+          columns[column] = (r << 16) | (g << 8) | b;
+        }
+        return columns;
+      };
+      tints = { grass: readColumns(), foliage: readColumns(), water: readColumns() };
+    } else if (hasTints !== 0) {
+      throw new Error(`flag de tints inválida: ${hasTints}`);
+    }
+  }
+  return { x, z, sections, tints };
 }
 
 export class Viewer3D {
@@ -651,8 +748,25 @@ export class Viewer3D {
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
+  /** Cache `0xRRGGBB` → componentes lineares — ver `linearColor`. */
+  private readonly linearColorCache = new Map<number, [number, number, number]>();
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
+  /** Canvas/textura do gradiente do domo — `paintSky` redesenha os dois. */
+  private skyCanvas: HTMLCanvasElement | null = null;
+  private skyTexture: THREE.CanvasTexture | null = null;
+  /** Hora do mundo (ticks 0..23999) e se o addon está reportando agora. Sem
+   * jogo, a hora congela na última real; sem nenhuma, vale `DEFAULT_DAY_TIME`. */
+  private worldTime: number | null = null;
+  private worldTimeLive = false;
+  private lastSkyPaintMs = -Infinity;
+  /** Luzes do ciclo dia/noite — ver `updateDayNight`. */
+  private ambientLight: THREE.AmbientLight;
+  private sunLight: THREE.DirectionalLight;
+  private moonLight: THREE.DirectionalLight;
+  private readonly dayNightA = new THREE.Color();
+  private readonly dayNightB = new THREE.Color();
+  private readonly dayNightC = new THREE.Color();
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
@@ -666,7 +780,7 @@ export class Viewer3D {
     (labelEl.parentElement ?? container).appendChild(this.mobLayer);
 
     this.scene = new THREE.Scene();
-    this.fog = new THREE.Fog(SKY_HORIZON, FOG_NEAR_BASE, FOG_FAR_BASE);
+    this.fog = new THREE.Fog(SKY_DAY.horizon, FOG_NEAR_BASE, FOG_FAR_BASE);
     this.scene.fog = this.fog;
 
     // `far` acompanha o `maxDistance` do OrbitControls: com o zoom livre
@@ -677,7 +791,7 @@ export class Viewer3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     // O domo cobre a tela; isto é o fundo de segurança (o que aparece antes do
     // primeiro frame), por isso a cor do horizonte.
-    this.renderer.setClearColor(SKY_HORIZON, 1);
+    this.renderer.setClearColor(SKY_DAY.horizon, 1);
     container.appendChild(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -721,10 +835,15 @@ export class Viewer3D {
       this.hoverHelper.visible = false;
     });
 
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-    const sun = new THREE.DirectionalLight(0xffffff, 0.5);
-    sun.position.set(80, 120, 40);
-    this.scene.add(sun);
+    // Luzes do ciclo dia/noite — posição/intensidade/cor reais em
+    // `updateDayNight` (o construtor só deixa a cena num dia neutro).
+    this.ambientLight = new THREE.AmbientLight(0xffffff, AMBIENT_DAY);
+    this.scene.add(this.ambientLight);
+    this.sunLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    this.sunLight.position.set(80, 120, 40);
+    this.scene.add(this.sunLight);
+    this.moonLight = new THREE.DirectionalLight(MOON_COLOR, 0);
+    this.scene.add(this.moonLight);
 
     this.sky = this.buildSky();
     this.scene.add(this.sky);
@@ -812,15 +931,6 @@ export class Viewer3D {
     const canvas = document.createElement("canvas");
     canvas.width = 2;
     canvas.height = 256;
-    const ctx = canvas.getContext("2d")!;
-    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
-    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    gradient.addColorStop(0, SKY_ZENITH);
-    gradient.addColorStop(0.55, SKY_MID);
-    gradient.addColorStop(1, SKY_HORIZON);
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     const sky = new THREE.Mesh(
@@ -834,7 +944,27 @@ export class Viewer3D {
       })
     );
     sky.frustumCulled = false; // está sempre na câmera — nunca cullar
+    this.skyCanvas = canvas;
+    this.skyTexture = texture;
+    // Estado inicial (dia claro); `updateDayNight` repinta conforme a hora.
+    this.paintSky(SKY_DAY_ZENITH, SKY_DAY_MID, SKY_DAY_HORIZON);
     return sky;
+  }
+
+  /** Redesenha o gradiente do domo (2×256) e reenvia pra GPU. Só é chamado a
+   * cada `SKY_REPAINT_MS` — o ciclo é lento e o domo não precisa de 60fps. */
+  private paintSky(zenith: THREE.Color, mid: THREE.Color, horizon: THREE.Color) {
+    const canvas = this.skyCanvas;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx || !this.skyTexture) return;
+    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    gradient.addColorStop(0, `#${zenith.getHexString()}`);
+    gradient.addColorStop(0.55, `#${mid.getHexString()}`);
+    gradient.addColorStop(1, `#${horizon.getHexString()}`);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    this.skyTexture.needsUpdate = true;
   }
 
   /** Chave numérica (x,z): o mundo do Minecraft cabe em |x|,|z| < 30M, então
@@ -1044,11 +1174,32 @@ export class Viewer3D {
     return resolved;
   }
 
-  /** Tint por vértice: só o topo da grama e as folhagens que vêm cinza no
-   * jar; o resto é branco (textura já colorida). */
-  private faceTint(blockName: string, face: BlockFace): number {
-    if (blockName === "grass_block") return face === "top" ? GRASS_TINT : 0xffffff;
+  /** Cor (`0xRRGGBB`) de uma face do bloco como o jogo resolve: texturas
+   * cinzas (grama, folhagem) levam o tint de bioma da coluna quando o chunk
+   * trouxe os tints (payload v3) — senão o fallback fixo aproximado. O resto
+   * sai branco (a textura já é colorida). */
+  private faceTint(blockName: string, face: BlockFace, column: number, tints: ChunkTints | null): number {
+    const kind = BLOCK_TINT_KIND[blockName];
+    if (kind === "grass") {
+      // No grass_block o lado é terra + overlay (camada própria, tingida em
+      // `buildChunkMesh`); aqui só o topo leva tint.
+      if (blockName === "grass_block" && face !== "top") return 0xffffff;
+      return this.grassTintAt(column, tints);
+    }
+    if (kind === "foliage") return this.foliageTintAt(column, tints);
     return BLOCK_TINTS[blockName] ?? 0xffffff;
+  }
+
+  private grassTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.grass[column] : GRASS_TINT;
+  }
+
+  private foliageTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.foliage[column] : FOLIAGE_TINT;
+  }
+
+  private waterTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.water[column] : WATER_TINT;
   }
 
   private buildMaterials() {
@@ -1079,7 +1230,10 @@ export class Viewer3D {
     const water = kind === "water";
     const material = new THREE.MeshStandardMaterial({
       map: frames[0] ?? null,
-      color: water ? WATER_TINT : 0xffffff,
+      // O tint da água é por coluna (bioma, ver `meshFluidFace`) e chega por
+      // vértice; lava não tem tint (branco).
+      color: 0xffffff,
+      vertexColors: true,
       roughness: water ? 0.35 : 0.6,
       metalness: 0,
       // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
@@ -1229,7 +1383,8 @@ export class Viewer3D {
 
   /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
    * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
-   * usado pra superfície rebaixada de fluido. */
+   * usado pra superfície rebaixada de fluido. `color` é `0xRRGGBB` e `offset`
+   * desloca o quad ao longo da normal da face (camada de overlay). */
   private pushQuadFlat(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1239,15 +1394,22 @@ export class Viewer3D {
     low: number,
     high: number,
     uv: readonly number[],
-    r: number,
-    g: number,
-    b: number
+    color: number,
+    offset = 0
   ) {
     const face = FACES[faceIndex];
+    const [r, g, b] = this.linearColor(color);
+    const offsetX = face.dir[0] * offset;
+    const offsetY = face.dir[1] * offset;
+    const offsetZ = face.dir[2] * offset;
     const base = buffers.positions.length / 3;
     for (let i = 0; i < 4; i++) {
       const corner = face.corners[i];
-      buffers.positions.push(x + corner[0], y + (corner[1] === 1 ? high : low), z + corner[2]);
+      buffers.positions.push(
+        x + corner[0] + offsetX,
+        y + (corner[1] === 1 ? high : low) + offsetY,
+        z + corner[2] + offsetZ
+      );
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
       buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
       buffers.colors.push(r, g, b);
@@ -1255,17 +1417,38 @@ export class Viewer3D {
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
 
-  /** UVs (flat, já no espaço do atlas) + tint linear de uma face do bloco,
-   * com cache por (bloco, face). `null` = face sem textura resolvida, pulada
-   * sem quebrar o chunk. */
-  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+  /** Componentes lineares de uma cor `0xRRGGBB`: o `THREE.Color` converte
+   * sRGB→linear no `setHex`, e o meshing não pode pagar essa conversão por
+   * face — o cache guarda o conjunto de cores em uso (com os tints de bioma
+   * são algumas centenas). */
+  private linearColor(hex: number): readonly [number, number, number] {
+    let linear = this.linearColorCache.get(hex);
+    if (!linear) {
+      this.scratchColor.setHex(hex);
+      const components: [number, number, number] = [
+        this.scratchColor.r,
+        this.scratchColor.g,
+        this.scratchColor.b,
+      ];
+      this.linearColorCache.set(hex, components);
+      linear = components;
+    }
+    return linear;
+  }
+
+  /** UVs (flat, já no espaço do atlas) de uma face do bloco, com cache por
+   * (bloco, face). `null` = face sem textura resolvida, pulada sem quebrar o
+   * chunk. `requireKnown` = só aceita textura real do atlas (usado pela
+   * camada de overlay do grass_block: sem a textura, melhor não desenhar nada
+   * do que um retângulo de fallback). */
+  private cachedFaceRender(blockName: string, faceIndex: number, requireKnown: boolean): FaceRender | null {
     const key = `${blockName}|${faceIndex}`;
     if (this.faceRenderCache.has(key)) return this.faceRenderCache.get(key)!;
 
     const face = FACES[faceIndex];
     const resolved = this.faceRect(blockName, face.kind);
     let render: FaceRender | null = null;
-    if (resolved) {
+    if (resolved && (!requireKnown || resolved.known)) {
       const rect = resolved.rect;
       const uv = new Array<number>(8);
       for (let i = 0; i < 4; i++) {
@@ -1273,20 +1456,24 @@ export class Viewer3D {
         uv[i * 2] = rect.u0 + u * (rect.u1 - rect.u0);
         uv[i * 2 + 1] = rect.v0 + v * (rect.v1 - rect.v0);
       }
-      // Sem textura real (bloco de mod, atlas degradado): cinza neutro em vez
-      // da textura de outro bloco.
-      this.scratchColor.setHex(
-        resolved.known ? this.faceTint(blockName, face.kind) : COLOR_UNKNOWN_BLOCK
-      );
-      render = { uv, r: this.scratchColor.r, g: this.scratchColor.g, b: this.scratchColor.b };
+      render = { uv, known: resolved.known };
     }
     this.faceRenderCache.set(key, render);
     return render;
   }
 
+  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+    return this.cachedFaceRender(blockName, faceIndex, false);
+  }
+
+  private grassOverlayRender(faceIndex: number): FaceRender | null {
+    return this.cachedFaceRender(GRASS_SIDE_OVERLAY, faceIndex, true);
+  }
+
   /** Uma face visível de fluido: mesma culling dos sólidos, mas face entre o
    * mesmo fluido só aparece quando o vizinho é mais raso (degrau d'água), e
-   * a altura sai do nível em vez de 0..1. */
+   * a altura sai do nível em vez de 0..1. `color` = tint do bioma (água) ou
+   * branco (lava). */
   private meshFluidFace(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1295,7 +1482,8 @@ export class Viewer3D {
     z: number,
     entry: PaletteEntry,
     neighbor: PaletteEntry | null,
-    flow: THREE.Vector3 | null
+    flow: THREE.Vector3 | null,
+    color: number
   ) {
     const ownHeight = fluidHeight(entry.level);
     let low = 0;
@@ -1320,9 +1508,7 @@ export class Viewer3D {
       low,
       high,
       FLUID_ROTATED_UV[faceIndex][rotation],
-      1,
-      1,
-      1
+      color
     );
   }
 
@@ -1369,6 +1555,9 @@ export class Viewer3D {
             const x = chunk.x * 16 + lx;
             const y = sectionY * 16 + ly;
             const z = chunk.z * 16 + lz;
+            // Coluna do chunk (ordem dos tints, `x + z*16`): de onde sai a cor
+            // de bioma da grama/folhagem/água.
+            const column = (lz << 4) | lx;
             const isFluid = (entry.flags & VOXEL_FLAG_FLUID) !== 0;
             const fluidBucket = isFluid ? `${entry.block}_${entry.level === 0 ? "still" : "flow"}` : "opaque";
             // Direção da correnteza só é calculada se alguma face de fluido
@@ -1384,7 +1573,8 @@ export class Viewer3D {
                   flow = this.fluidFlowVector(x, y, z, entry);
                   flowNeeded = false;
                 }
-                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow);
+                const fluidColor = entry.block === "water" ? this.waterTintAt(column, chunk.tints) : 0xffffff;
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor);
                 continue;
               }
               // Sólido: face some se o vizinho é oclusor; oclusão entre
@@ -1396,7 +1586,31 @@ export class Viewer3D {
               }
               const render = this.faceRender(entry.block, f);
               if (!render) continue;
-              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, render.r, render.g, render.b);
+              // Sem textura real (bloco de mod, atlas degradado): cinza neutro
+              // em vez da textura de outro bloco.
+              const color = render.known
+                ? this.faceTint(entry.block, face.kind, column, chunk.tints)
+                : COLOR_UNKNOWN_BLOCK;
+              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, color);
+              // Segunda camada do lado do grass_block no modelo vanilla:
+              // cinza no arquivo, tingida com a cor de grama do bioma.
+              if (entry.block === "grass_block" && face.kind === "side") {
+                const overlay = this.grassOverlayRender(f);
+                if (overlay) {
+                  this.pushQuadFlat(
+                    buffered("opaque"),
+                    f,
+                    x,
+                    y,
+                    z,
+                    0,
+                    1,
+                    overlay.uv,
+                    this.grassTintAt(column, chunk.tints),
+                    GRASS_SIDE_OVERLAY_OFFSET
+                  );
+                }
+              }
             }
           }
         }
@@ -1838,6 +2052,66 @@ export class Viewer3D {
   /** O domo é centrado na câmera (não no alvo): o horizonte do gradiente fica
    * sempre na linha do olhar, e o domo nunca "fica pra trás" quando a câmera
    * se afasta do bot. */
+  /** Hora real do mundo (ticks 0..23999) reportada pelo addon — ver
+   * `main.ts`/`addon_socket.rs`. `null` (sem jogo) **não** zera a hora local:
+   * a cena congela na última hora real, em vez de inventar um ciclo; sem
+   * nenhuma mensagem ainda, vale o meio-dia fixo (`DEFAULT_DAY_TIME`). */
+  setWorldTime(dayTime: number | null) {
+    if (dayTime === null) {
+      this.worldTimeLive = false;
+      return;
+    }
+    this.worldTime = ((dayTime % TICKS_PER_DAY) + TICKS_PER_DAY) % TICKS_PER_DAY;
+    this.worldTimeLive = true;
+  }
+
+  /** Move sol, lua, luz ambiente e o gradiente do céu conforme a hora do
+   * mundo. Com `worldTimeLive`, roda a cada frame (a hora local avança em
+   * `animate`); sem jogo, aplica a hora congelada uma vez e para. */
+  private updateDayNight(now: number) {
+    if (!this.worldTimeLive && this.lastSkyPaintMs !== -Infinity) return;
+
+    const time = this.worldTime ?? DEFAULT_DAY_TIME;
+    const phase = (time / TICKS_PER_DAY) * Math.PI * 2;
+    const elevation = Math.sin(phase); // -1 = meia-noite, +1 = meio-dia
+    const daylight = smoothstep(-0.12, 0.28, elevation);
+
+    // Sol nasce no leste (+X) e se põe no oeste, como no jogo.
+    this.sunLight.position.set(
+      Math.cos(phase) * SUN_DISTANCE,
+      elevation * SUN_DISTANCE,
+      SUN_DISTANCE * 0.25
+    );
+    this.sunLight.intensity = 0.5 * daylight;
+    this.sunLight.color.copy(SUN_COLOR_LOW_C).lerp(SUN_COLOR_HIGH_C, daylight);
+
+    // Lua fica do lado oposto e só rende à noite.
+    this.moonLight.position.set(
+      -Math.cos(phase) * SUN_DISTANCE,
+      -elevation * SUN_DISTANCE,
+      -SUN_DISTANCE * 0.25
+    );
+    this.moonLight.intensity = MOON_INTENSITY * (1 - daylight);
+
+    this.ambientLight.intensity = AMBIENT_NIGHT + (AMBIENT_DAY - AMBIENT_NIGHT) * daylight;
+    this.ambientLight.color.copy(AMBIENT_NIGHT_COLOR).lerp(AMBIENT_DAY_COLOR, daylight);
+
+    if (now - this.lastSkyPaintMs < SKY_REPAINT_MS) return;
+    this.lastSkyPaintMs = now;
+    // Nascer/pôr do sol deixa o horizonte quente — pico quando o sol raspa o
+    // horizonte (elevação perto de zero).
+    const twilight = Math.max(0, 1 - Math.abs(elevation) / 0.3);
+    const zenith = this.dayNightA.copy(SKY_NIGHT_ZENITH).lerp(SKY_DAY_ZENITH, daylight);
+    const mid = this.dayNightB.copy(SKY_NIGHT_MID).lerp(SKY_DAY_MID, daylight);
+    const horizon = this.dayNightC
+      .copy(SKY_NIGHT_HORIZON)
+      .lerp(SKY_DAY_HORIZON, daylight)
+      .lerp(SKY_TWILIGHT_COLOR, twilight * 0.65);
+    this.paintSky(zenith, mid, horizon);
+    this.fog.color.copy(horizon);
+    this.renderer.setClearColor(horizon, 1);
+  }
+
   private updateSky() {
     this.sky.position.copy(this.camera.position);
   }
@@ -2338,6 +2612,12 @@ export class Viewer3D {
     this.updateBotMarker(dt);
     this.updateMobs(dt);
     this.controls.update();
+    // A hora local anda 20 ticks/s enquanto o addon reporta a hora real — é
+    // isso que deixa o ciclo contínuo em vez de pular 1x/s no polling.
+    if (this.worldTimeLive && this.worldTime !== null) {
+      this.worldTime = (this.worldTime + dt * TICKS_PER_SECOND) % TICKS_PER_DAY;
+    }
+    this.updateDayNight(now);
     this.updateSky();
     this.updateFog();
     this.updateAnimation(now);
