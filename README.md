@@ -17,9 +17,10 @@ arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mud
 > **Status: ponta a ponta funcionando, escopo mínimo.** A shell do app, os modelos de dados Rust, a
 > identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app, nos
 > dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
-> chunks explorados e o bot em coordenadas reais do jogo) e a **fila executando `travel_to`/`explore`
-> de verdade** (com status e progresso vindos do addon) estão implementados e testados manualmente.
-> Baús e instruções de `#build`/`#mine`/craft ainda não existem — ver "O que falta" abaixo.
+> chunks explorados e o **jogador com o modelo e a skin reais do jogo** em coordenadas reais) e a
+> **fila executando `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) estão
+> implementados e testados manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não
+> existem — ver "O que falta" abaixo.
 
 ## Arquitetura
 
@@ -34,7 +35,8 @@ Addon Java (mod-addon/ — NeoForge, real)                    App Rust/Tauri (es
 └─ reporta posição/progresso/vitais ────────────┐            └─ Vitais/ameaças (src-tauri/src/vitals.rs)
                                                  ↓
                          socket TCP local 127.0.0.1:31173 (src-tauri/src/addon_socket.rs)
-                         manda vitais, posição e presença de chunk — baú/fila ainda não trafegam
+                         manda vitais, posição + rotação, skin do jogador e o chunk em voxels;
+                         recebe instruções/cancelamento — baú ainda não trafega
 ```
 
 ## Identidade visual

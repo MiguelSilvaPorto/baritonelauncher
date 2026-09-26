@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
 
 /**
  * Renderer 3D real do viewer — ver `docs/SPEC.md`, "Visualização 3D própria".
@@ -8,6 +9,10 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
  * o mesmo resultado (cena 3D, câmera orbitável, geometria real) sem a
  * complexidade de embutir uma superfície wgpu numa janela separada
  * sincronizada com o Tauri, que eu não teria como validar visualmente.
+ *
+ * O jogador é um modelo de verdade do Minecraft (`player_model.ts`), com a
+ * skin real do jogador mandada pelo addon — não um marcador genérico. Ver
+ * `docs/CHANGELOG.md`, "Renderizador do jogador".
  *
  * Escopo honesto: o addon manda o chunk inteiro em voxels (paleta + índices
  * 16×16×16, ver `world_cache.rs`), então cada bloco vira só as faces expostas
@@ -58,6 +63,15 @@ const MOVE_KEYS = new Set([
 // usuário se afastava.
 const FOG_NEAR_BASE = 60;
 const FOG_FAR_BASE = 260;
+
+// Perseguição do jogador: a pose real chega 4x/s (ver `addon_socket.rs`), e
+// estes valores são o que evita o modelo "piscar" de posição em posição — o
+// alvo é interpolado a cada frame (constante de tempo ~83ms com 12), e um
+// salto grande (reconexão, `/tp`) encaixa direto em vez de deslizar pelo mapa.
+const BOT_FOLLOW_RATE = 12; // 1/s
+const BOT_TELEPORT_DISTANCE = 8; // blocos
+const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
+const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
 
 // Aproximação, não tint real por bioma (isso exigiria saber o bioma da
 // coluna e amostrar o colormap/JSON de bioma — não implementado, ver
@@ -128,6 +142,15 @@ export interface BotPos {
   x: number;
   y: number;
   z: number;
+}
+
+/** Pose real do jogador (comando `bot_pose`): posição dos pés + olhar. */
+export interface BotPose {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
 }
 
 export interface ChunkPos {
@@ -315,8 +338,12 @@ export class Viewer3D {
   /** Malhas de um chunk, uma por bucket de material — ver `buildChunkMesh`. */
   private chunkMeshes = new Map<number, THREE.Mesh[]>();
   private botMarker: THREE.Group;
-  private botLight: THREE.PointLight;
-  private lastBotWorldPos: THREE.Vector3 | null = null;
+  /** Modelo do jogador dentro de `botMarker` — ver `player_model.ts`. */
+  private playerModel = new MinecraftPlayerModel();
+  /** Alvo da interpolação da pose; `null` = sem jogador. */
+  private targetBotPos: THREE.Vector3 | null = null;
+  private botYaw = 0;
+  private botPitch = 0;
 
   private labelEl: HTMLDivElement;
 
@@ -399,22 +426,30 @@ export class Viewer3D {
     this.botMarker.visible = false;
     this.scene.add(this.botMarker);
 
-    this.botLight = new THREE.PointLight(COLOR_TEAL, 3, 20);
-    this.botMarker.add(this.botLight);
-
     this.resize();
     this.animate();
   }
 
+  /** Grupo do jogador: o modelo do Minecraft + um anel teal raso no chão. O
+   * modelo é a posição real; o anel mantém o "você está aqui" legível de
+   * longe (mesmo papel do marcador antigo, sem a bola). */
   private buildBotMarker(): THREE.Group {
     const group = new THREE.Group();
-    const sphere = new THREE.Mesh(
-      new THREE.SphereGeometry(0.6, 20, 20),
-      // fog: false — o marcador é "você está aqui", nunca pode desaparecer
-      // no fog de distância como o resto da cena.
-      new THREE.MeshStandardMaterial({ color: COLOR_TEAL, emissive: COLOR_TEAL, emissiveIntensity: 0.9, fog: false })
+    group.add(this.playerModel.group);
+    const ring = new THREE.Mesh(
+      new THREE.RingGeometry(0.3, 0.42, 32),
+      new THREE.MeshBasicMaterial({
+        color: COLOR_TEAL,
+        transparent: true,
+        opacity: 0.7,
+        side: THREE.DoubleSide,
+        fog: false, // o marcador é "você está aqui", nunca some no fog
+        depthWrite: false,
+      })
     );
-    group.add(sphere);
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.y = 0.02;
+    group.add(ring);
     return group;
   }
 
@@ -841,43 +876,71 @@ export class Viewer3D {
     for (const chunk of this.chunks.values()) this.buildChunkMesh(chunk);
   }
 
-  /** Câmera "persegue" o bot: a cada posição nova, move a câmera pelo mesmo
-   * delta que o bot andou, preservando o ângulo/distância que o usuário
-   * escolheu orbitando com o mouse. Sem isso, a câmera fica plantada onde
-   * enquadrou da primeira vez e o bot sai de quadro assim que anda — foi
-   * exatamente o bug relatado. */
-  setBotPos(pos: BotPos | null) {
-    if (!pos) {
+  /** Recebe a pose real do jogador (comando `bot_pose`) e usa como alvo: o
+   * modelo anda até ela a cada frame (a pose chega 4x/s e sem isso ele
+   * piscaria de posição em posição), e a câmera segue pelo mesmo delta —
+   * preservando o ângulo/distância que o usuário escolheu orbitando.
+   * Teleporte (reconexão, `/tp`) encaixa direto, sem atravessar o mapa. */
+  setBotPose(pose: BotPose | null) {
+    if (!pose) {
+      this.targetBotPos = null;
       this.botMarker.visible = false;
       this.labelEl.style.display = "none";
+      this.playerModel.resetWalk();
       return;
     }
-    this.botMarker.visible = true;
-    const newPos = new THREE.Vector3(pos.x, pos.y + 1, pos.z);
 
-    if (this.lastBotWorldPos) {
-      const delta = newPos.clone().sub(this.lastBotWorldPos);
+    this.botYaw = pose.yaw;
+    this.botPitch = pose.pitch;
+    const target = new THREE.Vector3(pose.x, pose.y, pose.z);
+
+    if (!this.targetBotPos) {
+      // Primeira posição conhecida: enquadra direto, não tem de onde vir o delta.
+      this.botMarker.position.copy(target);
+      this.controls.target.set(pose.x, pose.y + BOT_CAMERA_HEIGHT, pose.z);
+      this.camera.position.set(pose.x + 40, pose.y + 45, pose.z + 40);
+      this.playerModel.resetWalk();
+    } else if (target.distanceTo(this.botMarker.position) > BOT_TELEPORT_DISTANCE) {
+      const delta = target.clone().sub(this.botMarker.position);
+      this.botMarker.position.copy(target);
       this.camera.position.add(delta);
       this.controls.target.add(delta);
-    } else {
-      // Primeira posição conhecida: enquadra direto, não tem de onde vir o delta.
-      this.controls.target.set(pos.x, pos.y, pos.z);
-      this.camera.position.set(pos.x + 40, pos.y + 45, pos.z + 40);
+      this.playerModel.resetWalk();
     }
 
-    this.botMarker.position.copy(newPos);
-    this.lastBotWorldPos = newPos;
-    this.labelEl.textContent = `${pos.x}, ${pos.y}, ${pos.z}`;
+    this.targetBotPos = target;
+    this.botMarker.visible = true;
+    this.labelEl.textContent = `${pose.x}, ${pose.y}, ${pose.z}`;
+  }
+
+  /** Skin real do jogador (comando `player_skin`) — o modelo só reaplica
+   * quando ela muda de verdade, então dá pra chamar a cada polling. */
+  setPlayerSkin(skin: PlayerSkinInput | null) {
+    this.playerModel.setSkin(skin);
+  }
+
+  /** Move o modelo (interpolando até o alvo) e a câmera pelo mesmo passo. */
+  private updateBotMarker(dt: number) {
+    if (!this.targetBotPos) return;
+
+    const step = this.targetBotPos.clone().sub(this.botMarker.position);
+    step.multiplyScalar(1 - Math.exp(-BOT_FOLLOW_RATE * dt));
+    this.botMarker.position.add(step);
+    this.camera.position.add(step);
+    this.controls.target.add(step);
+
+    this.playerModel.update(dt, this.botMarker.position, this.botYaw, this.botPitch);
   }
 
   /** Reenquadra o bot (tecla F): desloca câmera e alvo pelo mesmo delta, ou
    * seja, mantém o ângulo/distância que o usuário escolheu e só recentra a
-   * órbita no marcador — útil quando o bot andou pra longe da câmera. */
+   * órbita no jogador — útil quando ele andou pra longe da câmera. */
   private focusBot() {
     if (!this.botMarker.visible) return;
-    const delta = this.botMarker.position.clone().sub(this.controls.target);
+    const target = this.botMarker.position.clone().setY(this.botMarker.position.y + BOT_CAMERA_HEIGHT);
+    const delta = target.clone().sub(this.controls.target);
     this.camera.position.add(delta);
-    this.controls.target.copy(this.botMarker.position);
+    this.controls.target.copy(target);
   }
 
   /** A view do viewer fica `display:none` nos outros modos do rail; nesse
@@ -1007,7 +1070,8 @@ export class Viewer3D {
     this.chunks.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
-    this.lastBotWorldPos = null;
+    this.targetBotPos = null;
+    this.playerModel.resetWalk();
   }
 
   resize() {
@@ -1042,6 +1106,7 @@ export class Viewer3D {
     this.lastFrameMs = now;
 
     this.applyMovement(dt);
+    this.updateBotMarker(dt);
     this.controls.update();
     this.updateFog();
     this.updateAnimation(now);
@@ -1051,7 +1116,11 @@ export class Viewer3D {
 
   private updateLabelPosition() {
     if (!this.botMarker.visible) return;
-    const vector = this.botMarker.position.clone().project(this.camera);
+    // Projeta acima da cabeça do jogador (o marcador está nos pés).
+    const vector = this.botMarker.position
+      .clone()
+      .setY(this.botMarker.position.y + PLAYER_HEAD_HEIGHT)
+      .project(this.camera);
     const width = this.container.clientWidth;
     const height = this.container.clientHeight;
     const x = (vector.x * 0.5 + 0.5) * width;
