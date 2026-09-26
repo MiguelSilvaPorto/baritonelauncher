@@ -103,16 +103,52 @@
 
         <!-- ---------- Editor ---------- -->
         <section class="view" id="view-editor">
-          <div class="placeholder-view">
-            <h1>Editor de schematic</h1>
-            <p>
-              Ainda não implementado. No spec, o editor pinta blocos texturizados sobre o mesmo
-              <code>WorldCache</code> renderizado no viewer (estilo WorldEdit) — a diferença entre o
-              que existe e o que foi desenhado vira a instrução de build. Isso depende do pipeline de
-              atlas de texturas (jar do Minecraft → <code>BlockDef</code>) descrito em
-              <code>docs/SPEC.md</code>, seção "Blocos 3D".
-            </p>
+          <div class="editor-workspace">
+            <div class="editor-canvas-host" id="editor-canvas"></div>
+            <div class="editor-toolbar">
+              <button type="button" class="tool-btn" data-editor-tool="select" title="Clique em dois blocos pra marcar a região">
+                Selecionar
+              </button>
+              <button type="button" class="tool-btn" data-editor-tool="place" title="Clique num bloco (ou na região) pra colocar o bloco da paleta">
+                Colocar
+              </button>
+              <button type="button" class="tool-btn" data-editor-tool="break" title="Clique num bloco (ou na região) pra marcar pra quebrar">
+                Quebrar
+              </button>
+              <span class="toolbar-sep"></span>
+              <button type="button" class="tool-btn primary" id="editor-apply" disabled>Aplicar</button>
+              <button type="button" class="tool-btn flat" id="editor-clear-edits">Limpar edições</button>
+              <button type="button" class="tool-btn flat" id="editor-clear-selection">Limpar seleção</button>
+            </div>
+            <div class="editor-status mono" id="editor-status">
+              Escolha uma ferramenta e clique no terreno — arrastar continua orbitando.
+            </div>
           </div>
+          <aside class="side-panel" id="palette-panel">
+            <div class="side-header">
+              <h2>Paleta</h2>
+              <span class="count mono" id="palette-count">0</span>
+            </div>
+            <div class="palette-controls">
+              <input
+                class="composer-input"
+                type="search"
+                id="palette-search"
+                placeholder="buscar bloco…"
+                autocomplete="off"
+              />
+              <div class="palette-categories" id="palette-categories"></div>
+            </div>
+            <div class="palette-grid" id="palette-grid">
+              <div class="empty-state">
+                <span class="headline">Paleta vazia</span>
+                <span class="detail">
+                  A paleta é montada com as texturas reais do atlas, que só existe depois da primeira
+                  conexão do addon (é de lá que vem a versão do Minecraft).
+                </span>
+              </div>
+            </div>
+          </aside>
         </section>
 
         <!-- ---------- Fila (tela cheia) ---------- -->

@@ -434,6 +434,128 @@ button, input { font-family: inherit; }
 .placeholder-view p { font-size: 12px; color: var(--text-3); max-width: 480px; line-height: 1.6; }
 .placeholder-view code { font-family: var(--mono); color: var(--text-2); background: var(--bg-panel-2); padding: 1px 5px; border-radius: 4px; }
 
+/* ---------- Editor de schematic (ver src/viewer3d.ts) ---------- */
+
+.editor-workspace {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.editor-canvas-host {
+  flex: 1 1 auto;
+  position: relative;
+  background: var(--bg-base);
+  overflow: hidden;
+}
+
+.editor-canvas-host canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.editor-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.tool-btn {
+  background: transparent;
+  border: 1px solid var(--border-2);
+  color: var(--text-2);
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.tool-btn:hover { border-color: var(--text-2); color: var(--text); }
+.tool-btn.active { background: var(--amber-dim); border-color: var(--amber); color: var(--amber); }
+.tool-btn.primary { background: var(--amber-dim); border-color: var(--amber); color: var(--amber); }
+.tool-btn.primary:hover:not(:disabled) { background: var(--amber); color: var(--bg-base); }
+.tool-btn:disabled { opacity: 0.45; cursor: default; }
+.tool-btn:disabled:hover { border-color: var(--border-2); color: var(--text-2); }
+.tool-btn.flat { border-color: transparent; color: var(--text-3); }
+.toolbar-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+
+.editor-status {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-base);
+  color: var(--text-3);
+  font-size: 11px;
+  min-height: 26px;
+}
+
+/* Paleta de blocos — visual, com a textura real do atlas (não lista de texto). */
+
+.palette-controls {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.palette-categories { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.palette-category {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-3);
+  border-radius: 999px;
+  font-size: 10px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.palette-category:hover { color: var(--text-2); border-color: var(--border-2); }
+.palette-category.active { background: var(--amber-dim); border-color: var(--amber); color: var(--amber); }
+
+.palette-grid {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(52px, 1fr));
+  gap: 6px;
+  align-content: start;
+}
+
+.palette-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 6px 4px;
+  cursor: pointer;
+  color: var(--text-3);
+}
+.palette-item:hover { border-color: var(--border-2); color: var(--text-2); }
+.palette-item.active { border-color: var(--amber); color: var(--amber); }
+.palette-item img { width: 32px; height: 32px; image-rendering: pixelated; }
+.palette-item span {
+  font-size: 9px;
+  line-height: 1.2;
+  text-align: center;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-more { grid-column: 1 / -1; font-size: 10px; color: var(--text-3); text-align: center; padding: 6px 0; }
+
 /* ---------- Armazém: tabela ---------- */
 
 .storage-view { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }

@@ -1,6 +1,7 @@
 mod addon_socket;
 mod instructions;
 mod items;
+mod schematic;
 mod storage_index;
 mod texture_atlas;
 mod time_estimate;
@@ -11,6 +12,7 @@ mod world_store;
 use instructions::{Instruction, InstructionKind, InstructionQueue, InstructionStatus, InstructionTarget};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -51,6 +53,11 @@ pub(crate) struct AppState {
     /// periódico do `world_store` compara com a última revisão salva e só
     /// reescreve o arquivo quando algo mudou de verdade.
     pub(crate) world_revision: AtomicU64,
+    /// Lista de blocos de cada schematic aplicado no editor, por id de
+    /// instrução (`Mine`/`Build`). Fica fora do `Instruction` de propósito: a
+    /// fila é pollada a cada segundo e um schematic inteiro dentro dela
+    /// inflaria o IPC — o card mostra só contagem/centro.
+    pub(crate) schematics: Mutex<HashMap<String, Vec<schematic::SchematicBlock>>>,
 }
 
 /// Ids de instrução são gerados aqui (nunca pelo addon) — só precisam ser
@@ -83,15 +90,19 @@ pub(crate) fn dispatch_next_instruction(state: &AppState) {
         if queue.active().is_some() {
             return;
         }
-        queue.activate_next_queued()
+        // Só instruções com executor (ver `encode_instruction`): as outras
+        // (Mine/Build do editor de schematic) ficam na fila sem bloquear as
+        // que sabem rodar — ver o doc-comment de `activate_next_queued`.
+        queue.activate_next_queued(|instruction| encode_instruction(instruction).is_some())
     };
     let Some(instruction) = next else {
         return;
     };
 
     let Some(line) = encode_instruction(&instruction) else {
-        // Tipo sem executor ainda — devolve pra fila em vez de mentir que
-        // está ativo.
+        // Inalcançável enquanto o predicado acima e `encode_instruction`
+        // andarem juntos, mas devolver pra fila é melhor que mentir `Active`
+        // se um dia saírem de sincronia.
         let mut queue = state.queue.lock().unwrap();
         if let Some(item) = queue.by_id_mut(&instruction.id) {
             item.status = InstructionStatus::Queued;
@@ -143,6 +154,29 @@ pub(crate) struct ConnectionStatus {
     pub(crate) connected: bool,
     /// Preenchido quando `connected` é `true` — endereço do addon Java.
     pub(crate) endpoint: Option<String>,
+}
+
+/// Resposta de `schematic_apply`: só contagens e ids. A lista de blocos em si
+/// fica no `AppState` (`schematics`) — a fila é pollada a cada segundo e
+/// carregar centenas de blocos na resposta inflaria o IPC sem necessidade.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SchematicApplyResult {
+    pub(crate) breaks: usize,
+    pub(crate) builds: usize,
+    pub(crate) instruction_ids: Vec<String>,
+}
+
+/// Centro horizontal (x, z) de um schematic — só pro card da fila mostrar de
+/// onde ele é; o destino real é a lista de blocos.
+fn schematic_center(blocks: &[schematic::SchematicBlock]) -> Option<InstructionTarget> {
+    let min_x = blocks.iter().map(|b| b.x).min()?;
+    let max_x = blocks.iter().map(|b| b.x).max()?;
+    let min_z = blocks.iter().map(|b| b.z).min()?;
+    let max_z = blocks.iter().map(|b| b.z).max()?;
+    Some(InstructionTarget {
+        x: (min_x + max_x) / 2,
+        z: (min_z + max_z) / 2,
+    })
 }
 
 mod commands {
@@ -257,6 +291,68 @@ mod commands {
         state.queue.lock().unwrap().items.clone()
     }
 
+    /// Aplica a camada de edição do editor de schematic: o diff contra o
+    /// `WorldCache` real (feito em `schematic.rs`, não no frontend) vira
+    /// instruções `Mine`/`Build` na fila. Elas ficam `Queued` de verdade —
+    /// o addon ainda não tem executor pra esses tipos (ver "Known gaps"),
+    /// mas o schematic fica guardado em `AppState.schematics` pro dia em que
+    /// tiver. Devolve só as contagens/ids; a lista de blocos não volta.
+    #[tauri::command]
+    fn schematic_apply(
+        state: State<AppState>,
+        edits: Vec<schematic::BlockEdit>,
+    ) -> Result<SchematicApplyResult, String> {
+        let diff = {
+            let world = state.world.lock().unwrap();
+            schematic::diff(&world, &edits)
+        };
+        if diff.is_empty() {
+            return Ok(SchematicApplyResult {
+                breaks: 0,
+                builds: 0,
+                instruction_ids: Vec::new(),
+            });
+        }
+
+        let mut ids = Vec::new();
+        {
+            let mut queue = state.queue.lock().unwrap();
+            for (kind, blocks) in [
+                (InstructionKind::Mine, &diff.break_blocks),
+                (InstructionKind::Build, &diff.build_blocks),
+            ] {
+                if blocks.is_empty() {
+                    continue;
+                }
+                let id = format!("i{}", NEXT_INSTRUCTION_ID.fetch_add(1, Ordering::Relaxed));
+                let label = match kind {
+                    InstructionKind::Mine => format!("Quebrar {} blocos (editor)", blocks.len()),
+                    _ => format!("Construir {} blocos (editor)", blocks.len()),
+                };
+                queue.push(Instruction {
+                    id: id.clone(),
+                    kind,
+                    label,
+                    status: InstructionStatus::Queued,
+                    progress: 0.0,
+                    target: schematic_center(blocks),
+                });
+                state
+                    .schematics
+                    .lock()
+                    .unwrap()
+                    .insert(id.clone(), blocks.clone());
+                ids.push(id);
+            }
+        }
+        dispatch_next_instruction(&state);
+        Ok(SchematicApplyResult {
+            breaks: diff.break_blocks.len(),
+            builds: diff.build_blocks.len(),
+            instruction_ids: ids,
+        })
+    }
+
     #[tauri::command]
     fn storage_totals(state: State<AppState>) -> Vec<ItemTotal> {
         state.storage.lock().unwrap().aggregated_totals()
@@ -291,6 +387,7 @@ mod commands {
             queue_snapshot,
             queue_push,
             queue_cancel,
+            schematic_apply,
             storage_totals,
             vitals_snapshot,
             get_texture_atlas,

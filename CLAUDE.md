@@ -122,21 +122,27 @@ There is no test suite yet.
   the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
   rows.
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
-  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
-  `main.ts` only calls `setChunks()`/`setBotPos()`/`clear()`/`resize()` on it from `refreshState()` and
-  `setMode()`. Chunks are added once and never removed (cumulative "explored" semantics, matching
-  `WorldCache`) as flat plates at their real world position — there is no block data to render yet
-  (see "Known gaps"). This intentionally uses WebGL inside the existing webview instead of a native
-  wgpu surface (which the spec's architecture diagram shows) — an explicit user decision, because
-  embedding wgpu in a separate window synced to the Tauri window is much higher-risk to get right
-  blind. Don't silently redo that tradeoff; if wgpu comes up again, confirm first.
+  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop.
+  Chunks arrive as decoded voxels (`addChunkVoxels`, fed by `main.ts` → `chunk_voxels`), become merged
+  meshes per chunk (face culling between loaded neighbors, one material for opaque terrain + one per
+  fluid bucket, animated fluid frames from the atlas) and are never removed — cumulative "explored"
+  semantics, matching `WorldCache`. It also hosts the **schematic editor**: voxel DDA picking
+  (`pickBlock`, meshes are merged per chunk so a `Raycaster` can't map back to a block), the edit
+  layer (`edits` + `rebuildGhosts`, amber translucent ghost, never mutates `WorldCache`), region
+  selection/hover wire boxes, and `mountTo()` — the viewer and the editor share this one renderer, the
+  canvas is moved to the active view instead of opening a second WebGL context (`main.ts`, `setMode`).
+  This intentionally uses WebGL inside the existing webview instead of a native wgpu surface (which
+  the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in a
+  separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
+  redo that tradeoff; if wgpu comes up again, confirm first.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
   `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, plus `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
   `connection_status`, `world_summary`, `world_chunks`, `chunk_voxels`, `queue_snapshot`,
-  `queue_push`, `queue_cancel`, `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns
+  `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`, `vitals_snapshot`,
+  `get_texture_atlas`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world
@@ -178,7 +184,16 @@ There is no test suite yet.
 - `vitals.rs` — `Vitals`, `ArmorPiece`, `Effect`, and `classify_threat()` per "Combate e ameaças".
 - `time_estimate.rs` — `estimate_mine`, `estimate_travel`, `pick_fill_task` per "Agendamento por
   estimativa de tempo".
-- `instructions.rs` — `Instruction`, `InstructionStatus`, `InstructionQueue`.
+- `instructions.rs` — `Instruction`, `InstructionStatus`, `InstructionQueue`. `activate_next_queued`
+  takes a `can_execute` predicate so instructions without an executor (`Mine`/`Build` from the editor)
+  stay queued **without blocking** the executable ones behind them.
+- **`schematic.rs`** — editor diff (spec: "Como isso vira o editor estilo WorldEdit"): takes the
+  frontend edit layer (`BlockEdit`, `None` = break) and compares it against the real `WorldCache`
+  (`world_cache::block_at`), producing `break_blocks`/`build_blocks` (`SchematicBlock` = position +
+  block, the shape Baritone's `BuilderProcess` consumes). Edits on unknown chunks are ignored. The
+  spec's `blockstate_key` is just the block name for now (blockstates aren't modeled — see "Known
+  gaps"). Has unit tests. `schematic_apply` stores the resulting lists in `AppState.schematics` keyed
+  by instruction id (the queue is polled every second, so it must not carry hundreds of blocks).
 
 **Addon (`mod-addon/`)**
 - `BaritoneOrchestratorAddon.java` — common `@Mod` entry point. Holds `SOCKET_HOST`/`SOCKET_PORT` as
@@ -211,7 +226,13 @@ There is no test suite yet.
 - **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*
   persisted now — one global `world.cache` per app, so switching between servers/worlds mixes their
   chunks in the same cache; there's no per-world separation yet.)
-- **Schematic editor is a placeholder panel**, not an implementation.
+- **The schematic editor's blockstate/litematic/executor gaps.** The base editor works (visual
+  palette from the atlas textures, region selection, place/break with an amber ghost layer, diff →
+  queued instruction), but: every block renders as a full cube (no stair/log-axis/slab states, so no
+  variant inspector and `blockstate_key` degrades to the block name), `.litematic` import isn't
+  implemented, the palette derives block names from atlas texture names instead of a real block
+  registry (`minecraft-data` ingestion still pending), and the addon has **no `Mine`/`Build`
+  executor**, so applied schematics sit `Queued` in the queue.
 
 ## 8. Language and comment rules
 
