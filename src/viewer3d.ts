@@ -855,8 +855,14 @@ export class Viewer3D {
         // imagem (igual ao canvas), e é assim que o mapa é montado aqui.
         texture.flipY = false;
         texture.magFilter = THREE.NearestFilter;
-        texture.minFilter = THREE.NearestFilter;
-        texture.generateMipmaps = false;
+        // Mipmaps com folga no atlas (ver `texture_atlas.rs`): sem mipmap,
+        // cada bloco distante amostra um texel diferente do vizinho e o
+        // terreno ganha uma grade/"separação" visível de longe; com ele, as
+        // faces convergem pro mesmo tom médio. `NearestMipmapLinear` mantém o
+        // pixel nítido de perto e só mistura entre níveis na minificação.
+        texture.minFilter = THREE.NearestMipmapLinearFilter;
+        texture.generateMipmaps = true;
+        texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
         texture.colorSpace = THREE.SRGBColorSpace;
         texture.needsUpdate = true;
 
@@ -910,8 +916,11 @@ export class Viewer3D {
     // é como a tabela de UVs das faces foi montada.
     texture.flipY = false;
     texture.magFilter = THREE.NearestFilter;
-    texture.minFilter = THREE.NearestFilter;
-    texture.generateMipmaps = false;
+    // Tile avulso (frames de fluido): pode ter mipmap sem risco de folga —
+    // não há tile vizinho pra vazar.
+    texture.minFilter = THREE.NearestMipmapLinearFilter;
+    texture.generateMipmaps = true;
+    texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
     texture.colorSpace = THREE.SRGBColorSpace;
     return texture;
   }
