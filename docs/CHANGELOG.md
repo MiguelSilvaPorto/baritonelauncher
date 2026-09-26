@@ -10,6 +10,19 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ## [Não lançado]
 
+### Added
+
+- **Aba "Config" com preferências reais, salvas em disco**: quinta view na rail (engrenagem) pra
+  ajustar o **viewer 3D** e o **comportamento do app**, sem mudar nada até o usuário mexer — os
+  padrões são exatamente as constantes que o app já usava. No viewer: distância do horizonte (fog),
+  orçamento de montagem de malha por frame, teto de pixel ratio (1× / 1,5× / 2×, útil em tela HiDPI) e
+  teto de FPS (sem limite por padrão). No comportamento: intervalos do polling de estado e de pose
+  (padrão 1 s / 250 ms, as cadências do addon) e quantos chunks o viewer pede por atualização (16). O
+  backend é a fonte da verdade: as preferências ficam em `settings.json` no diretório de dados do app
+  (JSON pequeno e legível, gravado de forma atômica), valores fora da faixa são presos no backend e a
+  UI mostra o valor **efetivo**, e "Restaurar padrões" volta tudo pro comportamento original. Pedido
+  pelo usuário ("quero que vc adicione um configuração no meu app").
+
 ### Fixed
 
 - **"Separação"/grade visível entre os blocos de longe**: o atlas não tinha folga entre os tiles nem

@@ -82,6 +82,9 @@ const MOVE_KEYS = new Set([
 // usuário se afastava.
 const FOG_NEAR_BASE = 60;
 const FOG_FAR_BASE = 260;
+/** Início do fog como fração do fim — a aba Config expõe só a distância do
+ * horizonte (`fog_far`), e o início acompanha nessa proporção. */
+const FOG_NEAR_RATIO = FOG_NEAR_BASE / FOG_FAR_BASE;
 
 // Perseguição do jogador: a pose real chega 4x/s (ver `addon_socket.rs`), e
 // estes valores são o que evita o modelo "piscar" de posição em posição — o
@@ -177,9 +180,10 @@ export const CHUNKS_PER_REFRESH = 16;
  * persistido (que cresce sem limite). */
 export const NEARBY_CHUNK_LIMIT = 1024;
 
-/** Orçamento de CPU por frame pra montar malhas de chunk, em ms. Um backfill
- * pode enfileirar centenas de chunks; montar todos de uma vez derruba o fps,
- * então a fila é drenada em pedaços por frame. */
+/** Orçamento de CPU por frame pra montar malhas de chunk, em ms — padrão do
+ * app; a aba Config pode mudar (`applySettings`). Um backfill pode enfileirar
+ * centenas de chunks; montar todos de uma vez derruba o fps, então a fila é
+ * drenada em pedaços por frame. */
 const MESH_BUDGET_MS = 8;
 
 export interface BotPos {
@@ -218,6 +222,20 @@ export interface BlockPos {
 /** Ferramenta ativa do editor de schematic. `null` = viewer puro (clique não
  * edita nada). */
 export type EditMode = "select" | "place" | "break";
+
+/** Preferências do viewer vindas da aba Config (comando `settings_get`, ver
+ * `src-tauri/src/settings.rs`). O backend já prende os valores na faixa
+ * válida — o viewer só aplica o que chegou. */
+export interface ViewerSettings {
+  /** Distância (blocos) em que o fog fecha o horizonte. */
+  fogFar: number;
+  /** Orçamento por frame (ms) pra montar malhas de chunk. */
+  meshBudgetMs: number;
+  /** Teto do device pixel ratio do canvas. */
+  maxPixelRatio: number;
+  /** Teto de FPS — 0 = sem limite (vsync). */
+  fpsCap: number;
+}
 
 /** Uma edição da camada de pintura: `block = null` = quebrar (vira ar). O
  * frontend manda isso inteiro em `schematic_apply` e o diff real acontece no
@@ -445,6 +463,15 @@ export class Viewer3D {
   private controls: OrbitControls;
   private container: HTMLElement;
   private fog: THREE.Fog;
+
+  // Preferências da aba Config (ver `applySettings`). Os valores iniciais são
+  // os padrões do backend (`src-tauri/src/settings.rs`); `main.ts` substitui
+  // assim que o `settings_get` responde.
+  private fogFar = FOG_FAR_BASE;
+  private meshBudgetMs = MESH_BUDGET_MS;
+  private maxPixelRatio = 2;
+  private fpsCap = 0;
+  private lastRenderMs = 0;
 
   /** Chunks decodificados (voxels crus), chave = `chunkKey`. */
   private chunks = new Map<number, DecodedChunk>();
@@ -1325,7 +1352,7 @@ export class Viewer3D {
     this.chunkMeshes.set(key, meshes);
   }
 
-  /** Monta no máximo `MESH_BUDGET_MS` de malhas por frame. Um backfill (ou o
+  /** Monta no máximo `meshBudgetMs` de malhas por frame. Um backfill (ou o
    * mundo persistido abrindo) enfileira centenas de chunks de uma vez;
    * montar tudo num tick só derrubava o fps, então a fila anda em pedaços —
    * o resto aparece nos frames seguintes, começando pelos mais próximos do
@@ -1339,7 +1366,7 @@ export class Viewer3D {
       this.queuedChunks.delete(key);
       const chunk = this.chunks.get(key);
       if (chunk && this.atlasUvByName) this.buildChunkMesh(chunk);
-    } while (this.meshQueue.length > 0 && performance.now() - start < MESH_BUDGET_MS);
+    } while (this.meshQueue.length > 0 && performance.now() - start < this.meshBudgetMs);
   }
 
   private disposeChunkMeshes(key: number) {
@@ -1641,11 +1668,12 @@ export class Viewer3D {
 
   /** O fog acompanha a distância câmera→alvo: mantém o gradiente de
    * profundidade no enquadramento normal, mas não deixa o terreno distante
-   * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). */
+   * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). O piso
+   * das duas pontas é a preferência da aba Config (`fogFar`). */
   private updateFog() {
     const distance = this.camera.position.distanceTo(this.controls.target);
-    this.fog.near = Math.max(FOG_NEAR_BASE, distance * 0.85);
-    this.fog.far = Math.max(FOG_FAR_BASE, distance * 3);
+    this.fog.near = Math.max(this.fogFar * FOG_NEAR_RATIO, distance * 0.85);
+    this.fog.far = Math.max(this.fogFar, distance * 3);
   }
 
   /** Troca o frame das texturas animadas de fluido (água/lava). */
@@ -2075,6 +2103,19 @@ export class Viewer3D {
     this.atlasUnavailable = false;
   }
 
+  /** Aplica as preferências da aba Config (`settings_get`): fog, orçamento de
+   * malha por frame, teto de pixel ratio e teto de FPS. Os valores já chegam
+   * presos na faixa pelo backend (`settings.rs`) — aqui é só aplicar no
+   * renderer. */
+  applySettings(settings: ViewerSettings) {
+    this.fogFar = settings.fogFar;
+    this.meshBudgetMs = settings.meshBudgetMs;
+    this.maxPixelRatio = settings.maxPixelRatio;
+    this.fpsCap = settings.fpsCap;
+    this.updateFog();
+    this.resize(); // o teto de pixel ratio mudou
+  }
+
   resize() {
     const width = this.container.clientWidth;
     const height = this.container.clientHeight;
@@ -2095,14 +2136,19 @@ export class Viewer3D {
     // tamanho certo — foi exatamente o bug relatado ("visualização
     // erradíssima", rótulo de coordenada em lugar diferente do marcador).
     this.renderer.setSize(width, height, false);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.maxPixelRatio));
   }
 
   private animate = () => {
     requestAnimationFrame(this.animate);
+    const now = performance.now();
+    // Teto de FPS da aba Config: um viewer parado não precisa queimar GPU a
+    // 144 fps. `- 1` de tolerância pra um rAF que oscila décimos de ms não
+    // pular dois frames seguidos (60 caindo pra 30 por jitter do timer).
+    if (this.fpsCap > 0 && now - this.lastRenderMs < 1000 / this.fpsCap - 1) return;
+    this.lastRenderMs = now;
     // Delta-time com teto de 100ms: se a janela ficar em segundo plano (o
     // rAF pausa) e voltar, o primeiro frame não pode dar um salto gigante.
-    const now = performance.now();
     const dt = Math.min((now - this.lastFrameMs) / 1000, 0.1);
     this.lastFrameMs = now;
 
