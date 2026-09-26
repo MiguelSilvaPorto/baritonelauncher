@@ -27,6 +27,27 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   meshing usa cache de UV/tint por (bloco, face), UVs de fluido pré-rotacionadas e acesso local ao
   chunk sendo montado, e as meshes estáticas não recalculam matriz por frame
   (`matrixAutoUpdate = false`). Reportado pelo usuário ("melhore a perfomance das chunks").
+- **Folhas, plantas e tochas saíam com o fundo preto**: o material do terreno não tinha `alphaTest`,
+  então o canal alpha das texturas "cutout" do jogo era ignorado e os pixels vazios viravam quadrados
+  opacos pretos — visível nas copas das árvores, que ficavam escuras por dentro. `alphaTest: 0.5` no
+  material opaco faz o recorte como no jogo.
+- **Sem o client jar, o viewer ficava em branco e tentava extrair o atlas pra sempre**: a falha do
+  `get_texture_atlas` era só logada, e como `hasAtlas()` continuava `false`, o app repetia a extração
+  a cada segundo (relendo o jar inteiro) sem nunca desenhar nada. Agora falha real marca o atlas como
+  indisponível: o mundo é desenhado em modo degradado, com cor sólida por bloco em vez de textura, e a
+  tentativa para — numa reconexão o app tenta de novo (caso a versão do jogo tenha sido instalada
+  nesse meio tempo).
+- **Blocos sem textura própria viravam `dirt`**: escada, laje, muro, cerca, porta, tapete e afins não
+  têm textura com o nome do bloco, e caíam todos na textura de terra; blocos de mod idem. Agora o
+  viewer tira o sufixo do modelo (`oak_stairs` → `oak_planks`, `stone_brick_wall` → `stone_brick`) e,
+  quando ainda não acha textura, usa um tile branco neutro do atlas tingido de cinza — nunca a textura
+  de outro bloco.
+- **"Ir para" com campo vazio mandava o bot pra (0, 0)**: `Number("")` é `0`, então campo vazio
+  passava pela validação e enfileirava uma viagem pra coordenada zero. Campo vazio agora só foca o
+  input e não enfileira nada.
+- **Resposta de chunk atrasada repovoava o viewer desconectado**: a fila de chunks em voo não era
+  limpa no `clear()`, então um `chunk_voxels` que chegasse depois do disconnect podia voltar a
+  desenhar bloco. Agora a limpeza acompanha o `clear()`.
 - **Mensagem de protocolo desconhecido era descartada em silêncio**: quando o app recebe uma mensagem
   que o `AddonMessage` não conhece (ex: um jar do addon antigo ainda mandando `chunk_surface`, do
   protocolo antigo), ela era simplesmente ignorada — sem nenhum aviso, o viewer ficava vazio sem
@@ -142,6 +163,16 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Mundo de verdade no viewer — cada chunk vem inteiro, não mais uma placa lisa**: quando o cliente
+  carrega um chunk, o addon serializa todas as seções 16×16×16 não-vazias (paleta de blocos com o
+  level de fluido + 4096 índices por seção, a mesma divisão e a mesma ordem do `PalettedContainer` do
+  jogo), comprime com zlib e manda como `chunk_voxels` (base64, 2 chunks por tick). O Rust decodifica
+  pro `WorldCache` e entrega os bytes crus ao viewer, que monta malhas por bucket de material com face
+  culling real (inclusive contra chunks vizinhos já carregados). Água e lava são fluidos de verdade —
+  altura pelo level, transparência da água, textura animada com todos os frames e rotação pela direção
+  da correnteza — em vez de cubo sólido, e relevo, cavernas e minérios aparecem como no jogo. Tudo no
+  mesmo socket local e no mesmo cache de mundo salvo em disco, então o mundo já explorado abre
+  texturizado mesmo sem o jogo aberto.
 - **Mundo explorado salvo em disco — o viewer abre sem o jogo aberto**: o cache era só em memória,
   então fechar o app apagava tudo que já tinha sido carregado e o viewer só mostrava algo com o addon
   conectado de novo. Agora o `WorldCache` é gravado em `world.cache`, no diretório de dados do app
