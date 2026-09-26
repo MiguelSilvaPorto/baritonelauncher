@@ -16,10 +16,12 @@
 //! verdade em vez de mostrar um fotograma congelado. Frames de 32×32
 //! (`water_flow`, `lava_flow`) são reduzidos pra 16×16 — o atlas é uniforme
 //! 16×16; texturas estáticas de outro tamanho (ex: 32×32 de placa) continuam
-//! puladas.
+//! puladas. Um tile branco sintético (`__white`) entra no fim do atlas como
+//! fallback tingível pra bloco sem textura resolvida — o viewer pinta o bloco
+//! com cor sólida por cima dele em vez de fingir que é outro bloco.
 
 use base64::Engine;
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -30,7 +32,11 @@ const TILE_SIZE: u32 = 16;
 /// Sobe isto sempre que a extração/empacotamento mudar de formato: o cache
 /// em disco é reaproveitado sem checar conteúdo (`build_or_load_atlas`),
 /// então sem a versão no nome um atlas antigo continuaria valendo pra sempre.
-const ATLAS_CACHE_VERSION: u32 = 3;
+const ATLAS_CACHE_VERSION: u32 = 4;
+
+/// Nome do tile sintético (não existe no jar) usado como fallback de textura
+/// — o viewer pinta o bloco só com vertex color por cima dele.
+pub const WHITE_TILE_NAME: &str = "__white";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UvRect {
@@ -157,6 +163,14 @@ fn build_atlas(jar_path: &Path, mc_version: &str) -> Result<TextureAtlas, String
             raw.push((format!("{stem}_f{frame}"), tile.to_rgba8()));
         }
     }
+
+    // Fallback tingível pra bloco cujo nome não resolve pra textura nenhuma
+    // (mod, nome com variante...): branco puro pra multiplicar só a cor do
+    // vértice. Sem ele, o viewer teria que usar a textura de outro bloco.
+    raw.push((
+        WHITE_TILE_NAME.to_string(),
+        RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, Rgba([255, 255, 255, 255])),
+    ));
     raw.sort_by(|a, b| a.0.cmp(&b.0)); // saída determinística, cache estável
 
     if raw.is_empty() {
@@ -263,6 +277,10 @@ mod tests {
         assert!(
             atlas.textures.contains_key("water_flow_f0"),
             "frame de textura 32×32 (water_flow) deveria ser reduzido e entrar no atlas"
+        );
+        assert!(
+            atlas.textures.contains_key(WHITE_TILE_NAME),
+            "tile sintético de fallback deveria entrar no atlas"
         );
 
         // limpa o cache de teste pra não sujar o diretório real

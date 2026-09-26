@@ -174,10 +174,18 @@ function bootstrapQueueComposers() {
     const zInput = composer.querySelector<HTMLInputElement>('input[name="z"]');
 
     composer.querySelector('[data-queue-action="travel"]')?.addEventListener("click", () => {
-      const x = Number(xInput?.value);
-      const z = Number(zInput?.value);
-      if (!Number.isFinite(x) || !Number.isFinite(z)) {
-        (Number.isFinite(x) ? zInput : xInput)?.focus();
+      // Campo vazio não é zero: `Number("")` é 0 e passaria pelo
+      // `Number.isFinite`, enfileirando "ir para (0, 0)" sem o usuário pedir.
+      const xRaw = xInput?.value.trim() ?? "";
+      const zRaw = zInput?.value.trim() ?? "";
+      const x = Number(xRaw);
+      const z = Number(zRaw);
+      if (xRaw === "" || !Number.isFinite(x)) {
+        xInput?.focus();
+        return;
+      }
+      if (zRaw === "" || !Number.isFinite(z)) {
+        zInput?.focus();
         return;
       }
       invoke<Instruction[]>("queue_push", { kind: "TravelTo", target: { x: Math.round(x), z: Math.round(z) } })
@@ -257,6 +265,9 @@ function renderViewer(status: ConnectionStatus, world: WorldSummary) {
     empty.classList.remove("hidden");
     endpoint.textContent = "socket: aguardando o addon Java";
     viewer3d?.clear();
+    // Sem isso, uma resposta de `chunk_voxels` em voo pousa depois do
+    // `clear()` e repovoa um viewer desconectado.
+    pendingChunks.clear();
     return;
   }
 
@@ -575,16 +586,17 @@ async function refreshState() {
   if (viewer3d) {
     // Atlas: não depende mais do jogo estar aberto — a versão do MC fica no
     // cache em disco (ver `world_store.rs`), então o mundo persistido abre
-    // texturizado. Sem versão conhecida (nunca conectou), o comando falha e
-    // a tentativa se repete no próximo refresh.
-    if (
-      !viewer3d.hasAtlas() &&
-      !viewer3d.isLoadingAtlas &&
-      (status.connected || world.chunks_explored > 0)
-    ) {
+    // texturizado. Só tenta quando já existe versão conhecida (conectado ou
+    // com cache); falha aqui é falha de verdade (jar ausente/extração
+    // quebrada), então o viewer assume o modo degradado em vez de tentar de
+    // novo a cada segundo.
+    if (viewer3d.needsAtlas() && (status.connected || world.chunks_explored > 0)) {
       invoke<TextureAtlas>("get_texture_atlas")
         .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
-        .catch((err) => console.warn("[atlas] ainda indisponível:", err));
+        .catch((err) => {
+          console.error("[atlas] falha ao carregar o atlas:", err);
+          viewer3d?.setAtlasUnavailable();
+        });
     }
     // Sem o jogo aberto o `bot_pos` do Rust volta a ser `None` — esconde o
     // modelo aqui (o polling de `bot_pose` faria o mesmo em 250ms, mas isso
