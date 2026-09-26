@@ -19,7 +19,8 @@ arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mud
 > dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
 > chunks explorados e o **jogador com o modelo e a skin reais do jogo** em coordenadas reais) e a
 > **fila executando `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) estão
-> implementados e testados manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não
+> implementados e testados manualmente, além de uma **aba Config** com preferências reais salvas em
+> disco (viewer 3D e cadência do polling). Baús e instruções de `#build`/`#mine`/craft ainda não
 > existem — ver "O que falta" abaixo.
 
 ## Arquitetura
@@ -104,8 +105,9 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 - `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `viewer3d.ts` (o renderer 3D,
   Three.js/WebGL) + `styles.css`.
 - `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon),
-  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada) e
-  `world_store.rs` (grava/carrega o mundo explorado em disco).
+  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada),
+  `world_store.rs` (grava/carrega o mundo explorado em disco) e `settings.rs` (preferências da aba
+  Config, em `settings.json` no diretório de dados do app).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.
