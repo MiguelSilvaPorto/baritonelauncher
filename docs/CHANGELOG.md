@@ -12,6 +12,13 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Textura borrada — 1 tile esticado sobre o chunk inteiro em vez de 1 por bloco**: cada chunk é 16×16
+  *blocos*, mas o UV mapeava o plano inteiro pra um único tile de 16×16 *pixels* do atlas — esticando
+  uma textura de bloco 256x maior que deveria, virando borrão. Trocado por `buildTileTexture`: recorta
+  só o tile do bloco representante (`dirt`) do atlas numa textura própria de 16×16px com
+  `RepeatWrapping` + `repeat=(16,16)` e filtro nearest — agora repete uma vez por bloco de verdade
+  dentro do chunk, nítido, igual o jogo. Reportado pelo usuário ("1 textura por chunk não por pixel...
+  está tudo borrado").
 - **Canvas 3D ficava visualmente pequeno/distorcido, rótulo de coordenada em lugar errado**:
   `renderer.setSize(w, h)` do Three.js escreve `width`/`height` inline no `style` do próprio elemento
   `<canvas>`, em pixels — isso sobrescreve o CSS que faz o canvas preencher o container

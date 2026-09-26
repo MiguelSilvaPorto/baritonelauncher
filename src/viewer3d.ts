@@ -18,6 +18,7 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
  */
 
 const CHUNK_SIZE = 16;
+const BLOCK_TEXTURE_PX = 16; // resolução nativa das texturas de bloco do Minecraft
 const COLOR_BG = 0x0a0c0f;
 const COLOR_CHUNK = 0x14181d;
 const COLOR_CHUNK_EDGE = 0x262c34;
@@ -70,9 +71,12 @@ export class Viewer3D {
 
   private labelEl: HTMLDivElement;
 
-  private atlasTexture: THREE.Texture | null = null;
-  private atlasUvByName: Record<string, UvRect> | null = null;
   private atlasLoading = false;
+  /** Textura recortada de um único bloco (16×16px), com `RepeatWrapping` —
+   * diferente de mapear um pedaço do atlas esticado sobre o chunk inteiro
+   * (que dava um borrão gigante, 1 tile de 16px esticado sobre 16 *blocos*).
+   * Ver `buildTileTexture`. */
+  private placeholderTexture: THREE.Texture | null = null;
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement) {
     this.container = container;
@@ -128,7 +132,7 @@ export class Viewer3D {
   }
 
   hasAtlas(): boolean {
-    return this.atlasTexture !== null;
+    return this.placeholderTexture !== null;
   }
 
   get isLoadingAtlas(): boolean {
@@ -148,17 +152,14 @@ export class Viewer3D {
     this.atlasLoading = true;
     new THREE.TextureLoader().load(
       dataUrl,
-      (texture) => {
-        // Pixel art do Minecraft: sem suavização, sem mipmap borrando os tiles.
-        texture.magFilter = THREE.NearestFilter;
-        texture.minFilter = THREE.NearestFilter;
-        texture.generateMipmaps = false;
-        texture.colorSpace = THREE.SRGBColorSpace;
-        // As UVs são calculadas em espaço de pixel da imagem (v0 = topo),
-        // então desliga o flip automático do Three pra não inverter de novo.
-        texture.flipY = false;
-        this.atlasTexture = texture;
-        this.atlasUvByName = textures;
+      (atlasImageTexture) => {
+        const rect = textures[PLACEHOLDER_TEXTURE];
+        if (!rect) {
+          console.error(`[viewer3d] textura "${PLACEHOLDER_TEXTURE}" não veio no atlas`);
+          this.atlasLoading = false;
+          return;
+        }
+        this.placeholderTexture = this.buildTileTexture(atlasImageTexture.image, rect);
         this.atlasLoading = false;
 
         for (const group of this.chunkMeshes.values()) this.addTopTexture(group);
@@ -171,30 +172,54 @@ export class Viewer3D {
     );
   }
 
+  /** Recorta um único tile (ex: "dirt", 16×16px) do atlas e devolve uma
+   * textura própria com `RepeatWrapping` — o plano do chunk usa UV padrão
+   * (0..1) e `repeat = (16, 16)`, então essa textura de 16px se repete uma
+   * vez por *bloco* dentro do chunk de 16 blocos, igual o jogo de verdade,
+   * em vez de um único tile esticado (borrado) sobre o chunk inteiro. */
+  private buildTileTexture(sourceImage: HTMLImageElement, rect: UvRect): THREE.Texture {
+    const canvas = document.createElement("canvas");
+    canvas.width = BLOCK_TEXTURE_PX;
+    canvas.height = BLOCK_TEXTURE_PX;
+    const ctx = canvas.getContext("2d")!;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      sourceImage,
+      rect.u0 * sourceImage.width,
+      rect.v0 * sourceImage.height,
+      (rect.u1 - rect.u0) * sourceImage.width,
+      (rect.v1 - rect.v0) * sourceImage.height,
+      0,
+      0,
+      BLOCK_TEXTURE_PX,
+      BLOCK_TEXTURE_PX
+    );
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(CHUNK_SIZE, CHUNK_SIZE);
+    texture.magFilter = THREE.NearestFilter;
+    texture.minFilter = THREE.NearestFilter;
+    texture.generateMipmaps = false;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  }
+
   /** Adiciona (ou reaproveita, se já existir) o plano texturizado no topo da
-   * placa. Não faz nada se o atlas ainda não carregou. */
+   * placa. Não faz nada se a textura ainda não carregou. */
   private addTopTexture(group: THREE.Group) {
-    if (group.userData.textured || !this.atlasTexture) return;
-    const rect = this.atlasUvByName?.[PLACEHOLDER_TEXTURE];
-    if (!rect) return;
+    if (group.userData.textured || !this.placeholderTexture) return;
 
     const top = new THREE.PlaneGeometry(CHUNK_SIZE - 0.5, CHUNK_SIZE - 0.5);
     top.rotateX(-Math.PI / 2);
-    this.remapUv(top, rect);
-    const topMesh = new THREE.Mesh(top, new THREE.MeshStandardMaterial({ map: this.atlasTexture, roughness: 0.95 }));
+    const topMesh = new THREE.Mesh(
+      top,
+      new THREE.MeshStandardMaterial({ map: this.placeholderTexture, roughness: 0.95 })
+    );
     topMesh.position.y = 0.21; // logo acima da placa, evita z-fighting
     group.add(topMesh);
     group.userData.textured = true;
-  }
-
-  private remapUv(geometry: THREE.PlaneGeometry, rect: UvRect) {
-    const uv = geometry.attributes.uv;
-    for (let i = 0; i < uv.count; i++) {
-      const u = uv.getX(i);
-      const v = uv.getY(i);
-      uv.setXY(i, rect.u0 + u * (rect.u1 - rect.u0), rect.v0 + v * (rect.v1 - rect.v0));
-    }
-    uv.needsUpdate = true;
   }
 
   /** Chunks só são adicionados, nunca removidos — ver doc-comment do módulo
