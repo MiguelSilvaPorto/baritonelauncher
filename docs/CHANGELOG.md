@@ -163,6 +163,12 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Céu no viewer 3D**: o fundo era uma cor chapada quase preta, então o horizonte e a profundidade do
+  terreno sumiam — com o zoom afastado o mundo parecia flutuar no vazio. Agora há um domo de céu com
+  gradiente (zênite azul → horizonte claro) numa textura de canvas, sempre centrado na câmera, e o
+  *fog* passou a usar a cor do horizonte: o terreno distante se dissolve no céu em vez de virar um
+  borrão escuro. É um céu fixo de dia claro — o addon ainda não manda a hora do mundo, então ele não
+  cicla com o dia/noite do jogo (ver "Known gaps").
 - **Editor de schematic (estilo WorldEdit): pintar, quebrar e selecionar região** — o modo Editor
   agora usa o mesmo renderer do viewer (o canvas é movido pra view ativa, sem abrir um segundo
   contexto WebGL) com: paleta lateral **visual** (busca + categorias, cada bloco com o ícone real
