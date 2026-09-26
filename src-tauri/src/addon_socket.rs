@@ -37,6 +37,7 @@ use crate::AppState;
 use base64::Engine;
 use flate2::read::ZlibDecoder;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Manager};
@@ -181,9 +182,52 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
 
     let mut lines = BufReader::new(read_half).lines();
 
+    // Mensagens que o app não reconheceu nesta conexão, agrupadas pelo
+    // `"type"` do JSON. Sem isso, um addon desatualizado (ex: ainda mandando o
+    // protocolo antigo, `chunk_surface`) some em silêncio e o viewer fica
+    // vazio sem nenhum erro visível — foi exatamente o que aconteceu quando o
+    // jar do addon não foi rebuildado junto com o app. `logged` limita o aviso
+    // à primeira ocorrência de cada tipo, pra um addon velho não inundar o
+    // log (ele manda uma mensagem por chunk carregado).
+    let mut ignored: HashMap<String, u32> = HashMap::new();
+    let mut logged: HashSet<String> = HashSet::new();
+    let mut invalid_lines: u32 = 0;
+
     while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(message) = serde_json::from_str::<AddonMessage>(&line) else {
-            continue;
+        let message = match serde_json::from_str::<AddonMessage>(&line) {
+            Ok(message) => message,
+            Err(err) => {
+                // O `"type"` só é extraído no caminho de falha (o fluxo normal
+                // não paga uma segunda desserialização) — é ele que diz *qual*
+                // mensagem foi ignorada.
+                let kind = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(|kind| kind.as_str())
+                            .map(str::to_string)
+                    });
+                match kind {
+                    Some(kind) => {
+                        *ignored.entry(kind.clone()).or_insert(0) += 1;
+                        if logged.insert(kind.clone()) {
+                            eprintln!(
+                                "[addon_socket] mensagem ignorada (type \"{kind}\"): {err} — \
+                                 confira se o jar do addon foi buildado junto com o app (o \
+                                 protocolo muda dos dois lados)"
+                            );
+                        }
+                    }
+                    None => {
+                        invalid_lines += 1;
+                        if invalid_lines == 1 {
+                            eprintln!("[addon_socket] linha sem JSON/type ignorada: {err}");
+                        }
+                    }
+                }
+                continue;
+            }
         };
 
         match message {
@@ -261,6 +305,22 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 }
             }
         }
+    }
+
+    // Fim da conexão: fecha o resumo do que foi ignorado — um addon velho
+    // pode mandar centenas de mensagens, e o aviso por tipo só aparece uma vez.
+    if !ignored.is_empty() {
+        let mut kinds: Vec<(String, u32)> = ignored.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.cmp(&a.1));
+        let summary = kinds
+            .iter()
+            .map(|(kind, count)| format!("{kind} × {count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("[addon_socket] mensagens ignoradas nesta conexão: {summary}");
+    }
+    if invalid_lines > 0 {
+        eprintln!("[addon_socket] {invalid_lines} linha(s) sem JSON/type ignorada(s) nesta conexão");
     }
 
     writer.abort();
