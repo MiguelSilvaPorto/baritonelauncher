@@ -10,34 +10,6 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ## [Não lançado]
 
-### Added
-
-- **Cores de bioma reais no viewer — fim do verde único**: o addon agora manda, junto de cada chunk, as
-  cores de bioma **por coluna** (grama, folhagem e água), resolvidas pelo `BiomeColors` do próprio
-  client — o mesmo colormap de temperatura/umidade, override de bioma e modificador de
-  pântano/floresta escura que o jogo aplica ao renderizar. O viewer usa essa cor por bloco: topo do
-  `grass_block`, folhas (carvalho, jungle, acácia, dark oak, mangrove), videira, lírio-d'água,
-  cana-de-açúcar e água (que agora é tingida por vértice, não por material único). Cada bioma passa a
-  ter a cor que tem no jogo — savana amarelada, pântano escuro com água marrom, taiga azulada,
-  badlands alaranjado etc. — em vez de um "verde floresta" fixo. O payload binário dos chunks sobe
-  pro formato 3 (bloco de tints no fim; o `world.cache` gravado antes continua abrindo, só sem tints,
-  caindo nas cores fixas aproximadas) e **o jar do addon precisa ser rebuildado** — com o jar antigo o
-  app avisa no console e mantém o comportamento antigo.
-- **Lado do bloco de grama com a camada de overlay do jogo**: o lado do `grass_block` só tinha a
-  textura base (terra + franja fixa, que não muda de bioma); o modelo vanilla desenha uma segunda
-  camada cinza (`grass_block_side_overlay`) por cima, tingida com a cor de grama do bioma. Agora o
-  viewer desenha essa camada também, então o lado da grama acompanha o bioma tanto quanto o topo.
-- **Aba "Config" com preferências reais, salvas em disco**: quinta view na rail (engrenagem) pra
-  ajustar o **viewer 3D** e o **comportamento do app**, sem mudar nada até o usuário mexer — os
-  padrões são exatamente as constantes que o app já usava. No viewer: distância do horizonte (fog),
-  orçamento de montagem de malha por frame, teto de pixel ratio (1× / 1,5× / 2×, útil em tela HiDPI) e
-  teto de FPS (sem limite por padrão). No comportamento: intervalos do polling de estado e de pose
-  (padrão 1 s / 250 ms, as cadências do addon) e quantos chunks o viewer pede por atualização (16). O
-  backend é a fonte da verdade: as preferências ficam em `settings.json` no diretório de dados do app
-  (JSON pequeno e legível, gravado de forma atômica), valores fora da faixa são presos no backend e a
-  UI mostra o valor **efetivo**, e "Restaurar padrões" volta tudo pro comportamento original. Pedido
-  pelo usuário ("quero que vc adicione um configuração no meu app").
-
 ### Fixed
 
 - **Conexão do addon caindo no meio do tick derrubava o jogo com `NullPointerException`**: quando um
@@ -136,23 +108,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   nome (`atlas_v3_...`), senão o atlas antigo (sem essas texturas) continuaria sendo reaproveitado
   pra sempre.
 - **Viewer travado a 2–5 fps depois do material por face**: cada bloco era um `Mesh` próprio e, com
-  um material por face, cada um passou a custar 6 draw calls (um por grupo do `BoxGeometry`) — com
-  milhares de blocos explorados, isso virava dezenas de milhares de draw calls por frame. Agora os
-  blocos são renderizados **instanciados**: um `InstancedMesh` por tipo de bloco, com capacidade que
-  dobra quando enche (copia as matrizes pra um lote maior, amortizado). O custo por frame caiu de
-  "6 × blocos" para "6 × tipos de bloco" (algumas dezenas), independente do tamanho do mundo — sem
-  mudar nada do visual (mesma textura por face, mesmo tint). De quebra, o dedupe de colunas do polling
-  deixou de alocar uma string por coluna por segundo (chave numérica). Reportado pelo usuário ("o
-  renderizador está estremamente travado 2fps a 5").
+  um material por face, cada um custava 6 draw calls (um por grupo do `BoxGeometry`) — com milhares
+  de blocos explorados, isso virava dezenas de milhares de draw calls por frame. Agora a geometria
+  visível de cada chunk é **juntada numa malha por bucket de material** (terreno opaco + um por
+  fluido, com face culling), então o custo por frame passa a depender dos chunks/buckets desenhados,
+  não do número de blocos — sem mudar nada do visual (mesma textura por face, mesmo tint). De quebra,
+  o dedupe de colunas do polling deixou de alocar uma string por coluna por segundo (chave numérica).
+  Reportado pelo usuário ("o renderizador está extremamente travado 2fps a 5").
 - **Faces laterais dos blocos usavam a textura de topo**: cada cubo recebia um único material nas 6
   faces, então o degrau de um bloco de grama mostrava a face lateral toda verde (textura
-  `grass_block_top`) em vez de terra com a franja verde no topo, como no jogo. Agora o `BoxGeometry`
-  usa um material por face, na ordem dos grupos do próprio Three.js: `"{bloco}_top"` em cima,
-  `"{bloco}_side"` nos 4 lados (ex: `grass_block_side`, que já vem com a franja verde impressa sobre
-  a terra) e `"{bloco}_bottom"` embaixo — com `dirt` no fundo de `grass_block`/`mycelium`/`podzol`,
-  como no modelo vanilla. Blocos sem variantes (`stone`, `dirt`...) continuam com a mesma textura nos 6
-  lados. Reportado pelo usuário ("arrume as texturas... normalmente as texturas renderizadas escolhem
-  um lado só e aplica para os 4 lados").
+  `grass_block_top`) em vez de terra com a franja verde no topo, como no jogo. Agora cada face
+  escolhe a textura certa **no atlas do jar**: `"{bloco}_top"` em cima, `"{bloco}_side"` nos 4 lados
+  (ex: `grass_block_side`, que já vem com a franja verde impressa sobre a terra) e `"{bloco}_bottom"`
+  embaixo — com `dirt` no fundo de `grass_block`/`mycelium`/`podzol`, como no modelo vanilla. Blocos
+  sem variantes (`stone`, `dirt`...) usam a mesma textura nas 6 faces. Reportado pelo usuário ("arrume
+  as texturas... normalmente as texturas renderizadas escolhem um lado só e aplica para os 4 lados").
 - **Vão/grade preta entre os blocos do terreno**: cada bloco do viewer era um cubo de `0.98` (não
   `1.0`), deixando um vão de 2% entre colunas vizinhas. Como o addon só manda a camada de superfície
   (não existe bloco embaixo dela), esse vão deixava ver o fundo escuro da cena — um quadriculado de
@@ -247,6 +217,32 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   conectado, a cena congela na última hora real (e fica no meio-dia fixo antes da primeira
   mensagem), em vez de inventar um ciclo — `world_time` devolve `None` nesse caso. Reportado pelo
   usuário ("quero que vc adicione o ciclo de dia e noite").
+- **Cores de bioma reais no viewer — fim do verde único**: o addon agora manda, junto de cada chunk, as
+  cores de bioma **por coluna** (grama, folhagem e água), resolvidas pelo `BiomeColors` do próprio
+  client — o mesmo colormap de temperatura/umidade, override de bioma e modificador de
+  pântano/floresta escura que o jogo aplica ao renderizar. O viewer usa essa cor por bloco: topo do
+  `grass_block`, folhas (carvalho, jungle, acácia, dark oak, mangrove), videira, lírio-d'água,
+  cana-de-açúcar e água (que agora é tingida por vértice, não por material único). Cada bioma passa a
+  ter a cor que tem no jogo — savana amarelada, pântano escuro com água marrom, taiga azulada,
+  badlands alaranjado etc. — em vez de um "verde floresta" fixo. O payload binário dos chunks sobe
+  pro formato 3 (bloco de tints no fim; o `world.cache` gravado antes continua abrindo, só sem tints,
+  caindo nas cores fixas aproximadas) e **o jar do addon precisa ser rebuildado** — com o jar antigo o
+  app avisa no console e mantém o comportamento antigo.
+- **Lado do bloco de grama com a camada de overlay do jogo**: o lado do `grass_block` só tinha a
+  textura base (terra + franja fixa, que não muda de bioma); o modelo vanilla desenha uma segunda
+  camada cinza (`grass_block_side_overlay`) por cima, tingida com a cor de grama do bioma. Agora o
+  viewer desenha essa camada também, então o lado da grama acompanha o bioma tanto quanto o topo.
+- **Aba "Config" com preferências reais, salvas em disco**: quinta view na rail (engrenagem) pra
+  ajustar o **viewer 3D** e o **comportamento do app**, sem mudar nada até o usuário mexer — os
+  padrões são exatamente as constantes que o app já usava. No viewer: distância do horizonte (fog),
+  orçamento de montagem de malha por frame, teto de pixel ratio (1× / 1,5× / 2×, útil em tela HiDPI) e
+  teto de FPS (sem limite por padrão). No comportamento: intervalos do polling de estado e de pose
+  (padrão 1 s / 250 ms, as cadências do addon) e quantos chunks o viewer pede por atualização (16). O
+  backend é a fonte da verdade: as preferências ficam em `settings.json` no diretório de dados do app
+  (JSON pequeno e legível, gravado de forma atômica), valores fora da faixa são presos no backend e a
+  UI mostra o valor **efetivo**, e "Restaurar padrões" volta tudo pro comportamento original. Pedido
+  pelo usuário ("quero que vc adicione um configuração no meu app"). Referência dos campos em
+  [`docs/CONFIG.md`](CONFIG.md).
 - **Céu no viewer 3D**: o fundo era uma cor chapada quase preta, então o horizonte e a profundidade do
   terreno sumiam — com o zoom afastado o mundo parecia flutuar no vazio. Agora há um domo de céu com
   gradiente (zênite azul → horizonte claro) numa textura de canvas, sempre centrado na câmera, e o
@@ -385,7 +381,8 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   Não escaneia até o limite de build (320) pra economizar: teto de 192, cobre a esmagadora maioria do
   terreno. O backfill de reconexão (que pode escanear 100+ chunks de uma vez, cada um até ~256×384
   buscas de bloco) não roda tudo numa tacada — enfileira e drena só 2 chunks por tick, evitando travar
-  o jogo por um instante.
+  o jogo por um instante. (Superado logo depois pelo streaming da chunk inteira — ver **Mundo de
+  verdade no viewer**, acima.)
 - **`world_columns`**: novo comando Tauri expondo os blocos de superfície como lista plana
   `{x,y,z,block}`, e `viewer3d.ts` reescrito — cada coluna vira um cubo de 1×1×1 na posição/altura
   reais, com a textura real resolvida por face do bloco (`"{bloco}_top"` em cima, `"{bloco}_side"`
@@ -394,7 +391,8 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   chutado pra todo chunk. `grass_block` ganha um tint verde fixo aproximado no topo (não é tint real
   por bioma — isso precisaria saber o bioma da coluna e amostrar o colormap, não implementado).
   Reportado pelo usuário ("cade as arvores vc está renderizando apenas uma camada... quero que mostre
-  relevos de 16x como se fosse pequenos bloquinhos no minecraft").
+  relevos de 16x como se fosse pequenos bloquinhos no minecraft"). (Superado logo depois pelo
+  streaming da chunk inteira — ver **Mundo de verdade no viewer**, acima.)
 - **Pipeline de atlas de texturas** (`src-tauri/src/texture_atlas.rs`): extrai as texturas de bloco do
   client jar do Minecraft **que o usuário já tem instalado localmente**
   (`~/.minecraft/versions/<versão>/<versão>.jar`) — nunca baixa nem empacota nada da Mojang neste
@@ -482,21 +480,3 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   uma esfera teal emissiva + luz pontual na posição XYZ real, com label mono projetado em tela.
   Ainda não é blocos texturizados de verdade — isso continua dependendo do pipeline de atlas descrito
   em `docs/SPEC.md`, "Blocos 3D"; o que existe agora é a malha de chunks e o bot em 3D navegável.
-
-### Known gaps
-
-- Baús e recebimento de instruções da fila pelo addon — o socket manda vitais/posição/chunk, não
-  inventário nem comandos do lado Rust pro addon ainda (ver `mod-addon/README.md`).
-- `SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen` (crafting/fundição) no addon —
-  ainda só descrito em `docs/SPEC.md`.
-- Pipeline de atlas de texturas existe e funciona, mas ainda usa um representante fixo
-  (`grass_block_top`) em toda placa — não o bloco real de cada chunk, porque `chunk_loaded` ainda não
-  manda conteúdo de bloco (só presença). Sem isso, não dá pra ter terreno de verdade (altura por
-  coluna) nem textura correta por posição.
-- Sem ingestão de `minecraft-data` (itens, blocos, receitas) — diferente do atlas de texturas, que já
-  lê o jar local, essa parte ainda não existe.
-- `WorldCache`/`StorageIndex` só em memória, sem persistência — reiniciar o app Rust apaga todo chunk
-  já visto (mesmo os que o Baritone Orchestrator estava rodando há horas), e o backfill de reconexão
-  do addon só cobre os chunks que o *client* ainda tem carregados naquele momento, não o histórico
-  completo de exploração. Reportado pelo usuário ("sem lembranças das chunks anteriores").
-- Editor de schematic é um painel de placeholder, sem implementação.
