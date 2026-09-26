@@ -130,6 +130,18 @@ const BOTTOM_TEX_OVERRIDE: Record<string, string> = {
   podzol: "dirt",
 };
 
+/** Nome do tile branco sintético que o `texture_atlas.rs` adiciona pro
+ * fallback tingível — bloco sem textura resolvida usa ele + cor sólida por
+ * vértice, em vez de aparecer com a textura de outro bloco (ex: `dirt`). */
+const WHITE_TILE = "__white";
+
+/** Cor de bloco sem textura/atlas — cinza neutro, nunca a textura de outro. */
+const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
+
+/** UV usada no modo degradado (sem atlas nenhum): a geometria é montada sem
+ * `map`, então o valor não importa — só precisa existir. */
+const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
+
 // Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
 const VOXEL_FORMAT_VERSION = 2;
 const VOXEL_FLAG_RENDER = 1;
@@ -284,6 +296,17 @@ interface MeshBuffers {
   indices: number[];
 }
 
+/** Rect resolvido de uma face + se veio de textura real do atlas (`known`)
+ * ou do fallback (tile branco / bloco sem textura) — ver `faceRect`. */
+interface ResolvedFace {
+  rect: UvRect;
+  known: boolean;
+}
+
+/** Um decoder UTF-8 só pro módulo — o payload tem uma entrada de paleta por
+ * bloco distinto, não faz sentido alocar um `TextDecoder` por entrada. */
+const UTF8_DECODER = new TextDecoder();
+
 function byteReader(bytes: Uint8Array) {
   let pos = 0;
   const take = (n: number) => {
@@ -299,7 +322,7 @@ function byteReader(bytes: Uint8Array) {
       const b = take(2);
       return b[0] | (b[1] << 8);
     },
-    utf8: (n: number) => new TextDecoder().decode(take(n)),
+    utf8: (n: number) => UTF8_DECODER.decode(take(n)),
     done: () => pos,
   };
 }
@@ -395,6 +418,13 @@ export class Viewer3D {
   private atlasImage: HTMLImageElement | null = null;
   private atlasTexture: THREE.Texture | null = null;
   private atlasUvByName: Record<string, UvRect> | null = null;
+  /** Atlas tentado e falhou (jar ausente, extração quebrada): o mundo é
+   * desenhado em modo degradado (cor sólida, sem textura) e `main.ts` para de
+   * tentar — ver `needsAtlas`/`setAtlasUnavailable`. */
+  private atlasUnavailable = false;
+  /** Cache de `faceRect` por `bloco|face` — o rect não muda enquanto o atlas
+   * não troca, e isso é consultado por toda face da malha. */
+  private faceRectCache = new Map<string, ResolvedFace>();
   /** Uma textura recortada (16×16px) por nome exato de textura do atlas (ex:
    * "grass_block_top", "water_still_f3") — evita recriar canvas/textura pro
    * mesmo tile. `null` = atlas carregado mas sem essa textura. Enquanto o
@@ -533,6 +563,22 @@ export class Viewer3D {
     return this.atlasLoading;
   }
 
+  /** O `main.ts` só deve tentar `get_texture_atlas` quando isto for `true`:
+   * uma tentativa por vez, e nenhuma depois que o atlas já resolveu ou já
+   * falhou (falha vira modo degradado, não retry infinito). */
+  needsAtlas(): boolean {
+    return !this.atlasUnavailable && this.atlasImage === null && !this.atlasLoading;
+  }
+
+  /** Sem atlas (jar ausente, extração quebrada): para de tentar e passa a
+   * desenhar o mundo com cor sólida por face — degradado, mas visível. */
+  setAtlasUnavailable() {
+    if (this.atlasImage || this.atlasUnavailable) return;
+    this.atlasUnavailable = true;
+    this.buildMaterials();
+    this.rebuildAllMeshes();
+  }
+
   /** `true` se o chunk já foi recebido (mesmo antes do atlas carregar — os
    * dados ficam guardados e a malha é montada quando o atlas chega). */
   hasChunk(x: number, z: number): boolean {
@@ -563,6 +609,7 @@ export class Viewer3D {
         this.atlasImage = texture.image;
         this.atlasTexture = texture;
         this.atlasUvByName = textures;
+        this.atlasUnavailable = false;
         this.atlasLoading = false;
         this.buildMaterials();
         this.rebuildAllMeshes();
@@ -571,6 +618,9 @@ export class Viewer3D {
       (err) => {
         console.error("[viewer3d] falha ao carregar atlas de texturas:", err);
         this.atlasLoading = false;
+        // O data URL veio do Rust mas não decodificou — trata como atlas
+        // indisponível em vez de tentar pra sempre.
+        this.setAtlasUnavailable();
       }
     );
   }
@@ -622,23 +672,65 @@ export class Viewer3D {
   /** Rect do atlas pra uma face do bloco, como no jogo: topo usa
    * `"{bloco}_top"` (ex: grass_block_top, oak_log_top), os 4 lados usam
    * `"{bloco}_side"` e o fundo `"{bloco}_bottom"` — com fallback pro nome
-   * puro quando a variante não existe (stone, dirt, sand...). Heurística,
-   * não o pipeline blockstate→model→face do spec ("Blocos 3D"). */
-  private faceRect(blockName: string, face: BlockFace): UvRect | null {
+   * puro quando a variante não existe (stone, dirt, sand...). Blocos com
+   * modelo próprio (escada, laje, muro, porta...) não têm textura com o nome
+   * do bloco: a lista de candidatos tira o sufixo e tenta o material "base"
+   * deles (oak_stairs → oak_planks). Heurística, não o pipeline
+   * blockstate→model→face do spec ("Blocos 3D").
+   *
+   * Devolve também se a textura é real (`known`) ou fallback — quem chama usa
+   * isso pra pintar o bloco desconhecido de cinza em vez de fingir que é
+   * outro bloco. */
+  private faceRect(blockName: string, face: BlockFace): ResolvedFace | null {
     const atlas = this.atlasUvByName;
-    if (!atlas) return null;
+    if (!atlas) {
+      // Sem atlas nenhum: no modo degradado a geometria ainda é montada (sem
+      // `map`), então qualquer UV serve; antes do atlas resolver, `null`
+      // adia a malha (ver `addChunkVoxels`/`setAtlas`).
+      return this.atlasUnavailable ? { rect: NO_ATLAS_RECT, known: false } : null;
+    }
+
+    const key = `${blockName}|${face}`;
+    const cached = this.faceRectCache.get(key);
+    if (cached) return cached;
+
     const base = face === "bottom" ? BOTTOM_TEX_OVERRIDE[blockName] ?? blockName : blockName;
-    const candidates =
-      face === "top"
-        ? [`${base}_top`, base]
-        : face === "side"
-          ? [`${base}_side`, base]
-          : [`${base}_bottom`, base];
+    const candidates: string[] = [];
+    const add = (name: string) => {
+      if (name && !candidates.includes(name)) candidates.push(name);
+    };
+    if (face === "top") add(`${base}_top`);
+    if (face === "side") add(`${base}_side`);
+    if (face === "bottom") add(`${base}_bottom`);
+    add(base);
+
+    const stripped = base.replace(
+      /(_stairs|_slab|_wall|_fence_gate|_fence|_door|_trapdoor|_button|_pressure_plate|_pane|_bars|_carpet|_bed|_candle|_sign|_hanging_sign|_chain)$/,
+      ""
+    );
+    if (stripped !== base) {
+      add(`${stripped}_planks`);
+      add(stripped);
+      add(`${stripped}_block`);
+    }
+
     for (const name of candidates) {
       const rect = atlas[name] ?? atlas[TEXTURE_ALIASES[name]];
-      if (rect) return rect;
+      if (rect) {
+        const resolved = { rect, known: true };
+        this.faceRectCache.set(key, resolved);
+        return resolved;
+      }
     }
-    return atlas["dirt"] ?? Object.values(atlas)[0] ?? null;
+
+    // Nenhuma textura com o nome do bloco (mod, nome sem variante): tile
+    // branco + cinza por vértice. Se o atlas for antigo e não tiver o tile
+    // branco, ainda cai em `dirt` como último recurso.
+    const fallback = atlas[WHITE_TILE] ?? atlas["dirt"] ?? Object.values(atlas)[0] ?? null;
+    if (!fallback) return null;
+    const resolved = { rect: fallback, known: false };
+    this.faceRectCache.set(key, resolved);
+    return resolved;
   }
 
   /** Tint por vértice: só o topo da grama e as folhagens que vêm cinza no
@@ -649,14 +741,19 @@ export class Viewer3D {
   }
 
   private buildMaterials() {
-    if (!this.atlasTexture) return;
     this.animatedMaterials = [];
     this.bucketMaterials.clear();
+    this.faceRectCache.clear();
+    // `alphaTest` recorta as texturas com transparência (folhas, plantas,
+    // tochas): sem ele o alpha é ignorado e os pixels vazios saem pretos.
+    // Sem atlas (`map: null`, modo degradado) não muda nada — o alpha do
+    // vértice é 1.
     this.opaqueMaterial = new THREE.MeshStandardMaterial({
       map: this.atlasTexture,
       vertexColors: true,
       roughness: 0.95,
       metalness: 0,
+      alphaTest: 0.5,
     });
     this.bucketMaterials.set("opaque", this.opaqueMaterial);
     this.bucketMaterials.set("water_still", this.buildFluidMaterial("water", "still"));
@@ -851,11 +948,12 @@ export class Viewer3D {
   }
 
   /** Monta as malhas de um chunk (um mesh por bucket usado) e substitui as
-   * antigas. Sem atlas carregado não faz nada — `setAtlas` remonta tudo. */
+   * antigas. Sem atlas carregado não faz nada até o atlas resolver (ou até o
+   * modo degradado ligar) — `setAtlas`/`setAtlasUnavailable` remontam tudo. */
   private buildChunkMesh(chunk: DecodedChunk) {
     const key = this.chunkKey(chunk.x, chunk.z);
     this.disposeChunkMeshes(key);
-    if (!this.atlasUvByName || !this.atlasTexture) return;
+    if (!this.atlasUvByName && !this.atlasUnavailable) return;
 
     const buckets = new Map<string, MeshBuffers>();
     for (const section of chunk.sections.values()) {
@@ -885,8 +983,9 @@ export class Viewer3D {
               if (neighbor !== null && (neighbor.flags & VOXEL_FLAG_RENDER) !== 0) {
                 if ((neighbor.flags & VOXEL_FLAG_OCCLUDES) !== 0) continue;
               }
-              const rect = this.faceRect(entry.block, face.kind);
-              if (!rect) continue;
+              const resolved = this.faceRect(entry.block, face.kind);
+              if (!resolved) continue;
+              const rect = resolved.rect;
               const uvs = face.uv.map(
                 ([u, v]) => [rect.u0 + u * (rect.u1 - rect.u0), rect.v0 + v * (rect.v1 - rect.v0)] as [number, number]
               );
@@ -899,7 +998,9 @@ export class Viewer3D {
                 0,
                 1,
                 uvs,
-                this.faceTint(entry.block, face.kind)
+                // Sem textura real (bloco de mod, atlas degradado): cinza
+                // neutro em vez da textura de outro bloco.
+                resolved.known ? this.faceTint(entry.block, face.kind) : COLOR_UNKNOWN_BLOCK
               );
             }
           }
@@ -1245,6 +1346,9 @@ export class Viewer3D {
       this.scene.remove(mesh);
       this.instructionMarkers.delete(id);
     }
+    // Uma nova conexão tenta o atlas de novo (ex: a versão do jogo foi
+    // instalada nesse meio tempo) — a falha anterior não é definitiva.
+    this.atlasUnavailable = false;
   }
 
   resize() {

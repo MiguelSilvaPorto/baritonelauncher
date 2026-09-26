@@ -13,9 +13,10 @@ a WorldEdit-style schematic editor, and a chest/storage index. Full product spec
 > Status: **minimal end-to-end slice working**. Identifier: `dev.baritone.orchestrator`. The UI shell,
 > visual identity, Rust domain models, the Java addon (real NeoForge project), and the local socket
 > between them are implemented and manually tested — the addon streams real player vitals from an
-> actual Baritone-controlled game into the app's HUD. Chunk/chest/instruction streaming, the 3D
-> renderer, and `minecraft-data` ingestion do not exist yet. See "Known gaps" in `README.md` before
-> claiming something works.
+> actual Baritone-controlled game into the app's HUD, streams each loaded chunk's real blocks for the
+> 3D viewer, and executes queued `travel_to`/`explore` instructions through Baritone. Chest data and
+> `minecraft-data` ingestion do not exist yet. See "Known gaps" in `README.md` before claiming
+> something works.
 
 ## 2. Where you are
 
@@ -42,8 +43,8 @@ There is no component framework and no bundled state library: `main.ts` renders 
   everything else stays plain DOM/innerHTML.
 - **Backend:** Rust (edition 2021) · Tauri 2 · `serde`/`serde_json` · `tauri-plugin-opener` ·
   `tauri-plugin-dialog` · `tokio` (powers `addon_socket.rs`, the local TCP server the Java addon
-  connects to) · `image`/`zip`/`base64` (read-only jar/texture extraction in `texture_atlas.rs`, see
-  rule 9 below).
+  connects to) · `flate2` (zlib payloads: `chunk_voxels` and the persisted `world.cache`) ·
+  `image`/`zip`/`base64` (read-only jar/texture extraction in `texture_atlas.rs`, see rule 9 below).
 - **Styling:** one `src/styles.css`, plain CSS custom properties under `:root` — the fixed dark
   identity from `docs/SPEC.md` ("Identidade visual"), not a multi-theme system.
 - **Addon:** Java 25 · NeoForge (ModDevGradle) · `mod-addon/`, a normal Gradle project you build with
@@ -64,7 +65,11 @@ Rust-only check without a full Tauri build:
 cd src-tauri && cargo check
 ```
 
-There is no test suite yet.
+Rust unit/integration tests:
+
+```bash
+cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas (skips if no local jar)
+```
 
 ## 5. Non-negotiable rules
 
@@ -181,13 +186,14 @@ There is no test suite yet.
   disk. `crossing_hints` are **not** persisted yet.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
-  `src-tauri/.cache/` (gitignored). **Never download or bundle Mojang assets** — this reads only what
-  the user already has installed, per explicit user requirement (Mojang's license doesn't allow
-  redistributing game assets). Only handles 16×16 textures (animated ones, e.g. water/lava, are taller
-  multi-frame PNGs and are skipped — no animation support yet). Has a real integration test
-  (`cargo test texture_atlas`) that runs against whatever local jar exists, skipping itself (not
-  failing) if none is found — keep that skip behavior if you touch this file, other environments won't
-  have the jar.
+  `src-tauri/.cache/` (gitignored; the cache name carries `ATLAS_CACHE_VERSION`). **Never download or
+  bundle Mojang assets** — this reads only what the user already has installed, per explicit user
+  requirement (Mojang's license doesn't allow redistributing game assets). Animated textures (water,
+  lava, fire) contribute every frame as `{stem}_fN` tiles (32×32 frames are downscaled to 16×16), with
+  the bare name aliasing frame 0; a synthetic white tile (`WHITE_TILE_NAME`) is the tintable fallback
+  for blocks with no matching texture. Has a real integration test (`cargo test texture_atlas`) that
+  runs against whatever local jar exists, skipping itself (not failing) if none is found — keep that
+  skip behavior if you touch this file, other environments won't have the jar.
 - `storage_index.rs` — `StorageIndex` (chest position → contents) and `aggregated_totals()`.
 - `items.rs` — `Item`, `Block`, `Recipe`, `IngredientRef`, `RecipeType`, `Station`, and
   `fits_inventory_2x2()` per the spec's "Receitas 2×2" section. Not populated from `minecraft-data`
@@ -216,6 +222,9 @@ There is no test suite yet.
 - **No chest/inventory data.** `StorageIndex` stays empty — `chunk_voxels` carries terrain, but no
   block entities, and there's no `ContainerScreen` simulation to read chests (see `docs/SPEC.md`,
   "Índice de armazenamento").
+- **Chunks are a snapshot, not a live world.** `chunk_voxels` carries the chunk as it was when the
+  client loaded it; block changes after that (mining, placing, opening a chest) aren't resent, so the
+  viewer goes stale there until the chunk reloads. There is no per-block update delta channel yet.
 - **Instructions only cover `travel_to`/`explore`.** The reverse channel works end to end
   (`queue_push` → addon → `instruction_status`), but `Mine`/`Build`/`FetchFromChest`/`Craft`/`Smelt`
   have no executor in the addon yet, and the UI composer only creates the two executable kinds.
