@@ -136,6 +136,9 @@ enum AddonMessage {
 #[serde(rename_all = "snake_case")]
 enum AddonInstructionState {
     Active,
+    /// Executando mas parado por falta de material (`BuilderProcess` pausado,
+    /// "Missing materials" no chat) — não é terminal.
+    Paused,
     Done,
     Failed,
 }
@@ -332,6 +335,7 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
             AddonMessage::InstructionStatus { id, status, progress } => {
                 let status = match status {
                     AddonInstructionState::Active => QueueInstructionStatus::Active,
+                    AddonInstructionState::Paused => QueueInstructionStatus::Paused,
                     AddonInstructionState::Done => QueueInstructionStatus::Done,
                     AddonInstructionState::Failed => QueueInstructionStatus::Failed,
                 };
