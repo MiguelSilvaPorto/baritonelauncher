@@ -60,6 +60,11 @@
               />
             </svg>
           </button>
+          <button class="rail-btn" data-mode="jogar" title="Jogar (abrir o Minecraft)">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M7 4.5v15l12-7.5-12-7.5z" />
+            </svg>
+          </button>
         </nav>
 
         <!-- ---------- Viewer ---------- -->
@@ -378,11 +383,89 @@
                 </div>
               </section>
 
+              <section class="config-section">
+                <h2>Minecraft (aba Jogar)</h2>
+
+                <div class="config-row">
+                  <div class="config-info">
+                    <span class="config-label">Pasta do CurseForge</span>
+                    <span class="config-detail">
+                      A pasta que contém <code>Install/</code> e <code>Instances/</code> (padrão:
+                      <code>~/Documents/curseforge/minecraft</code>). Vazio detecta sozinho.
+                    </span>
+                  </div>
+                  <div class="config-control">
+                    <input type="text" class="config-input" data-setting="curseforge_root" placeholder="detectar sozinho" disabled />
+                    <span class="config-value mono" data-setting-value="curseforge_root">—</span>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <div class="config-info">
+                    <span class="config-label">Nick na sessão offline</span>
+                    <span class="config-detail">
+                      Nome mostrado no jogo quando ele é aberto pela aba Jogar (sem login) — singleplayer não
+                      valida credencial.
+                    </span>
+                  </div>
+                  <div class="config-control">
+                    <input type="text" class="config-input" data-setting="offline_username" maxlength="32" disabled />
+                    <span class="config-value mono" data-setting-value="offline_username">—</span>
+                  </div>
+                </div>
+
+                <div class="config-row">
+                  <div class="config-info">
+                    <span class="config-label">Memória do jogo</span>
+                    <span class="config-detail">Quanto de RAM o Minecraft aberto pela aba Jogar pode usar (<code>-Xmx</code>).</span>
+                  </div>
+                  <div class="config-control">
+                    <input type="range" data-setting="java_memory_mb" min="1024" max="32768" step="1024" disabled />
+                    <span class="config-value mono" data-setting-value="java_memory_mb">—</span>
+                  </div>
+                </div>
+              </section>
+
               <div class="config-actions">
                 <button type="button" class="tool-btn flat" id="config-reset" disabled>Restaurar padrões</button>
                 <button type="button" class="tool-btn flat" id="config-reload">Recarregar</button>
                 <span class="composer-hint">Salvas em disco — valem pra próxima sessão.</span>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-jogar">
+          <div class="config-view">
+            <div class="config-header">
+              <h1>Jogar</h1>
+              <span class="config-status mono" id="launch-status">carregando…</span>
+            </div>
+            <div class="config-body">
+              <section class="config-section">
+                <h2>Instalação</h2>
+                <div id="launch-setup" class="launch-setup"></div>
+                <div class="config-actions">
+                  <button type="button" class="tool-btn flat" id="launch-game" disabled>Abrir Minecraft</button>
+                  <button type="button" class="tool-btn flat" id="launch-preview" disabled>Prévia do comando</button>
+                  <span class="launch-state mono" id="launch-game-state">—</span>
+                </div>
+                <span class="composer-hint">
+                  Abre a instância direto pelo Java do CurseForge, em sessão offline: singleplayer entra
+                  (inclusive direto num mundo); servidor com online-mode não.
+                </span>
+                <pre id="launch-command" class="launch-command mono" hidden></pre>
+              </section>
+
+              <section class="config-section">
+                <h2>Instâncias</h2>
+                <div id="launch-instances" class="launch-instances"></div>
+              </section>
+
+              <section class="config-section">
+                <h2>Mundos</h2>
+                <div id="launch-worlds" class="launch-worlds"></div>
+              </section>
             </div>
           </div>
         </section>

@@ -125,6 +125,9 @@ function setMode(mode: string) {
     viewer3d?.mountTo($<HTMLElement>("#viewer-3d"));
   }
   if (mode === "editor" || mode === "viewer") viewer3d?.resize();
+  // A aba Jogar lê o disco (instâncias/mundos): atualiza ao entrar nela em
+  // vez de a cada segundo no polling geral.
+  if (mode === "jogar") void refreshLaunch();
 }
 
 function bootstrapRail() {
@@ -783,7 +786,7 @@ function requestChunk(pos: ChunkPos) {
 }
 
 async function refreshState() {
-  const [status, world, queue, totals, vitals, skin, mobs, worldTime] = await Promise.all([
+  const [status, world, queue, totals, vitals, skin, mobs, worldTime, gameStatus] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
     invoke<Instruction[]>("queue_snapshot"),
@@ -792,6 +795,7 @@ async function refreshState() {
     invoke<PlayerSkin | null>("player_skin"),
     invoke<MobSnapshot | null>("nearby_mobs"),
     invoke<number | null>("world_time"),
+    invoke<GameStatus>("minecraft_game_status"),
   ]);
 
   lastBotPos = world.bot_pos ?? world.last_bot_pos ?? null;
@@ -917,6 +921,7 @@ async function refreshState() {
   }
   renderHud(vitals);
   renderMobs(mobs);
+  renderGameStatus(gameStatus);
   renderQueue(queue);
   renderStorage(totals);
 }
@@ -934,6 +939,9 @@ interface Settings {
   state_interval_ms: number;
   pose_interval_ms: number;
   chunks_per_refresh: number;
+  curseforge_root: string;
+  offline_username: string;
+  java_memory_mb: number;
 }
 
 let settings: Settings | null = null;
@@ -943,15 +951,20 @@ function decimal(value: number): string {
   return String(value).replace(".", ",");
 }
 
-/** Rótulo do valor efetivo ao lado de cada controle. */
-const CONFIG_VALUE_FORMAT: Record<keyof Settings, (value: number) => string> = {
-  fog_far: (v) => `${decimal(v)} blocos`,
-  mesh_budget_ms: (v) => `${decimal(v)} ms`,
-  max_pixel_ratio: (v) => `${decimal(v)}×`,
-  fps_cap: (v) => (v === 0 ? "sem limite" : `${v} fps`),
+/** Rótulo do valor efetivo ao lado de cada controle. Os campos de texto da
+ *  aba Jogar entram aqui também — o formato recebe o valor como veio do
+ *  backend (número ou string). */
+const CONFIG_VALUE_FORMAT: Record<keyof Settings, (value: number | string) => string> = {
+  fog_far: (v) => `${decimal(Number(v))} blocos`,
+  mesh_budget_ms: (v) => `${decimal(Number(v))} ms`,
+  max_pixel_ratio: (v) => `${decimal(Number(v))}×`,
+  fps_cap: (v) => (Number(v) === 0 ? "sem limite" : `${v} fps`),
   state_interval_ms: (v) => `${v} ms`,
   pose_interval_ms: (v) => `${v} ms`,
   chunks_per_refresh: (v) => `${v} chunks`,
+  curseforge_root: (v) => (String(v).trim() === "" ? "detectar sozinho" : String(v)),
+  offline_username: (v) => String(v),
+  java_memory_mb: (v) => `${v} MB`,
 };
 
 let configStatusTimer: number | undefined;
@@ -1038,7 +1051,7 @@ function scheduleSettingsSave() {
   settingsSaveTimer = window.setTimeout(persistSettings, SETTINGS_SAVE_DEBOUNCE_MS);
 }
 
-function updateSetting(key: keyof Settings, value: number) {
+function updateSetting(key: keyof Settings, value: number | string) {
   if (!settings) return;
   applySettings({ ...settings, [key]: value });
   scheduleSettingsSave();
@@ -1053,13 +1066,19 @@ function reloadSettings() {
   });
 }
 
+/** Valor de um controle da Config: campos de texto devolvem string; números
+ *  (range/number/select) viram `Number`. */
+function readConfigValue(el: HTMLInputElement | HTMLSelectElement): number | string {
+  return el instanceof HTMLInputElement && el.type === "text" ? el.value : Number(el.value);
+}
+
 function bootstrapConfig() {
   $$<HTMLInputElement | HTMLSelectElement>("[data-setting]").forEach((el) => {
     const key = el.dataset.setting as keyof Settings;
     // `input` dá feedback ao vivo no viewer enquanto o slider anda; o
     // debounce segura a gravação em disco (ver `scheduleSettingsSave`).
-    el.addEventListener("input", () => updateSetting(key, Number(el.value)));
-    el.addEventListener("change", () => updateSetting(key, Number(el.value)));
+    el.addEventListener("input", () => updateSetting(key, readConfigValue(el)));
+    el.addEventListener("change", () => updateSetting(key, readConfigValue(el)));
   });
 
   $("#config-reset").addEventListener("click", () => {
@@ -1089,6 +1108,246 @@ async function loadSettings(): Promise<boolean> {
     setConfigStatus("não consegui carregar as preferências — veja o console", "error");
     return false;
   }
+}
+
+/* ---------- Jogar (abrir o Minecraft direto) ---------- */
+
+/** Espelha `minecraft_launch.rs` (aba Jogar). O app lê a instalação do
+ *  CurseForge que já existe, lista mundos e abre o jogo direto pelo Java do
+ *  próprio CurseForge — em sessão offline. */
+interface MinecraftSetup {
+  root: string | null;
+  install_dir: string | null;
+  assets_dir: string | null;
+  java: string | null;
+  java_version: string | null;
+  problem: string | null;
+}
+
+interface MinecraftInstance {
+  id: string;
+  name: string;
+  game_version: string;
+  modloader: string;
+}
+
+interface MinecraftWorld {
+  id: string;
+  name: string;
+  last_modified_ms: number;
+}
+
+interface GameStatus {
+  running: boolean;
+  pid: number | null;
+  exit_code: number | null;
+}
+
+interface LaunchOutcome {
+  pid: number;
+  java: string;
+  java_version: string | null;
+  version: string;
+  world: string | null;
+}
+
+interface LaunchPreview {
+  command: string;
+  java: string;
+  java_version: string | null;
+  log_path: string;
+  version: string;
+  world: string | null;
+}
+
+let launchSetup: MinecraftSetup | null = null;
+let launchInstances: MinecraftInstance[] = [];
+let launchWorlds: MinecraftWorld[] = [];
+let launchInstanceId: string | null = null;
+let launchLoading = false;
+
+function setLaunchStatus(message: string, kind: "info" | "error" = "info") {
+  const el = $<HTMLElement>("#launch-status");
+  el.textContent = message;
+  el.classList.toggle("error", kind === "error");
+}
+
+/** Instância padrão: a que tem "baritone" no nome (é a que tem o addon),
+ *  senão a primeira em ordem alfabética. */
+function defaultInstanceId(): string | null {
+  if (launchInstances.length === 0) return null;
+  const named = launchInstances.find((instance) => instance.name.toLowerCase().includes("baritone"));
+  return (named ?? launchInstances[0]).id;
+}
+
+function launchReady(): boolean {
+  return Boolean(launchSetup?.root) && launchInstanceId !== null;
+}
+
+async function refreshLaunchWorlds() {
+  if (!launchInstanceId) {
+    launchWorlds = [];
+    return;
+  }
+  try {
+    launchWorlds = await invoke<MinecraftWorld[]>("minecraft_worlds", { instanceId: launchInstanceId });
+  } catch (err) {
+    console.error("[jogar] listar mundos falhou:", err);
+    launchWorlds = [];
+    setLaunchStatus(String(err), "error");
+  }
+}
+
+async function refreshLaunch() {
+  if (launchLoading) return;
+  launchLoading = true;
+  try {
+    launchSetup = await invoke<MinecraftSetup>("minecraft_setup");
+    launchInstances = launchSetup.root ? await invoke<MinecraftInstance[]>("minecraft_instances") : [];
+    if (launchInstanceId === null || !launchInstances.some((instance) => instance.id === launchInstanceId)) {
+      launchInstanceId = defaultInstanceId();
+    }
+    await refreshLaunchWorlds();
+    setLaunchStatus(launchSetup.problem ? "Jogar indisponível" : "");
+  } catch (err) {
+    console.error("[jogar] carregar falhou:", err);
+    setLaunchStatus(String(err), "error");
+  } finally {
+    launchLoading = false;
+  }
+  renderLaunch();
+}
+
+function formatWorldDate(ms: number): string {
+  if (!ms) return "data desconhecida";
+  return new Date(ms).toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+}
+
+/** Estado do processo aberto pela aba Jogar (polling do `refreshState`). */
+function renderGameStatus(status: GameStatus) {
+  const el = $<HTMLElement>("#launch-game-state");
+  if (!el) return;
+  el.classList.toggle("running", status.running);
+  el.classList.toggle("exited", !status.running && status.exit_code !== null);
+  if (status.running) {
+    el.textContent = `jogando (pid ${status.pid})`;
+  } else if (status.exit_code !== null) {
+    el.textContent = `encerrado (código ${status.exit_code})`;
+  } else {
+    el.textContent = "parado";
+  }
+}
+
+function renderLaunch() {
+  const setupEl = $<HTMLElement>("#launch-setup");
+  if (!launchSetup) {
+    setupEl.innerHTML = `<span>carregando…</span>`;
+  } else if (!launchSetup.root) {
+    setupEl.innerHTML = `<span class="problem">${escapeHtml(launchSetup.problem ?? "instalação não encontrada")}</span>`;
+  } else {
+    const java = launchSetup.java
+      ? `${escapeHtml(launchSetup.java)}${launchSetup.java_version ? ` (${escapeHtml(launchSetup.java_version)})` : ""}`
+      : "não encontrado";
+    setupEl.innerHTML = `
+      <span>CurseForge: ${escapeHtml(launchSetup.root)}</span>
+      <span>Java: ${java}</span>
+    `;
+    if (launchSetup.problem) {
+      setupEl.innerHTML += `<span class="problem">${escapeHtml(launchSetup.problem)}</span>`;
+    }
+  }
+
+  $<HTMLElement>("#launch-instances").innerHTML = launchInstances.length
+    ? launchInstances
+        .map(
+          (instance) => `
+      <button type="button" class="launch-instance ${instance.id === launchInstanceId ? "active" : ""}" data-instance="${escapeHtml(instance.id)}">
+        <span class="name">${escapeHtml(instance.name)}</span>
+        <span class="meta">${escapeHtml(instance.game_version)} · ${escapeHtml(instance.modloader || "vanilla")}</span>
+      </button>`
+        )
+        .join("")
+    : `<span class="composer-hint">Nenhuma instância encontrada${
+        launchSetup?.root ? "" : " — aponte a pasta do CurseForge na aba Config"
+      }.</span>`;
+
+  const worldsEl = $<HTMLElement>("#launch-worlds");
+  if (!launchInstanceId) {
+    worldsEl.innerHTML = "";
+  } else if (launchWorlds.length === 0) {
+    worldsEl.innerHTML = `
+      <div class="empty-state">
+        <span class="headline">Nenhum mundo nesta instância</span>
+        <span class="detail">Crie um mundo pelo jogo (dá pra abrir o Minecraft sem mundo e criar lá) — ele aparece aqui pra abrir direto.</span>
+      </div>`;
+  } else {
+    worldsEl.innerHTML = launchWorlds
+      .map(
+        (world) => `
+      <div class="launch-world">
+        <div class="info">
+          <span class="name">${escapeHtml(world.name)}</span>
+          <span class="meta">última alteração: ${escapeHtml(formatWorldDate(world.last_modified_ms))}</span>
+        </div>
+        <button type="button" class="tool-btn flat" data-world="${escapeHtml(world.id)}">Abrir neste mundo</button>
+      </div>`
+      )
+      .join("");
+  }
+
+  $<HTMLButtonElement>("#launch-game").disabled = !launchReady();
+  $<HTMLButtonElement>("#launch-preview").disabled = !launchReady();
+}
+
+async function launchGame(worldId?: string) {
+  if (!launchInstanceId) return;
+  setLaunchStatus("abrindo o Minecraft…");
+  try {
+    const outcome = await invoke<LaunchOutcome>("minecraft_launch", {
+      instanceId: launchInstanceId,
+      worldId: worldId ?? null,
+    });
+    setLaunchStatus(
+      `Minecraft aberto (pid ${outcome.pid})${outcome.world ? ` no mundo "${outcome.world}"` : ""} — o addon conecta sozinho.`
+    );
+    renderGameStatus({ running: true, pid: outcome.pid, exit_code: null });
+  } catch (err) {
+    console.error("[jogar] abrir falhou:", err);
+    setLaunchStatus(String(err), "error");
+  }
+}
+
+async function previewLaunch() {
+  if (!launchInstanceId) return;
+  try {
+    const preview = await invoke<LaunchPreview>("minecraft_launch_preview", {
+      instanceId: launchInstanceId,
+      worldId: null,
+    });
+    const el = $<HTMLElement>("#launch-command");
+    el.hidden = false;
+    el.textContent = `${preview.command}\n\n# log: ${preview.log_path}`;
+  } catch (err) {
+    console.error("[jogar] prévia falhou:", err);
+    setLaunchStatus(String(err), "error");
+  }
+}
+
+function bootstrapLaunch() {
+  $("#launch-game").addEventListener("click", () => void launchGame());
+  $("#launch-preview").addEventListener("click", () => void previewLaunch());
+  $("#launch-instances").addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLElement>("[data-instance]");
+    if (!button) return;
+    launchInstanceId = button.dataset.instance ?? null;
+    void refreshLaunchWorlds().then(renderLaunch);
+  });
+  $("#launch-worlds").addEventListener("click", (event) => {
+    const button = (event.target as HTMLElement).closest<HTMLElement>("[data-world]");
+    if (!button) return;
+    void launchGame(button.dataset.world ?? undefined);
+  });
+  renderLaunch();
 }
 
 /* ---------- Polling ---------- */
@@ -1135,6 +1394,7 @@ window.addEventListener("DOMContentLoaded", () => {
   bootstrapQueueActions();
   bootstrapTargetPopup();
   bootstrapConfig();
+  bootstrapLaunch();
 
   viewer3d = new Viewer3D(
     $<HTMLElement>("#viewer-3d"),

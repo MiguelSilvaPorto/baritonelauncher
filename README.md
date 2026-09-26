@@ -18,13 +18,12 @@ documentação (com as referências externas oficiais) está em [`docs/README.md
 > **Status: ponta a ponta funcionando, escopo mínimo.** A shell do app, os modelos de dados Rust, a
 > identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app, nos
 > dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
-> dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
 > chunks explorados, o **jogador com o modelo e a skin reais do jogo** em coordenadas reais e os
 > **mobs ao redor identificados** por nome/categoria/distância/vida), a **fila executando
-> `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) e uma **aba Config** com
-> preferências reais salvas em disco (viewer 3D e cadência do polling) estão implementados e testados
-> manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não existem — ver "O que falta"
-> abaixo.
+> `travel_to`/`explore` de verdade** (com status e progresso vindos do addon), uma **aba Config** com
+> preferências reais salvas em disco e a **aba Jogar**, que abre o Minecraft direto (instância do
+> CurseForge, sessão offline) com seleção de mundo, estão implementados e testados manualmente. Baús e
+> instruções de `#build`/`#mine`/craft ainda não existem — ver "O que falta" abaixo.
 
 ## Arquitetura
 
@@ -110,6 +109,12 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   nome do bloco), import de `.litematic`,
   paleta vinda de um registro real de blocos (hoje é derivada dos nomes de textura do atlas) e
   executor de `Mine`/`Build` no addon (a instrução fica na fila) — ver `docs/CHANGELOG.md`.
+- **Login Microsoft (servidores online)** — a aba Jogar abre o jogo em **sessão offline**: mundos
+  singleplayer entram normalmente, mas servidor com `online-mode` recusa. Login com device code (e
+  token salvo) ainda não existe; o app não lê o token do CurseForge de propósito.
+- **Detecção limitada ao CurseForge** — a aba Jogar procura a instalação do CurseForge (padrão
+  `~/Documents/curseforge/minecraft`, configurável); outros launchers (Prism, Modrinth App, oficial)
+  não são detectados ainda.
 - **Persistência** do `StorageIndex` (hoje só em memória) — o **mundo explorado** já é salvo em
   disco (`world.log`, gravado chunk a chunk; `world.json` com a versão do jogo e a última posição do
   bot) e reaparece com o jogo fechado (ver `src-tauri/src/world_store.rs`). O viewer desenha uma
@@ -122,8 +127,10 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   Three.js/WebGL) + `styles.css`.
 - `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon),
   `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada),
-  `world_store.rs` (log de chunks do mundo explorado + metadados em disco) e `settings.rs`
-  (preferências da aba Config, em `settings.json` no diretório de dados do app).
+  `world_store.rs` (log de chunks do mundo explorado + metadados em disco), `settings.rs`
+  (preferências da aba Config, em `settings.json` no diretório de dados do app) e
+  `minecraft_launch.rs` (aba Jogar: monta a linha de comando do jogo a partir da instalação do
+  CurseForge que já existe, sem baixar nada).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/README.md` — índice da documentação, incluindo as referências externas oficiais.
 - `docs/PROTOCOL.md` — socket app ↔ addon: mensagens e formato binário do `chunk_voxels`.

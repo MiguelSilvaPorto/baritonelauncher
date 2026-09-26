@@ -22,6 +22,9 @@ devolveu — se um valor estiver fora da faixa, ele é preso lá e a UI exibe o 
 | `state_interval_ms` | 1000 | 250–10000 | Intervalo do polling de estado (fila/vitais/mundo) |
 | `pose_interval_ms` | 250 | 100–5000 | Intervalo do polling da pose do jogador |
 | `chunks_per_refresh` | 16 | 1–64 | Chunks pedidos por atualização de estado |
+| `curseforge_root` | *(vazio)* | caminho com `Install/` | Pasta da instalação do CurseForge usada pela aba Jogar; vazio detecta `~/Documents/curseforge/minecraft` |
+| `offline_username` | `Player` | 1–32 caracteres (sem espaço) | Nick da sessão offline do jogo aberto pela aba Jogar |
+| `java_memory_mb` | 4096 | 1024–32768 | RAM (`-Xmx`) do jogo aberto pela aba Jogar |
 
 Os padrões são exatamente as constantes que o app usava antes da aba existir — não mexer em nada é o
 mesmo que o comportamento antigo.
