@@ -7,9 +7,10 @@
 //!   prefixado — simples de implementar dos dois lados sem biblioteca extra
 //!   no addon Java (usa só `java.net.Socket`, sem WebSocket).
 //! - Mensagens hoje: `hello` (handshake), `vitals` (vida/fome/armadura,
-//!   ~1x/segundo), `position` (pés do jogador, ~4x/segundo) e `chunk_voxels`
-//!   (o chunk inteiro, seção por seção, comprimido — ver abaixo). Baús ainda
-//!   não trafegam por aqui.
+//!   ~1x/segundo), `position` (pés do jogador + yaw/pitch, ~4x/segundo),
+//!   `player_skin` (PNG da skin do próprio jogador, quando muda — ver
+//!   `player_skin.rs`) e `chunk_voxels` (o chunk inteiro, seção por seção,
+//!   comprimido — ver abaixo). Baús ainda não trafegam por aqui.
 //! - Canal reverso (app → addon, mesmo socket): `instruction` (`travel_to` ou
 //!   `explore`) e `cancel` (id da instrução). O addon responde com
 //!   `instruction_status` (`active` com `progress`, ou `done`/`failed`), que
@@ -35,7 +36,7 @@ use crate::world_cache::{decode_voxels, BlockPos, ChunkPos, ChunkSection};
 use crate::AppState;
 use base64::Engine;
 use flate2::read::ZlibDecoder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::Read;
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -70,6 +71,20 @@ enum AddonMessage {
         x: i32,
         y: i32,
         z: i32,
+        /// Rotação do corpo em graus (0 = sul, como no jogo) e inclinação da
+        /// cabeça (positivo = olhando pra baixo). `default` mantém um addon
+        /// antigo (sem os campos) funcionando — só não orienta o modelo.
+        #[serde(default)]
+        yaw: f32,
+        #[serde(default)]
+        pitch: f32,
+    },
+    /// Skin do próprio jogador (PNG em base64) — ver `player_skin.rs`. O
+    /// addon só manda quando a textura muda.
+    PlayerSkin {
+        name: String,
+        model: String,
+        png_base64: String,
     },
     ChunkVoxels {
         x: i32,
@@ -96,6 +111,19 @@ enum AddonInstructionState {
     Active,
     Done,
     Failed,
+}
+
+/// Pose real do jogador (pés + olhar) reportada pelo addon a cada `position`.
+/// O viewer usa x/y/z pro modelo e yaw/pitch pra orientá-lo — ver
+/// `src/player_model.ts`. Separado de `WorldCache::BlockPos` de propósito:
+/// aquele é posição de bloco inteira (chave de cache), este carrega ângulos.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct BotPose {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 /// Roda pro resto da vida do app (`tauri::async_runtime::spawn`ada uma vez em
@@ -188,9 +216,21 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                     active_effects: Vec::new(),
                 });
             }
-            AddonMessage::Position { x, y, z } => {
+            AddonMessage::Position { x, y, z, yaw, pitch } => {
+                // `bot_pos` continua sendo a posição "de grade" que
+                // `world_summary` expõe; `bot_pose` é a mesma posição + o
+                // olhar, que só o modelo do jogador usa.
                 *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
+                *state.bot_pose.lock().unwrap() = Some(BotPose { x, y, z, yaw, pitch });
             }
+            AddonMessage::PlayerSkin {
+                name,
+                model,
+                png_base64,
+            } => match crate::player_skin::PlayerSkin::from_png_base64(name, model, &png_base64) {
+                Ok(skin) => *state.player_skin.lock().unwrap() = Some(skin),
+                Err(err) => eprintln!("[addon_socket] player_skin inválido: {err}"),
+            },
             AddonMessage::ChunkVoxels { x, z, data } => match decode_chunk_payload(&data) {
                 Ok(sections) => state
                     .world
@@ -233,6 +273,9 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
     drop(connection);
     *state.vitals.lock().unwrap() = None;
     *state.bot_pos.lock().unwrap() = None;
+    *state.bot_pose.lock().unwrap() = None;
+    // A skin fica: é um dado real do jogador, e mantê-la evita o modelo
+    // piscar de volta pro placeholder a cada reconexão.
 }
 
 /// base64 → zlib → `decode_voxels`. O payload do addon vai comprimido porque

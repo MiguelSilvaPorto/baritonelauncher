@@ -1,6 +1,7 @@
 mod addon_socket;
 mod instructions;
 mod items;
+mod player_skin;
 mod storage_index;
 mod texture_atlas;
 mod time_estimate;
@@ -38,6 +39,12 @@ pub(crate) struct AppState {
     /// Última posição (pés do jogador) reportada pelo addon. Mapeada no
     /// grid do viewer em `src/main.ts` (`worldToScreen`).
     pub(crate) bot_pos: Mutex<Option<BlockPos>>,
+    /// Mesma posição de `bot_pos` + yaw/pitch do jogador — o viewer usa os
+    /// ângulos pra orientar o modelo (ver `addon_socket::BotPose`).
+    pub(crate) bot_pose: Mutex<Option<addon_socket::BotPose>>,
+    /// Skin real do jogador (PNG), mandada pelo addon quando muda — ver
+    /// `player_skin.rs`.
+    pub(crate) player_skin: Mutex<Option<player_skin::PlayerSkin>>,
     /// Versão do Minecraft reportada no `hello` do addon — usada pra achar
     /// o client jar certo em `texture_atlas.rs`. Real, não hardcoded: se o
     /// addon nunca conectou ainda, isso fica `None` e o comando do atlas
@@ -259,6 +266,22 @@ mod commands {
         state.vitals.lock().unwrap().clone()
     }
 
+    /// Pose real do jogador (pés + yaw/pitch) reportada pelo addon a cada
+    /// `position` — ver `addon_socket.rs`. O viewer usa pra posicionar e
+    /// orientar o modelo do jogador.
+    #[tauri::command]
+    fn bot_pose(state: State<AppState>) -> Option<addon_socket::BotPose> {
+        *state.bot_pose.lock().unwrap()
+    }
+
+    /// Skin real do jogador (PNG em data URL + variante do modelo), mandada
+    /// pelo addon — ver `player_skin.rs`. `None` enquanto o addon não mandou
+    /// (o viewer mostra o modelo sem textura, não uma skin inventada).
+    #[tauri::command]
+    fn player_skin(state: State<AppState>) -> Option<player_skin::PlayerSkin> {
+        state.player_skin.lock().unwrap().clone()
+    }
+
     /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco a
     /// partir do client jar que o usuário já tem instalado — nunca baixa
     /// nada. Precisa saber a versão do MC, que só existe depois que o addon
@@ -285,6 +308,8 @@ mod commands {
             queue_cancel,
             storage_totals,
             vitals_snapshot,
+            bot_pose,
+            player_skin,
             get_texture_atlas,
         ])
     }

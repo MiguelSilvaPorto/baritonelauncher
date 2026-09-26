@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, type ColumnBlock, type BotPos, type UvRect } from "./viewer3d";
+import { Viewer3D, type BotPos, type BotPose, type ColumnBlock, type UvRect } from "./viewer3d";
 
 interface TextureAtlas {
   image_data_url: string;
@@ -17,7 +17,14 @@ interface ConnectionStatus {
 interface WorldSummary {
   chunks_explored: number;
   chunks_total_estimate: number;
-  bot_pos?: BotPos;
+  bot_pos?: { x: number; y: number; z: number };
+}
+
+/** Skin real do jogador (comando `player_skin`, ver `player_skin.rs`). */
+interface PlayerSkin {
+  name: string;
+  model: string;
+  image_data_url: string;
 }
 
 type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed" | "Canceled";
@@ -320,13 +327,14 @@ let viewer3d: Viewer3D | null = null;
 let lastBotPos: BotPos | null = null;
 
 async function refreshState() {
-  const [status, world, columns, queue, totals, vitals] = await Promise.all([
+  const [status, world, columns, queue, totals, vitals, skin] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
     invoke<ColumnBlock[]>("world_columns"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
+    invoke<PlayerSkin | null>("player_skin"),
   ]);
 
   lastBotPos = world.bot_pos ?? null;
@@ -341,7 +349,9 @@ async function refreshState() {
         .catch((err) => console.error("[atlas]", err));
     }
     viewer3d.setColumns(columns);
-    viewer3d.setBotPos(world.bot_pos ?? null);
+    // A skin real (ou `null` enquanto o addon não mandou) — o viewer mostra o
+    // modelo sem textura em vez de inventar uma skin.
+    viewer3d.setPlayerSkin(skin ? { model: skin.model, imageDataUrl: skin.image_data_url } : null);
   }
   renderHud(vitals);
   renderQueue(queue);
@@ -351,6 +361,19 @@ async function refreshState() {
 // 1s = mesmo intervalo de envio de vitais do addon (ver addon_socket.rs) — não
 // há push do backend pro frontend ainda, então isso é polling, não streaming.
 const REFRESH_INTERVAL_MS = 1000;
+
+// 250ms = mesma cadência do envio de `position` do addon (4x/s). A pose anda
+// em intervalo próprio porque no polling de 1s o modelo andaria em saltos; o
+// payload é minúsculo (5 números), então não pesa.
+const POSE_INTERVAL_MS = 250;
+
+async function refreshPose() {
+  try {
+    viewer3d?.setBotPose(await invoke<BotPose | null>("bot_pose"));
+  } catch (err) {
+    console.error("[bot_pose]", err);
+  }
+}
 
 window.addEventListener("DOMContentLoaded", () => {
   bootstrapRail();
@@ -363,4 +386,6 @@ window.addEventListener("DOMContentLoaded", () => {
 
   refreshState();
   setInterval(refreshState, REFRESH_INTERVAL_MS);
+  refreshPose();
+  setInterval(refreshPose, POSE_INTERVAL_MS);
 });
