@@ -21,6 +21,15 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   (`NearestMipmapLinearFilter`: nítido de perto, média entre níveis de longe) com anisotropia. Cada
   nível de mip mistura só conteúdo do mesmo bloco, então some a grade e a cintilação. Reportado pelo
   usuário ("essa separação que fica quando eu enxergo de longe").
+- **Videira (e líquen brilhante / veia de sculk) não apareciam no viewer**: o addon decide o que
+  desenhar olhando `canBeReplaced()` do bloco — e no registro vanilla a videira é `.replaceable()`,
+  então saía do payload com flags zero. Resultado: um bioma de selva cheio de videira aparecia sem
+  nenhuma, mesmo o bloco existindo no chunk carregado. Agora videira e os blocos de face
+  (`MultifaceBlock`) entram como renderizáveis de propósito — são geometria visível colada nas
+  paredes, não decoração em cruz; grama alta, flor e muda continuam fora do desenho (virariam cubo
+  cheio e poluiriam a cena). A textura `vine` e o tint de folhagem já existiam no viewer; o que
+  faltava era o bloco chegar marcado. Reportado pelo usuário ("quero que vc arrume as videiras que
+  não são carregadas o bioma que estou não mostra videira nenhuma").
 - **Carregamento de chunks em ordem arbitrária, sem priorizar o que está ao redor do bot**: o viewer
   pedia `world_chunks` (o cache inteiro, que cresce sem limite) e usava os primeiros quatro na ordem
   em que o `HashMap` devolvia — o terreno ao redor do bot podia ser o último a chegar. Agora o
