@@ -12,6 +12,20 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **App travava a cada gravação do mundo (justo quando o bot se move)**: o gravador periódico do
+  `world_store` fazia **tudo** — serializar, comprimir e escrever — segurando o lock do `WorldCache`.
+  Medido com o cache real desta máquina (19,6 MB crus, build debug): ~2,25 s só para serializar os
+  chunks + ~1,3 s de zlib. Enquanto isso, todo comando que toca o mundo (`world_summary`,
+  `world_chunks_near`, `chunk_voxels`) e o próprio handler do socket ficavam esperando o lock —
+  resultado: segundos de travamento a cada 5 s, exatamente enquanto o bot anda e chunks novos chegam
+  (o `world_revision` muda e dispara a gravação). Três correções: (1) cada chunk agora carrega o
+  próprio payload binário em cache, montado uma vez quando o chunk chega (`Chunk::encoded_payload`) —
+  o arquivo de cache já guarda exatamente esses bytes, então o load também não re-serializa nada;
+  (2) a compressão e a escrita saem do lock, numa thread de blocking (`spawn_blocking`), sobrando só o
+  memcpy de montar o arquivo (~92 ms medidos, 24× menos); (3) a compressão usa nível 1 (~0,46 s em vez
+  de ~1,3 s, +0,6 MB no arquivo). O fechamento continua gravando, sem reescrever quando nada mudou
+  (`LAST_SAVED_REVISION`). Reportado pelo usuário ("qualquer movimento... qualquer conclusão que meu
+  Minecraft conclui o meu app trava").
 - **Carregamento de chunks em ordem arbitrária, sem priorizar o que está ao redor do bot**: o viewer
   pedia `world_chunks` (o cache inteiro, que cresce sem limite) e usava os primeiros quatro na ordem
   em que o `HashMap` devolvia — o terreno ao redor do bot podia ser o último a chegar. Agora o

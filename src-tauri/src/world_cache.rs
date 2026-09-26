@@ -9,6 +9,7 @@
 //! `mod-addon/README.md`.
 
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 /// Versão do payload binário de `chunk_voxels`. O addon Java e este módulo
@@ -91,6 +92,32 @@ pub struct Chunk {
     /// Só as seções com pelo menos um bloco não-ar; seção ausente = ar.
     pub sections: Vec<ChunkSection>,
     pub dirty: bool,
+    /// Payload de `encode_voxels` derivado de `sections`, pronto pra ir pro
+    /// socket/arquivo — ver `encoded_payload`. Serializar um mundo de ~20 MB
+    /// leva segundos em build debug; recalcular isso a cada gravação (ou a
+    /// cada pedido de chunk) seguraria o lock do mundo por muito tempo, então
+    /// o resultado fica cacheado por versão das seções e fora do serde (é
+    /// derivado, não dado).
+    #[serde(skip)]
+    encoded: OnceCell<Vec<u8>>,
+}
+
+impl Chunk {
+    /// Payload do chunk no formato do `chunk_voxels`, calculado na primeira
+    /// leitura se ainda não tiver sido (caminho de teste; o de produção já
+    /// entrega pronto em `apply_voxels`/`apply_voxels_with_payload`).
+    pub fn encoded_payload(&self) -> &[u8] {
+        self.encoded.get_or_init(|| encode_voxels(&self.sections))
+    }
+
+    fn set_sections(&mut self, sections: Vec<ChunkSection>, payload: Option<Vec<u8>>) {
+        self.sections = sections;
+        let cell = OnceCell::new();
+        if let Some(payload) = payload {
+            let _ = cell.set(payload);
+        }
+        self.encoded = cell;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -118,10 +145,26 @@ impl WorldCache {
     /// Substitui o conteúdo do chunk por um snapshot completo (o addon manda
     /// o chunk inteiro no load). Sem merge: se o chunk for reenviado (ex:
     /// recarregado depois de sair e voltar ao render distance), o snapshot
-    /// novo manda.
+    /// novo manda. O payload binário é montado aqui, por chunk — assim a
+    /// gravação do mundo (`world_store.rs`) só copia bytes prontos.
     pub fn apply_voxels(&mut self, pos: ChunkPos, sections: Vec<ChunkSection>) {
+        let payload = encode_voxels(&sections);
         let chunk = self.chunks.entry(pos).or_default();
-        chunk.sections = sections;
+        chunk.set_sections(sections, Some(payload));
+        chunk.dirty = true;
+    }
+
+    /// Igual a `apply_voxels`, mas recebe o payload já pronto (o arquivo de
+    /// cache guarda exatamente esses bytes) — evita re-serializar o mundo
+    /// inteiro ao carregar do disco.
+    pub fn apply_voxels_with_payload(
+        &mut self,
+        pos: ChunkPos,
+        sections: Vec<ChunkSection>,
+        payload: Vec<u8>,
+    ) {
+        let chunk = self.chunks.entry(pos).or_default();
+        chunk.set_sections(sections, Some(payload));
         chunk.dirty = true;
     }
 
@@ -130,7 +173,7 @@ impl WorldCache {
     /// trata isso como "ainda não pronto", não como chunk vazio.
     pub fn chunk_voxels_bytes(&self, pos: ChunkPos) -> Vec<u8> {
         match self.chunks.get(&pos) {
-            Some(chunk) => encode_voxels(&chunk.sections),
+            Some(chunk) => chunk.encoded_payload().to_vec(),
             None => Vec::new(),
         }
     }
@@ -438,5 +481,31 @@ mod tests {
 
         // `limit` maior que o conjunto devolve tudo.
         assert_eq!(nearest_chunks(chunks.iter(), 0, 0, 99).len(), chunks.len());
+    }
+
+    #[test]
+    fn encoded_payload_follows_the_sections() {
+        let mut world = WorldCache::new();
+        let sections = example_sections();
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.apply_voxels(pos, sections.clone());
+        assert_eq!(
+            world.chunk_voxels_bytes(pos),
+            encode_voxels(&sections),
+            "payload cacheado deveria ser o encode das seções"
+        );
+
+        // Reaplicar um snapshot novo invalida o payload antigo.
+        let other = vec![ChunkSection {
+            y: 9,
+            palette: vec![PaletteEntry {
+                block: "sand".to_string(),
+                flags: VOXEL_FLAG_RENDER,
+                level: 0,
+            }],
+            indices: vec![0; 4096],
+        }];
+        world.apply_voxels(pos, other.clone());
+        assert_eq!(world.chunk_voxels_bytes(pos), encode_voxels(&other));
     }
 }
