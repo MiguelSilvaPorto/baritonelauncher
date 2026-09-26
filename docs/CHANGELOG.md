@@ -157,6 +157,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   conectado — mostrando o mundo em cache"; sem cache nenhum, continua o estado vazio honesto de
   sempre. Nada é inventado: é o dado real que o addon mandou e foi salvo. Reportado pelo usuário
   ("quero que adicione um cache que evita eu sempre ter o jogo aberto para ver oque já carreguei").
+- **Renderizador do jogador de verdade — com a skin do próprio jogador**: o viewer mostrava uma bola
+  teal no lugar do jogador. Agora desenha o modelo do Minecraft (cabeça, tronco, braços e pernas, nas
+  proporções e UVs do `HumanoidModel`/`PlayerModel` do jogo, incluindo as camadas de sobreposição —
+  chapéu, jaqueta, mangas, calças) com a skin real que o jogador usa em jogo, na variante `slim`
+  (Alex, braço de 3px) ou `wide` (Steve, 4px). O addon lê a textura que o client **já tem carregada**
+  (a skin baixada/customizada no cache de texturas ou a padrão do resource pack/jar — nada é baixado
+  da Mojang, mesma regra do atlas de blocos) e manda um `player_skin` (PNG em base64) quando ela
+  muda; o app valida, guarda em memória e expõe o comando `player_skin`. A caminhada usa as contas do
+  `WalkAnimationState` do jogo, e a pose real (a mensagem `position` agora carrega yaw/pitch,
+  expostos pelo comando `bot_pose`) é interpolada entre os updates de 4x/s — o modelo anda em vez de
+  piscar de posição em posição e gira pra onde o jogador olha. Um anel teal raso no chão substitui o
+  glow da esfera antiga, pra posição continuar legível de longe. Enquanto a skin não chega, o modelo
+  aparece sem textura (cinza neutro) — nunca uma skin inventada. Reportado pelo usuário ("quero que
+  vc adicione um renderizador do jogador no meu aplicativo hoje é só um bola azul... adicione um
+  player do minecraft de verdade que pega a textura do próprio jogador").
 - **Água e lava renderizadas de verdade — nível, transparência, animação e fluxo direcional** — o
   viewer tratava (quando renderizava) fluido como cubo opaco de 1×1×1, e `water_flow`/`lava_flow`
   eram puladas de vez, então não existia "fluxo" visual nenhum. Agora o protocolo `chunk_voxels`

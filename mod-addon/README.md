@@ -9,11 +9,16 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
 
 - Compila contra `baritone.api` (jar oficial, ver seção abaixo) e roda junto do
   Baritone de verdade no client — testado manualmente em NeoForge `26.3.0.22-beta`.
-- A cada tick do cliente, lê vida/fome/saturação/armadura (1x/s) e posição
-  (`getPlayerContext().playerFeet()`, 4x/s) do jogador via
+- A cada tick do cliente, lê vida/fome/saturação/armadura (1x/s) e posição +
+  rotação (`getPlayerContext().playerFeet()`, `getYRot()`/`getXRot()`, 4x/s) do jogador via
   `BaritoneAPI.getProvider().getPrimaryBaritone()` (prova que a dependência do
   Baritone resolve e funciona em runtime, não só em tempo de compilação) e
   manda pro app Rust por um socket TCP local.
+- Manda a skin do próprio jogador (`player_skin`, PNG em base64 + variante
+  `slim`/`wide`) sempre que a textura muda — lida do que o client já tem
+  carregado (cache de texturas pra skin baixada/customizada, resource pack/jar
+  pra padrão), sem baixar nada da Mojang. É o que deixa o viewer desenhar o
+  modelo de verdade do jogador em vez de um marcador genérico.
 - Assina `ChunkEvent.Load` (client-side) e enfileira o chunk pro envio de
   `chunk_voxels`: cada seção 16×16×16 vira paleta + índices (deflate + base64),
   com flags de renderização/oclusão/fluido e o nível de cada fluido — é daí
@@ -60,7 +65,13 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
   — primeira mensagem, marca `connection_status` como conectado no app.
 - `{"type":"vitals","health":20.0,"max_health":20.0,"hunger":20,"saturation":5.0,"armor_points":0}`
   — a cada ~20 ticks.
-- `{"type":"position","x":123,"y":64,"z":45}` — a cada ~5 ticks.
+- `{"type":"position","x":123,"y":64,"z":45,"yaw":90.0,"pitch":12.5}` — a
+  cada ~5 ticks (yaw/pitch = rotação real do jogador, usada pra orientar o
+  modelo no viewer).
+- `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` —
+  quando a skin muda (inclui a padrão, se o perfil ainda não carregou a
+  real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
+  client ou do resource pack/jar instalado, nunca baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
   (paleta + índices por seção, deflate + base64). Por entrada da paleta:
   `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido

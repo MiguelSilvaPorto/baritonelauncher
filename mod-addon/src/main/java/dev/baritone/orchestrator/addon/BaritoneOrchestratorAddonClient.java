@@ -7,10 +7,15 @@ import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.utils.BetterBlockPos;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.block.LiquidBlock;
@@ -166,6 +171,12 @@ public class BaritoneOrchestratorAddonClient {
             }
         }
 
+        // Skin do próprio jogador pro viewer desenhar o modelo de verdade em
+        // vez do marcador genérico — só manda quando a textura muda.
+        if (helloSent) {
+            sendPlayerSkinIfChanged(player);
+        }
+
         for (int i = 0; i < CHUNK_PAYLOADS_PER_TICK && !pendingChunkPayloads.isEmpty(); i++) {
             sendChunkVoxels(pendingChunkPayloads.poll());
         }
@@ -176,8 +187,8 @@ public class BaritoneOrchestratorAddonClient {
             BetterBlockPos pos = baritone.getPlayerContext().playerFeet();
             send(String.format(
                     Locale.ROOT,
-                    "{\"type\":\"position\",\"x\":%d,\"y\":%d,\"z\":%d}",
-                    pos.x, pos.y, pos.z
+                    "{\"type\":\"position\",\"x\":%d,\"y\":%d,\"z\":%d,\"yaw\":%.1f,\"pitch\":%.1f}",
+                    pos.x, pos.y, pos.z, player.getYRot(), player.getXRot()
             ));
         }
 
@@ -202,6 +213,90 @@ public class BaritoneOrchestratorAddonClient {
         if (ticksSinceLastInstructionStatus >= POSITION_INTERVAL_TICKS) {
             ticksSinceLastInstructionStatus = 0;
             tickActiveInstruction(baritone);
+        }
+    }
+
+    /**
+     * Manda a skin do próprio jogador (PNG em base64) pro app desenhar o
+     * modelo de verdade no viewer. Os bytes saem do que o jogo já tem: o
+     * cache de texturas do client pra skin baixada/customizada, ou o
+     * resource pack/jar instalado pra skin padrão — nada é baixado da Mojang
+     * aqui (mesma regra de {@code texture_atlas.rs}: ler o que já está
+     * instalado, nunca baixar/empacotar asset).
+     *
+     * <p>Roda a cada tick, mas só envia quando a textura muda: a skin do
+     * perfil pode chegar um instante depois do join (até lá o client desenha
+     * a skin padrão, que é a resposta honesta — é o que o jogo mostra), então
+     * mandar uma vez só no hello perderia a skin real.
+     */
+    private static void sendPlayerSkinIfChanged(LocalPlayer player) {
+        PlayerSkin skin;
+        try {
+            skin = player.getSkin();
+        } catch (RuntimeException e) {
+            return; // player info/skin ainda não disponível — tenta no próximo tick
+        }
+
+        String signature = skin.body().texturePath() + "|" + skin.model().getSerializedName();
+        if (signature.equals(lastSkinSignature)) {
+            return;
+        }
+
+        byte[] png = skinPngBytes(skin);
+        if (png == null) {
+            return; // textura ainda não registrada/legível — tenta no próximo tick
+        }
+
+        lastSkinSignature = signature;
+        send(String.format(
+                Locale.ROOT,
+                "{\"type\":\"player_skin\",\"name\":\"%s\",\"model\":\"%s\",\"png_base64\":\"%s\"}",
+                player.getGameProfile().name(),
+                skin.model().getSerializedName(),
+                Base64.getEncoder().encodeToString(png)
+        ));
+    }
+
+    /**
+     * PNG da skin: textura em cache do client (skin baixada/customizada) ou
+     * direto do resource pack/jar (skin padrão). {@code null} = ainda não dá
+     * (tenta de novo no próximo tick).
+     */
+    private static byte[] skinPngBytes(PlayerSkin skin) {
+        Identifier texturePath = skin.body().texturePath();
+        try {
+            AbstractTexture texture = Minecraft.getInstance().getTextureManager().getTexture(texturePath);
+            if (texture instanceof DynamicTexture dynamic && !dynamic.getPixels().isClosed()) {
+                return toPngBytes(dynamic.getPixels());
+            }
+            return Minecraft.getInstance()
+                    .getResourceManager()
+                    .getResource(texturePath)
+                    .map(resource -> {
+                        try (InputStream in = resource.open()) {
+                            return in.readAllBytes();
+                        } catch (IOException e) {
+                            return null;
+                        }
+                    })
+                    .orElse(null);
+        } catch (RuntimeException | IOException e) {
+            return null;
+        }
+    }
+
+    /**
+     * {@code NativeImage} não expõe um encoder PNG público em bytes; passar
+     * por um arquivo temporário usa o encoder do próprio jogo (STB) e o
+     * arquivo é apagado na sequência. Só roda quando a skin muda.
+     */
+    private static byte[] toPngBytes(NativeImage image) throws IOException {
+        Path tmp = Files.createTempFile("baritone-orchestrator-skin", ".png");
+        try {
+            image.writeToFile(tmp);
+            return Files.readAllBytes(tmp);
+        } finally {
+            Files.deleteIfExists(tmp);
         }
     }
 
@@ -622,6 +717,7 @@ public class BaritoneOrchestratorAddonClient {
             socket = newSocket;
             out = newSocket.getOutputStream();
             helloSent = false;
+            lastSkinSignature = null; // conexão nova: o app precisa da skin de novo
             startReader(newSocket);
         } catch (IOException e) {
             // The Rust app probably isn't running yet — quietly retry later.
