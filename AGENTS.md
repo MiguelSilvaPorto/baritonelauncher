@@ -139,8 +139,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   rows.
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
   own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
-  `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
-  `resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real
+  `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/
+  `setNearbyMobs()`/`clear()`/`resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes
+  per-bucket meshes with real
   face culling (including against already-loaded neighbors); the mesh work is queued and drained with
   a per-frame budget (`drainMeshQueue`), and `main.ts` asks for the nearest chunks first
   (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). The
@@ -170,12 +171,12 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
   `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`world_time`/
-  `player_skin`, `settings` (Config tab), plus
+  `player_skin`, the mob snapshot (`mobs.rs`), `settings` (Config tab), plus
   `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
   `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
-  `vitals_snapshot`, `bot_pose`, `world_time`, `player_skin`,
+  `vitals_snapshot`, `bot_pose`, `world_time`, `player_skin`, `nearby_mobs`,
   `get_texture_atlas`, `settings_get`, `settings_set`, `settings_reset`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
@@ -186,8 +187,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   directions**. Addon → app: `hello` (marks `AppState.connection` as connected + dispatches queued
   instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos` and
   `AppState.bot_pose` — feet coordinates plus yaw/pitch), `world_time` (the overworld clock in
-  ticks → the viewer's day/night cycle), `player_skin` (the player's own skin as a
-  base64 PNG, sent whenever the texture changes → `player_skin.rs`),
+  ticks → the viewer's day/night cycle), `player_skin` (the player's own skin as a base64 PNG, sent
+  whenever the texture changes → `player_skin.rs`), `entities` (snapshot of the living mobs within
+  32 blocks, ~4x/s, category/name/health/distance per entity → `mobs.rs`),
   `chunk_voxels` (full chunk, palette + indices per section, **plus per-column biome tints** —
   grass/foliage/water colors the addon resolves with the client's own `BiomeColors`, payload v3;
   v2 is still accepted for old caches/addon jars, without tints — deflate+base64 →
@@ -279,8 +281,12 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **Instructions only cover `travel_to`/`explore`.** The reverse channel works end to end
   (`queue_push` → addon → `instruction_status`), but `Mine`/`Build`/`FetchFromChest`/`Craft`/`Smelt`
   have no executor in the addon yet, and the UI composer only creates the two executable kinds.
-- **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
-  described in `docs/SPEC.md`.
+- **No `SurvivalProcess`/threat *reaction* or `ContainerScreen` simulation in the addon** — the mob
+  scan exists (the addon streams `entities` and the viewer identifies each mob with a label), but
+  nothing fights, flees or raises a shield; the rest is still only described in `docs/SPEC.md`.
+- **Mobs are identified, not modeled.** The viewer draws a projected label (real game name, category,
+  distance, health) per mob — there is no entity-model/UV/animation pipeline for mob types (the
+  atlas only covers block textures).
 - **Clouds are fixed overworld height, with the viewer's fog.** The pattern, the 192.33 height, the
   12×12×4 cells, the per-face shading, the 0.6 block/s drift and the day/night color multiplier
   (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`) are the game's, but the height is always the

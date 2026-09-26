@@ -179,6 +179,82 @@ button, input { font-family: inherit; }
   white-space: nowrap;
 }
 
+/* ---------- Mobs ao redor do bot (comando `nearby_mobs`) ---------- */
+
+.mob-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Rótulo projetado por mob — nome, categoria (pela cor) e distância/vida. */
+.mob-label {
+  position: absolute;
+  display: none;
+  transform: translate(-50%, -100%);
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 6px;
+  background: rgba(10, 12, 15, 0.72);
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.25;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.mob-label .mob-name { color: var(--text-2); }
+.mob-label .mob-meta { font-size: 9px; color: var(--text-3); }
+
+/* Hostil = perigo (token `--danger`, mesma semântica de ameaça do HUD de
+ * vida); neutro/passivo/outro ficam no cinza padrão — sem cor decorativa. */
+.mob-label.mob-hostile { border-color: var(--danger); }
+.mob-label.mob-hostile .mob-name { color: var(--danger); }
+
+.mob-panel {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 200px;
+  max-width: 280px;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.mob-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mob-panel-header .title {
+  font-size: 10px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mob-panel-header .count { font-size: 10px; color: var(--text-3); }
+
+.mob-row { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.mob-row .dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--border-2); }
+.mob-row.hostile .dot { background: var(--danger); }
+.mob-row .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.mob-row.hostile .name { color: var(--text); }
+.mob-row .meta { flex: 0 0 auto; font-size: 10px; color: var(--text-3); }
+
+.mob-empty { font-size: 11px; color: var(--text-3); }
+.mob-more { font-size: 10px; color: var(--text-3); }
+
 /* Alvo do clique no terreno (âmbar = planejado): coordenadas + ações. Fica
  * acima e centralizado no bloco escolhido — a posição vem do `viewer3d.ts`,
  * que projeta o ponto 3D na tela a cada frame. */
