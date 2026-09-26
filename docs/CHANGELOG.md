@@ -12,6 +12,18 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Canvas 3D ficava visualmente pequeno/distorcido, rótulo de coordenada em lugar errado**:
+  `renderer.setSize(w, h)` do Three.js escreve `width`/`height` inline no `style` do próprio elemento
+  `<canvas>`, em pixels — isso sobrescreve o CSS que faz o canvas preencher o container
+  (`.viewer-3d canvas { width: 100%; height: 100% }`). Se `resize()` rodasse uma vez com o container
+  ainda sem layout pronto (0px — ex: durante um reload do HMR), o canvas ficava travado nesse tamanho
+  errado pra sempre, mesmo depois do container ter o tamanho certo — só o rótulo de coordenada (que usa
+  as dimensões reais do container a cada frame, não do canvas) continuava calculando a posição certa,
+  daí o descompasso entre onde o marcador aparecia e onde o texto das coordenadas aparecia. Duas
+  correções: `resize()` agora ignora chamadas com container de tamanho zero (não força um aspect ratio
+  degenerado), e `renderer.setSize(w, h, false)` — o `false` impede o Three.js de mexer no `style`
+  inline, deixando o CSS sempre no controle do tamanho visual. Reportado pelo usuário ("as coordenadas
+  estão erradas em comparação ao boneco a visualização está erradíssima").
 - **Placa texturizada saía sem cor nenhuma (cinza)**: o representante fixo usado enquanto o addon não
   manda o bloco real de cada chunk era `grass_block_top` — e essa textura, dentro do jar, é
   literalmente cinza (RGB médio 147,147,147, R=G=B); a cor verde real só existe em runtime, via

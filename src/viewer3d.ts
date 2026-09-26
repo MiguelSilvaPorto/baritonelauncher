@@ -274,11 +274,25 @@ export class Viewer3D {
   }
 
   resize() {
-    const width = this.container.clientWidth || 1;
-    const height = this.container.clientHeight || 1;
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    // Se o container ainda não tem layout pronto (0px — ex: chamado antes
+    // do primeiro paint, ou enquanto a view está `display:none`), não faz
+    // nada. Um resize de verdade acontece depois (troca de modo, resize da
+    // janela) — melhor que forçar aspect ratio 1:1/degenerado nesse meio
+    // tempo.
+    if (width === 0 || height === 0) return;
+
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
-    this.renderer.setSize(width, height);
+    // `false` = não escreve width/height inline no style do canvas. Isso é
+    // do CSS (`.viewer-3d canvas { width: 100%; height: 100% }`) — se o
+    // Three.js escrevesse um pixel inline aqui e essa chamada acontecesse
+    // com um tamanho errado/desatualizado, o canvas ficava visualmente
+    // pequeno/distorcido pra sempre, mesmo depois do container ter o
+    // tamanho certo — foi exatamente o bug relatado ("visualização
+    // erradíssima", rótulo de coordenada em lugar diferente do marcador).
+    this.renderer.setSize(width, height, false);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   }
 
