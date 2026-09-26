@@ -12,6 +12,14 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Mensagem de protocolo desconhecido era descartada em silêncio**: quando o app recebe uma mensagem
+  que o `AddonMessage` não conhece (ex: um jar do addon antigo ainda mandando `chunk_surface`, do
+  protocolo antigo), ela era simplesmente ignorada — sem nenhum aviso, o viewer ficava vazio sem
+  pista do motivo. Agora a primeira ocorrência de cada tipo vira um aviso no console com o `type` e o
+  erro de parse, e ao fim da conexão sai um resumo por tipo (`chunk_surface × 412, chunk_loaded × 57`)
+  junto com a contagem de linhas que nem eram JSON. Foi esse silêncio que transformou um jar do addon
+  desatualizado (esquecido sem rebuild depois da mudança pra `chunk_voxels`) num "parou de carregar
+  chunks" sem nenhuma mensagem de erro.
 - **Folhas, videira e lírio-d'água saíam cinza**: essas texturas vêm em tons de cinza no próprio jar
   — o verde só existe em runtime via "biome tint" (colormap/JSON de bioma, não implementado). Agora
   levam tint fixo aproximado, igual já era feito com a grama: folhagem no tom de floresta (carvalho,
