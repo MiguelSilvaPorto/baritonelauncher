@@ -33,8 +33,16 @@ import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
 const BLOCK_TEXTURE_PX = 16; // resolução dos tiles do atlas (frames 32×32 são reduzidos lá)
 const COLOR_BG = 0x0a0c0f;
 const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso")
-const COLOR_AMBER = 0xf2b155; // token `--amber` do SPEC ("ação planejada") — camada de edição
+// token `--amber` do SPEC ("ação planejada"): camada de edição do editor e
+// alvo clicado da fila.
+const COLOR_AMBER = 0xf2b155;
 const MAX_EDIT_VOLUME = 50_000; // teto de blocos por operação de região (um clique só)
+
+// Clique vs. arrastar: o botão esquerdo orbita (OrbitControls) e também edita
+// (editor) ou escolhe o alvo da fila — só conta como clique se o ponteiro quase
+// não andou (um clique lento, mas parado, continua valendo).
+const CLICK_MAX_MOVE_PX = 6;
+const CLICK_MAX_MS = 800;
 
 // Movimento por teclado ("voo" pela cena): o OrbitControls sozinho só responde
 // ao mouse, então qualquer deslocamento exigia arrastar/orbitar — e o alvo da
@@ -399,6 +407,34 @@ export class Viewer3D {
 
   private labelEl: HTMLDivElement;
 
+  /** Alvo escolhido clicando no terreno (âmbar) + popup de ações — ver
+   * `pickTargetAt`/`setTarget`. `null` = nenhum alvo. */
+  private targetMarker: THREE.Group;
+  private targetEl: HTMLDivElement;
+  private targetBlock: { x: number; y: number; z: number } | null = null;
+  private readonly raycaster = new THREE.Raycaster();
+  private readonly pointerNdc = new THREE.Vector2();
+  private pointerDownAt: { x: number; y: number; time: number } | null = null;
+
+  /** Instruções da fila com alvo, desenhadas no mundo (uma caixa de arame por
+   * instrução): âmbar = `Queued`, teal = `Active` — ver `setInstructionTargets`. */
+  private readonly instructionMarkers = new Map<string, THREE.Mesh>();
+  private readonly ghostGeometry = new THREE.BoxGeometry(1.04, 1.04, 1.04);
+  private readonly ghostQueuedMaterial = new THREE.MeshBasicMaterial({
+    color: COLOR_AMBER,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.45,
+    fog: false,
+  });
+  private readonly ghostActiveMaterial = new THREE.MeshBasicMaterial({
+    color: COLOR_TEAL,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.75,
+    fog: false,
+  });
+
   // Estado do voo por teclado — ver `handleKeyDown`/`applyMovement`.
   private keysDown = new Set<string>();
   private turboKey = false;
@@ -431,7 +467,6 @@ export class Viewer3D {
   private ghostGroup = new THREE.Group();
   /** Ghosts instanciados por (bloco, quebrar|colocar). */
   private ghostMeshes = new Map<string, THREE.InstancedMesh>();
-  private pointerDownAt: { x: number; y: number } | null = null;
   private iconCache = new Map<string, string>();
   private readonly scratchMatrix = new THREE.Matrix4();
   /** Chamado quando a camada de edição ou a seleção muda — a UI usa pra
@@ -467,9 +502,10 @@ export class Viewer3D {
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
 
-  constructor(container: HTMLElement, labelEl: HTMLDivElement) {
+  constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
     this.labelEl = labelEl;
+    this.targetEl = targetEl;
 
     this.scene = new THREE.Scene();
     this.fog = new THREE.Fog(COLOR_BG, FOG_NEAR_BASE, FOG_FAR_BASE);
@@ -507,6 +543,19 @@ export class Viewer3D {
     window.addEventListener("keyup", this.handleKeyUp);
     window.addEventListener("blur", this.clearKeys);
 
+    // Clique parado no terreno escolhe o destino; arrastar continua orbitando
+    // (o OrbitControls escuta os mesmos eventos, então nada de preventDefault
+    // aqui — a distinção é só o movimento/tempo). O mesmo clique vira edição
+    // quando há uma ferramenta do editor ativa — ver `handlePointerUp`.
+    const canvas = this.renderer.domElement;
+    canvas.addEventListener("pointerdown", this.handlePointerDown);
+    canvas.addEventListener("pointerup", this.handlePointerUp);
+    canvas.addEventListener("pointermove", this.handlePointerMove);
+    canvas.addEventListener("pointerleave", () => {
+      this.hovered = null;
+      this.hoverHelper.visible = false;
+    });
+
     this.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
     const sun = new THREE.DirectionalLight(0xffffff, 0.5);
     sun.position.set(80, 120, 40);
@@ -517,19 +566,14 @@ export class Viewer3D {
     this.scene.add(this.botMarker);
 
     // Editor: helpers de arame (hover/seleção) e o grupo dos ghosts — ver
-    // `rebuildGhosts`. Os listeners de clique ficam no canvas; editar só vale
-    // com uma ferramenta ativa (`editMode`).
+    // `rebuildGhosts`.
     this.scene.add(this.ghostGroup);
     this.hoverHelper = this.buildWireBox(COLOR_TEAL);
     this.selectionHelper = this.buildWireBox(COLOR_AMBER);
-    const canvas = this.renderer.domElement;
-    canvas.addEventListener("pointerdown", this.handlePointerDown);
-    canvas.addEventListener("pointerup", this.handlePointerUp);
-    canvas.addEventListener("pointermove", this.handlePointerMove);
-    canvas.addEventListener("pointerleave", () => {
-      this.hovered = null;
-      this.hoverHelper.visible = false;
-    });
+
+    // Alvo clicado da fila (instruções) — caixa âmbar sobre o bloco escolhido.
+    this.targetMarker = this.buildTargetMarker();
+    this.scene.add(this.targetMarker);
 
     this.resize();
     this.animate();
@@ -546,6 +590,26 @@ export class Viewer3D {
     box.visible = false;
     this.scene.add(box);
     return box;
+  }
+
+  /** Caixa de arame âmbar sobre o bloco clicado — planejado, ainda não
+   * enviado (a cor segue a identidade: âmbar = ação/planejado). O preenchimento
+   * translúcido existe só pra dar volume; `fog: false` pra nunca sumir no
+   * horizonte, igual o marcador do bot. */
+  private buildTargetMarker(): THREE.Group {
+    const group = new THREE.Group();
+    const geometry = new THREE.BoxGeometry(1.02, 1.02, 1.02);
+    const fill = new THREE.Mesh(
+      geometry,
+      new THREE.MeshBasicMaterial({ color: COLOR_AMBER, transparent: true, opacity: 0.14, depthWrite: false, fog: false })
+    );
+    const wire = new THREE.Mesh(
+      geometry,
+      new THREE.MeshBasicMaterial({ color: COLOR_AMBER, wireframe: true, transparent: true, opacity: 0.9, fog: false })
+    );
+    group.add(fill, wire);
+    group.visible = false;
+    return group;
   }
 
   /** Grupo do jogador: o modelo do Minecraft + um anel teal raso no chão. O
@@ -1144,6 +1208,110 @@ export class Viewer3D {
     return this.container.clientWidth > 0 && this.container.clientHeight > 0;
   }
 
+  private handlePointerDown = (event: PointerEvent) => {
+    if (event.button !== 0) return;
+    this.pointerDownAt = { x: event.clientX, y: event.clientY, time: performance.now() };
+  };
+
+  private handlePointerUp = (event: PointerEvent) => {
+    const down = this.pointerDownAt;
+    this.pointerDownAt = null;
+    if (!down || event.button !== 0) return;
+    const moved = Math.hypot(event.clientX - down.x, event.clientY - down.y);
+    if (moved > CLICK_MAX_MOVE_PX || performance.now() - down.time > CLICK_MAX_MS) return;
+    // Com uma ferramenta do editor ativa o clique é edição; o alvo da fila
+    // fica de fora (nada de mirar instrução sem querer enquanto se pinta).
+    if (this.editMode) {
+      const hit = this.pickBlock(event.clientX, event.clientY);
+      if (hit) this.applyToolAt(hit);
+      return;
+    }
+    this.pickTargetAt(event.clientX, event.clientY);
+  };
+
+  /** Raycast do clique contra as malhas dos chunks. A geometria é composta de
+   * quads em coordenadas de mundo, então recuar meio bloco contra a normal
+   * (`-0.5 × normal`) cai dentro do bloco clicado — serve tanto pra face de
+   * topo quanto pra lateral (e a face rebaixada de fluido, que fica abaixo de
+   * y+1). Clicar no céu limpa o alvo. */
+  private pickTargetAt(clientX: number, clientY: number) {
+    if (!this.isViewerVisible()) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointerNdc.set(
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
+    );
+    this.raycaster.setFromCamera(this.pointerNdc, this.camera);
+
+    const meshes: THREE.Object3D[] = [];
+    for (const list of this.chunkMeshes.values()) meshes.push(...list);
+    const hit = this.raycaster.intersectObjects(meshes, false)[0];
+    if (!hit || !hit.face) {
+      this.setTarget(null);
+      return;
+    }
+    const inside = hit.point.clone().addScaledVector(hit.face.normal, -0.5);
+    this.setTarget({ x: Math.floor(inside.x), y: Math.floor(inside.y), z: Math.floor(inside.z) });
+  }
+
+  /** Define (ou limpa, com `null`) o alvo do clique — movimento do marcador,
+   * popup de ações e coordenadas. Público porque o `main.ts` limpa o alvo
+   * depois de enfileirar a instrução. */
+  setTarget(pos: { x: number; y: number; z: number } | null) {
+    this.targetBlock = pos;
+    if (!pos) {
+      this.targetMarker.visible = false;
+      this.targetEl.style.display = "none";
+      return;
+    }
+    this.targetMarker.position.set(pos.x + 0.5, pos.y + 0.5, pos.z + 0.5);
+    this.targetMarker.visible = true;
+    this.targetEl.style.display = "flex";
+    const coords = this.targetEl.querySelector<HTMLElement>(".target-coords");
+    if (coords) coords.textContent = `${pos.x}, ${pos.y}, ${pos.z}`;
+  }
+
+  getTarget(): { x: number; y: number; z: number } | null {
+    return this.targetBlock;
+  }
+
+  /** Reflete a fila real no mundo: cada instrução com alvo (`Queued`/`Active`)
+   * vira uma caixa de arame na superfície do bloco apontado — âmbar enquanto
+   * espera, teal enquanto o bot executa (mesma semântica de cor do app). Alvo
+   * fora do que já foi carregado no cache não desenha nada: melhor nada do que
+   * chutar uma altura. */
+  setInstructionTargets(items: { id: string; active: boolean; x: number; z: number }[]) {
+    const seen = new Set<string>();
+    for (const item of items) {
+      const y = this.surfaceYAt(item.x, item.z);
+      if (y === null) continue;
+      seen.add(item.id);
+      let mesh = this.instructionMarkers.get(item.id);
+      if (!mesh) {
+        mesh = new THREE.Mesh(this.ghostGeometry, this.ghostQueuedMaterial);
+        this.scene.add(mesh);
+        this.instructionMarkers.set(item.id, mesh);
+      }
+      mesh.material = item.active ? this.ghostActiveMaterial : this.ghostQueuedMaterial;
+      mesh.position.set(item.x + 0.5, y + 0.5, item.z + 0.5);
+    }
+    for (const [id, mesh] of this.instructionMarkers) {
+      if (seen.has(id)) continue;
+      this.scene.remove(mesh);
+      this.instructionMarkers.delete(id);
+    }
+  }
+
+  /** Primeiro bloco desenhável descendo a coluna — mesma varredura que o
+   * addon fazia por coluna, agora em cima do cache de voxels já recebido. */
+  private surfaceYAt(x: number, z: number): number | null {
+    for (let y = 319; y >= -64; y--) {
+      const entry = this.entryAt(x, y, z);
+      if (entry && (entry.flags & VOXEL_FLAG_RENDER) !== 0) return y;
+    }
+    return null;
+  }
+
   private handleKeyDown = (event: KeyboardEvent) => {
     // Nunca roubar teclas de quem está digitando num campo de texto (não
     // existe campo no viewer hoje, mas o app tem modal/prompt planejados).
@@ -1159,6 +1327,11 @@ export class Viewer3D {
     }
     // Ctrl/Cmd+F etc. continuam sendo atalhos da janela, não da câmera.
     if (event.ctrlKey || event.metaKey || !this.isViewerVisible()) return;
+
+    if (event.code === "Escape") {
+      this.setTarget(null);
+      return;
+    }
 
     this.turboKey = event.shiftKey;
     this.preciseKey = event.altKey;
@@ -1392,22 +1565,6 @@ export class Viewer3D {
     this.container = host;
     this.resize();
   }
-
-  private handlePointerDown = (event: PointerEvent) => {
-    this.pointerDownAt = { x: event.clientX, y: event.clientY };
-  };
-
-  /** Clique = pressionou e soltou no mesmo lugar (arrastar é orbitar/pan).
-   * Só o botão esquerdo edita, e só com uma ferramenta ativa. */
-  private handlePointerUp = (event: PointerEvent) => {
-    const down = this.pointerDownAt;
-    this.pointerDownAt = null;
-    if (!down || !this.editMode || event.button !== 0) return;
-    if (Math.abs(event.clientX - down.x) > 4 || Math.abs(event.clientY - down.y) > 4) return;
-    const hit = this.pickBlock(event.clientX, event.clientY);
-    if (!hit) return;
-    this.applyToolAt(hit);
-  };
 
   private handlePointerMove = (event: PointerEvent) => {
     if (!this.editMode) return;
@@ -1674,6 +1831,11 @@ export class Viewer3D {
     this.clearSelection();
     this.targetBotPos = null;
     this.playerModel.resetWalk();
+    this.setTarget(null);
+    for (const [id, mesh] of this.instructionMarkers) {
+      this.scene.remove(mesh);
+      this.instructionMarkers.delete(id);
+    }
     // Uma nova conexão tenta o atlas de novo (ex: a versão do jogo foi
     // instalada nesse meio tempo) — a falha anterior não é definitiva.
     this.atlasUnavailable = false;
@@ -1717,7 +1879,24 @@ export class Viewer3D {
     this.updateAnimation(now);
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
+    this.updateTargetPosition();
   };
+
+  /** Mantém o popup do alvo grudado no bloco clicado (mesma projeção do
+   * rótulo do bot); some quando o ponto fica atrás da câmera. */
+  private updateTargetPosition() {
+    if (!this.targetBlock) return;
+    const vector = this.targetMarker.position.clone().project(this.camera);
+    if (vector.z > 1) {
+      this.targetEl.style.display = "none";
+      return;
+    }
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    this.targetEl.style.display = "flex";
+    this.targetEl.style.left = `${(vector.x * 0.5 + 0.5) * width}px`;
+    this.targetEl.style.top = `${(-vector.y * 0.5 + 0.5) * height}px`;
+  }
 
   private updateLabelPosition() {
     if (!this.botMarker.visible) return;

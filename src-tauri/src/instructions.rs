@@ -38,6 +38,27 @@ pub struct InstructionTarget {
     pub z: i32,
 }
 
+/// Padrão de varredura da exploração com raio (`ExploreParams`). O Baritone
+/// sozinho só tem `explore(origem)` (anda pro chunk nunca visto mais próximo,
+/// sem forma definida); os padrões abaixo são uma sequência de waypoints que o
+/// addon percorre, com progresso real.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExploreStyle {
+    /// Anéis concêntricos a partir da origem.
+    Circles,
+    /// Faixas de ida e volta cobrindo o quadrado do raio.
+    Zigzag,
+}
+
+/// Exploração com área definida: raio em blocos + padrão. `radius` é validado
+/// no comando (`queue_push`) porque um raio absurdo viraria uma lista de
+/// waypoints enorme no addon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExploreParams {
+    pub radius: u32,
+    pub style: ExploreStyle,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instruction {
     pub id: String,
@@ -49,6 +70,9 @@ pub struct Instruction {
     /// Ausente em instruções sem alvo no mundo (ex: `Explore` sem origem
     /// explícita — o addon usa a posição atual do bot).
     pub target: Option<InstructionTarget>,
+    /// Só para `Explore`: raio + padrão de varredura. `None` = exploração
+    /// nativa do Baritone (sem forma definida, até ser cancelada).
+    pub explore: Option<ExploreParams>,
 }
 
 #[derive(Debug, Default)]

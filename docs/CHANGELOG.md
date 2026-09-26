@@ -166,6 +166,32 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   executor: ele pula pra próxima que sabe rodar em vez de pegar a mesma pra sempre. Reportado pelo
   usuário ("quero que vc adicione o sistema de poder posicionar blocos e destruir selecionar areas
   para quebrar" / "faça do jeito que o documento relata").
+- **Explorar com raio e estilo (círculos/zigue-zague)**: o "Explorar" só tinha o modo nativo do
+  Baritone (`explore(origem)`), que anda pro chunk nunca visto mais próximo sem forma definida — e
+  ficava sem fim e sem progresso. Agora dá pra escolher o **raio** em blocos (16–5000) e o **padrão**:
+  *círculos* (anéis concêntricos) ou *zigue-zague* (faixas de ida e volta), com *automático* mantendo
+  o comportamento nativo. O addon gera os waypoints a partir da origem (o passo entre faixas/anéis vem
+  da render distance efetiva do cliente — passar por dentro dela já carrega os chunks, então passos
+  menores só fariam o bot andar mais devagar sem revelar nada novo) e percorre um a um com `GoalXZ`,
+  reportando progresso real (waypoint atual / total); waypoint inalcançável é pulado em vez de travar
+  a exploração inteira. Os controles ficam no popup do alvo ("Explorar daqui") e no painel da fila, ao
+  lado do botão "Explorar". Reportado pelo usuário ("melhore o explorar daqui para poder escrever o
+  raio e o estilo").
+- **Card cancelado some sozinho da fila**: cancelar deixava o card "cancelado" na lista pra sempre,
+  acumulando lixo visual. Agora ele fica ~4s visível (o suficiente pra confirmar que o cancelamento
+  valeu) e depois sai da lista — o backend continua com o histórico, isso é só apresentação.
+  Reportado pelo usuário ("se vc cancela ele não fica um pouco na fila e depois some").
+- **Instruções sem digitar coordenada: clique no terreno pra mirar o destino** — a fila já executava
+  de verdade, mas a única forma de criar uma instrução era digitar x/z no composer, o que não combina
+  com a proposta de simplicidade do app. Agora um clique parado no terreno (a distinção com o arrastar
+  de órbita do `OrbitControls` é movimento/tempo, não botão) marca o bloco com uma caixa âmbar e abre
+  um popup no próprio ponto clicado com "Ir para" e "Explorar daqui" — o alvo vira instrução real e o
+  marcador sai de cena. `Esc` (ou clicar no céu, ou o ×) limpa o alvo. A digitação continua como
+  caminho secundário, com `Enter` confirmando o "Ir para". De quebra, toda instrução com alvo na fila
+  aparece no mundo como caixa de arame — âmbar enquanto espera, teal enquanto o bot executa —, então
+  a fila deixa de ser só uma lista lateral: dá pra ver onde cada destino fica antes de o bot chegar.
+  Reportado pelo usuário ("o sistema foi feito para ser simples e não pode simplesmente fazer o
+  usuário escrever todas as instruções automaticamente").
 - **Mundo de verdade no viewer — cada chunk vem inteiro, não mais uma placa lisa**: quando o cliente
   carrega um chunk, o addon serializa todas as seções 16×16×16 não-vazias (paleta de blocos com o
   level de fluido + 4096 índices por seção, a mesma divisão e a mesma ordem do `PalettedContainer` do
