@@ -130,6 +130,7 @@ mod tests {
                 indices,
                 light: vec![0xf0; 4096],
             }],
+            None,
         );
         world
     }

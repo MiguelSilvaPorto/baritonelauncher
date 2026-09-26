@@ -182,7 +182,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos` and
   `AppState.bot_pose` — feet coordinates plus yaw/pitch), `player_skin` (the player's own skin as a
   base64 PNG, sent whenever the texture changes → `player_skin.rs`),
-  `chunk_voxels` (full chunk, palette + indices per section, deflate+base64 → `world_cache.rs`) and
+  `chunk_voxels` (full chunk, palette + indices per section, **plus per-column biome tints** —
+  grass/foliage/water colors the addon resolves with the client's own `BiomeColors`, payload v3;
+  v2 is still accepted for old caches/addon jars, without tints — deflate+base64 →
+  `world_cache.rs`) and
   `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
   the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
   a task consuming `AppState.addon_tx`, registered per connection. Stores the version from `hello`
@@ -196,7 +199,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   already has (its texture cache for downloaded skins, or the installed resource pack/jar for the
   default one) — **never** fetched from Mojang's CDN, same rule as `texture_atlas.rs`.
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
-  + indices per 16×16×16 section). Also `CrossingStrategy` for the learned water/lava crossing policy.
+  + indices per 16×16×16 section, plus per-column biome tints since payload v3 — see `ChunkTints`).
+  Also `CrossingStrategy` for the learned water/lava crossing policy.
 - **`world_store.rs`** — persists `WorldCache` + the last `mc_version` to `world.cache` in the app
   data dir (`~/.local/share/dev.baritone.orchestrator/` on Linux), zlib-compressed with a magic +
   version header and atomic writes (`tmp` + rename). Loaded in `setup()`; saved every 5s only when
@@ -249,7 +253,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `playerFeet()`) to the socket, with a 5s reconnect backoff if the Rust app isn't up. Also sends the
   player's own skin (`player_skin`, only when the texture changes — read from the client's own
   texture cache/resource pack) and subscribes to `ChunkEvent.Load` (filtered to `ClientLevel`) to
-  send one `chunk_voxels` per chunk — separate from the tick loop.
+  send one `chunk_voxels` per chunk (sections + per-column biome tints resolved with the client's own
+  `BiomeColors`, sampled at the top block of each column) — separate from the tick loop.
 - `neoforge.mods.toml` (templated from `gradle.properties`) declares Baritone as a required dependency
   — modid is `baritoe`, confirmed from the real jar, not `baritone`.
 
@@ -266,10 +271,14 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   have no executor in the addon yet, and the UI composer only creates the two executable kinds.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **Biome tint is a fixed approximation, not the real colormap.** Grass/foliage/water textures are
-  gray in the jar and get fixed tints (`GRASS_TINT` and friends in `viewer3d.ts`) instead of a
-  per-column biome lookup — visually close, not exact. Blockstates (stair orientation, log axis,
-  slabs) also aren't modeled yet: every block renders as a full cube.
+- **Biome tint is real, but per column (surface) and only for what the viewer draws.** The addon
+  samples the top block of each chunk column and sends grass/foliage/water colors resolved by the
+  client's own `BiomeColors` — the same colormap + biome modifier the game renders with — so each
+  biome now has its real color (`viewer3d.ts` applies them per block; `GRASS_TINT` and friends are
+  only the fallback for chunks from an old `world.cache` or an old addon jar). Cave/underground
+  blocks still use the surface biome of their column, there's no per-biome sky/fog color, and
+  blockstates (stair orientation, log axis, slabs) still aren't modeled: every block renders as a
+  full cube.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
 - **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*

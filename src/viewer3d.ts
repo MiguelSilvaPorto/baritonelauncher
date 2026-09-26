@@ -102,32 +102,48 @@ const BOT_TELEPORT_DISTANCE = 8; // blocos
 const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
 const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
 
-// Aproximação, não tint real por bioma (isso exigiria saber o bioma da
-// coluna e amostrar o colormap/JSON de bioma — não implementado, ver
-// docs/SPEC.md "Blocos 3D"). "grass_block_top" vem cinza no jar por design
-// (RGB médio 147,147,147, R=G=B); sem isso ficaria tudo cinza de novo.
-// Só o topo leva tint: o lado ("grass_block_side") já vem com a franja verde
-// impressa na própria textura, sobre a terra.
+// Cores reais de bioma chegam no payload v3, por coluna (`ChunkTints`): grama,
+// folhagem e água com a mesma cor que o `BiomeColors` do jogo resolve pra
+// renderização (colormap + modificador de bioma já aplicados). Os valores
+// abaixo são só o fallback de payload antigo/sem tint — um tom temperado
+// médio, nunca a cor de um bioma específico. Ver docs/SPEC.md "Blocos 3D".
 const GRASS_TINT = 0x79c05a;
-
-// Mesma ideia do GRASS_TINT, pras outras texturas que vêm cinza no jar e que
-// o jogo colore em runtime: tom de folhagem/água "floresta/plains", não a cor
-// exata do bioma da coluna. Espécies cuja textura já vem colorida no arquivo
-// (cerejeira, azaleia, carvalho-pálido) ficam de fora de propósito — tint
-// nelas só escureceria uma cor que já está certa.
 const FOLIAGE_TINT = 0x59ae30;
 const WATER_TINT = 0x3f76e4;
+
+/** Blocos cuja cor o jogo resolve pelo `BlockColors` (26.3): `grass` e
+ * `foliage` vêm do tint de bioma da coluna; sem tint no payload, caem no
+ * fallback acima. Espécies cuja textura já vem colorida no arquivo (cerejeira,
+ * azaleia, carvalho-pálido) ficam de fora de propósito — tint nelas só
+ * escureceria uma cor que já está certa. O topo do `grass_block` é tingido; o
+ * lado leva tint só na camada de overlay (ver `GRASS_SIDE_OVERLAY`). */
+const BLOCK_TINT_KIND: Record<string, "grass" | "foliage"> = {
+  grass_block: "grass",
+  lily_pad: "grass", // o jogo usa a cor de grama no lírio
+  sugar_cane: "grass",
+  oak_leaves: "foliage",
+  jungle_leaves: "foliage",
+  acacia_leaves: "foliage",
+  dark_oak_leaves: "foliage",
+  mangrove_leaves: "foliage",
+  vine: "foliage",
+};
+
+/** Cores fixas do jogo pra blocos que não dependem de bioma — mesmos valores
+ * de `BlockColors.createDefault()` no 26.3 (em `0xRRGGBB`). */
 const BLOCK_TINTS: Record<string, number> = {
-  oak_leaves: FOLIAGE_TINT,
-  jungle_leaves: FOLIAGE_TINT,
-  acacia_leaves: FOLIAGE_TINT,
-  dark_oak_leaves: FOLIAGE_TINT,
-  mangrove_leaves: FOLIAGE_TINT,
-  vine: FOLIAGE_TINT,
-  lily_pad: GRASS_TINT, // o jogo usa a cor de grama no lírio
-  spruce_leaves: 0x619961, // cor fixa no jogo, não vem do bioma
+  spruce_leaves: 0x619961,
   birch_leaves: 0x80a755,
 };
+
+/** Segunda camada do lado do `grass_block` no modelo vanilla: a base
+ * (`grass_block_side`) é terra com uma franja clara, e por cima vem
+ * `grass_block_side_overlay` — cinza no arquivo, tingida com a cor de grama do
+ * bioma. Sem ela os lados da grama não acompanhavam o bioma (só o topo). O
+ * jogo desenha as duas coincidentes; aqui a de cima sai um fio ao longo da
+ * normal pra não brigar no z-buffer. */
+const GRASS_SIDE_OVERLAY = "grass_block_side_overlay";
+const GRASS_SIDE_OVERLAY_OFFSET = 0.002;
 
 /** Blocos cujo nome não bate com o nome da textura no jar: água/lava/fogo
  * são animados (`water_still`, `fire_0`) e o atlas guarda todos os frames,
@@ -164,8 +180,13 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
  * `map`, então o valor não importa — só precisa existir. */
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
-// Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-const VOXEL_FORMAT_VERSION = 3;
+// Versão/flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
+// v4 = seções (paleta + índices + luz) + tints de bioma por coluna; v3 (sem
+// luz) e v2 (sem nada disso) ainda são aceitos na leitura pros `world.cache`
+// gravados antes, caindo no dia cheio e nos tints fixos.
+const VOXEL_FORMAT_VERSION = 4;
+const VOXEL_FORMAT_VERSION_TINTS = 3;
+const VOXEL_FORMAT_VERSION_LEGACY = 2;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
@@ -301,11 +322,26 @@ interface DecodedSection {
   light: Uint8Array;
 }
 
+/** Tints de bioma por coluna (payload v3): cor `0xRRGGBB` por coluna
+ * (`lx + lz*16`, a mesma ordem dos índices das seções), já resolvida pelo
+ * addon com o `BiomeColors` do client. `null` = payload v2 ou sem dados — o
+ * viewer cai nas cores fixas (`GRASS_TINT` e companhia). */
+interface ChunkTints {
+  grass: Uint32Array;
+  foliage: Uint32Array;
+  water: Uint32Array;
+}
+
+/** Uma coluna do chunk tem `x + z*16` — os tint maps seguem essa ordem. */
+const TINT_COLUMNS = 256;
+
 interface DecodedChunk {
   x: number;
   z: number;
   /** Seção Y (mundo / 16) → seção; ausente = ar. */
   sections: Map<number, DecodedSection>;
+  /** Tints de bioma por coluna; `null` = chunk sem essa informação. */
+  tints: ChunkTints | null;
   /** Maior seção Y que veio no payload — acima dela o ar é céu cheio (ver
    * `lightAt`). */
   maxSectionY: number;
@@ -423,15 +459,16 @@ interface MeshBuffers {
   indices: number[];
 }
 
-/** UVs já no espaço do atlas (flat) + tint linear, cacheados por (bloco,
- * face do cubo) — o laço de meshing roda uma vez por face exposta e refazer
- * string + rect + conversão de cor a cada iteração era o grosso do custo
- * num chunk denso. */
+/** UVs já no espaço do atlas (flat) + se veio de textura real, cacheados por
+ * (bloco, face do cubo) — o laço de meshing roda uma vez por face exposta e
+ * refazer string + rect a cada iteração era o grosso do custo num chunk denso.
+ * A cor não entra aqui: desde os tints por coluna ela varia dentro do chunk
+ * (ver `faceTint`). */
 interface FaceRender {
   uv: number[];
-  r: number;
-  g: number;
-  b: number;
+  /** Veio de textura real do atlas (`faceRect`) — bloco sem textura sai cinza
+   * neutro em vez de fingir que é outro bloco. */
+  known: boolean;
 }
 
 /** Rect resolvido de uma face + se veio de textura real do atlas (`known`)
@@ -464,11 +501,16 @@ function byteReader(bytes: Uint8Array) {
   };
 }
 
-/** Decodifica o payload de `chunk_voxels` (formato 2, ver `world_cache.rs`). */
+/** Decodifica o payload de `chunk_voxels` (formato 4, ver `world_cache.rs` —
+ * v3, sem luz, e v2, sem luz nem tints, ainda são aceitos pro cache antigo). */
 function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
   const reader = byteReader(bytes);
   const version = reader.u8();
-  if (version !== VOXEL_FORMAT_VERSION) {
+  if (
+    version !== VOXEL_FORMAT_VERSION &&
+    version !== VOXEL_FORMAT_VERSION_TINTS &&
+    version !== VOXEL_FORMAT_VERSION_LEGACY
+  ) {
     throw new Error(`versão de payload desconhecida: ${version}`);
   }
   const sectionCount = reader.u8();
@@ -488,14 +530,42 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
     const indices = new Uint16Array(4096);
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
     const light = new Uint8Array(4096);
-    for (let idx = 0; idx < 4096; idx++) light[idx] = reader.u8();
+    if (version >= VOXEL_FORMAT_VERSION) {
+      for (let idx = 0; idx < 4096; idx++) light[idx] = reader.u8();
+    } else {
+      // Payload antigo (v2/v3) não tem luz: dia cheio, como o viewer
+      // desenhava antes de existir luz de verdade.
+      light.fill(0xf0);
+    }
     sections.set(y, { y, palette, indices, light });
   }
+
+  let tints: ChunkTints | null = null;
+  if (version >= VOXEL_FORMAT_VERSION_TINTS) {
+    const hasTints = reader.u8();
+    if (hasTints === 1) {
+      const readColumns = () => {
+        const columns = new Uint32Array(TINT_COLUMNS);
+        for (let column = 0; column < TINT_COLUMNS; column++) {
+          const r = reader.u8();
+          const g = reader.u8();
+          const b = reader.u8();
+          columns[column] = (r << 16) | (g << 8) | b;
+        }
+        return columns;
+      };
+      tints = { grass: readColumns(), foliage: readColumns(), water: readColumns() };
+    } else if (hasTints !== 0) {
+      throw new Error(`flag de tints inválida: ${hasTints}`);
+    }
+  }
+
   const sectionYs = Array.from(sections.keys());
   return {
     x,
     z,
     sections,
+    tints,
     maxSectionY: sectionYs.length > 0 ? Math.max(...sectionYs) : 0,
   };
 }
@@ -637,6 +707,8 @@ export class Viewer3D {
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
+  /** Cache `0xRRGGBB` → componentes lineares — ver `linearColor`. */
+  private readonly linearColorCache = new Map<number, [number, number, number]>();
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
 
@@ -1024,11 +1096,32 @@ export class Viewer3D {
     return resolved;
   }
 
-  /** Tint por vértice: só o topo da grama e as folhagens que vêm cinza no
-   * jar; o resto é branco (textura já colorida). */
-  private faceTint(blockName: string, face: BlockFace): number {
-    if (blockName === "grass_block") return face === "top" ? GRASS_TINT : 0xffffff;
+  /** Cor (`0xRRGGBB`) de uma face do bloco como o jogo resolve: texturas
+   * cinzas (grama, folhagem) levam o tint de bioma da coluna quando o chunk
+   * trouxe os tints (payload v3) — senão o fallback fixo aproximado. O resto
+   * sai branco (a textura já é colorida). */
+  private faceTint(blockName: string, face: BlockFace, column: number, tints: ChunkTints | null): number {
+    const kind = BLOCK_TINT_KIND[blockName];
+    if (kind === "grass") {
+      // No grass_block o lado é terra + overlay (camada própria, tingida em
+      // `buildChunkMesh`); aqui só o topo leva tint.
+      if (blockName === "grass_block" && face !== "top") return 0xffffff;
+      return this.grassTintAt(column, tints);
+    }
+    if (kind === "foliage") return this.foliageTintAt(column, tints);
     return BLOCK_TINTS[blockName] ?? 0xffffff;
+  }
+
+  private grassTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.grass[column] : GRASS_TINT;
+  }
+
+  private foliageTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.foliage[column] : FOLIAGE_TINT;
+  }
+
+  private waterTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.water[column] : WATER_TINT;
   }
 
   private buildMaterials() {
@@ -1059,7 +1152,9 @@ export class Viewer3D {
     const water = kind === "water";
     const material = new THREE.MeshBasicMaterial({
       map: frames[0] ?? null,
-      color: water ? WATER_TINT : 0xffffff,
+      // O tint da água é por coluna (bioma, ver `meshFluidFace`) e chega por
+      // vértice junto da luz; lava não tem tint (branco).
+      color: 0xffffff,
       vertexColors: true,
       // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
       // opaca. A luz da lava vem do próprio dado do jogo (bloco 15 propagado
@@ -1207,7 +1302,9 @@ export class Viewer3D {
 
   /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
    * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
-   * usado pra superfície rebaixada de fluido. */
+   * usado pra superfície rebaixada de fluido. `offset` desloca o quad ao
+   * longo da normal da face (camada de overlay) e `light` traz o brilho 0–1
+   * já suavizado por canto (ver `faceCornerBrightness`). */
   /** Byte de luz de uma posição (nibble baixo = bloco, alto = céu); 0 se o
    * chunk/seção não está no cache. Acima do topo do mundo é céu cheio. */
   private lightAt(x: number, y: number, z: number): number {
@@ -1292,14 +1389,22 @@ export class Viewer3D {
     r: number,
     g: number,
     b: number,
-    light: readonly number[]
+    light: readonly number[],
+    offset = 0
   ) {
     const face = FACES[faceIndex];
     const shade = faceShade(face);
+    const offsetX = face.dir[0] * offset;
+    const offsetY = face.dir[1] * offset;
+    const offsetZ = face.dir[2] * offset;
     const base = buffers.positions.length / 3;
     for (let i = 0; i < 4; i++) {
       const corner = face.corners[i];
-      buffers.positions.push(x + corner[0], y + (corner[1] === 1 ? high : low), z + corner[2]);
+      buffers.positions.push(
+        x + corner[0] + offsetX,
+        y + (corner[1] === 1 ? high : low) + offsetY,
+        z + corner[2] + offsetZ
+      );
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
       buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
       // A luz do jogo já vem pronta (tocha, céu, lava...): aqui ela só é
@@ -1310,17 +1415,38 @@ export class Viewer3D {
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
 
-  /** UVs (flat, já no espaço do atlas) + tint linear de uma face do bloco,
-   * com cache por (bloco, face). `null` = face sem textura resolvida, pulada
-   * sem quebrar o chunk. */
-  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+  /** Componentes lineares de uma cor `0xRRGGBB`: o `THREE.Color` converte
+   * sRGB→linear no `setHex`, e o meshing não pode pagar essa conversão por
+   * face — o cache guarda o conjunto de cores em uso (com os tints de bioma
+   * são algumas centenas). */
+  private linearColor(hex: number): readonly [number, number, number] {
+    let linear = this.linearColorCache.get(hex);
+    if (!linear) {
+      this.scratchColor.setHex(hex);
+      const components: [number, number, number] = [
+        this.scratchColor.r,
+        this.scratchColor.g,
+        this.scratchColor.b,
+      ];
+      this.linearColorCache.set(hex, components);
+      linear = components;
+    }
+    return linear;
+  }
+
+  /** UVs (flat, já no espaço do atlas) de uma face do bloco, com cache por
+   * (bloco, face). `null` = face sem textura resolvida, pulada sem quebrar o
+   * chunk. `requireKnown` = só aceita textura real do atlas (usado pela
+   * camada de overlay do grass_block: sem a textura, melhor não desenhar nada
+   * do que um retângulo de fallback). */
+  private cachedFaceRender(blockName: string, faceIndex: number, requireKnown: boolean): FaceRender | null {
     const key = `${blockName}|${faceIndex}`;
     if (this.faceRenderCache.has(key)) return this.faceRenderCache.get(key)!;
 
     const face = FACES[faceIndex];
     const resolved = this.faceRect(blockName, face.kind);
     let render: FaceRender | null = null;
-    if (resolved) {
+    if (resolved && (!requireKnown || resolved.known)) {
       const rect = resolved.rect;
       const uv = new Array<number>(8);
       for (let i = 0; i < 4; i++) {
@@ -1328,20 +1454,24 @@ export class Viewer3D {
         uv[i * 2] = rect.u0 + u * (rect.u1 - rect.u0);
         uv[i * 2 + 1] = rect.v0 + v * (rect.v1 - rect.v0);
       }
-      // Sem textura real (bloco de mod, atlas degradado): cinza neutro em vez
-      // da textura de outro bloco.
-      this.scratchColor.setHex(
-        resolved.known ? this.faceTint(blockName, face.kind) : COLOR_UNKNOWN_BLOCK
-      );
-      render = { uv, r: this.scratchColor.r, g: this.scratchColor.g, b: this.scratchColor.b };
+      render = { uv, known: resolved.known };
     }
     this.faceRenderCache.set(key, render);
     return render;
   }
 
+  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+    return this.cachedFaceRender(blockName, faceIndex, false);
+  }
+
+  private grassOverlayRender(faceIndex: number): FaceRender | null {
+    return this.cachedFaceRender(GRASS_SIDE_OVERLAY, faceIndex, true);
+  }
+
   /** Uma face visível de fluido: mesma culling dos sólidos, mas face entre o
    * mesmo fluido só aparece quando o vizinho é mais raso (degrau d'água), e
-   * a altura sai do nível em vez de 0..1. */
+   * a altura sai do nível em vez de 0..1. `color` = tint do bioma (água) ou
+   * branco (lava). */
   private meshFluidFace(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1351,6 +1481,7 @@ export class Viewer3D {
     entry: PaletteEntry,
     neighbor: PaletteEntry | null,
     flow: THREE.Vector3 | null,
+    color: number,
     lightAt: (x: number, y: number, z: number) => number
   ) {
     const ownHeight = fluidHeight(entry.level);
@@ -1367,6 +1498,7 @@ export class Viewer3D {
     }
 
     const rotation = flow ? this.flowRotation(faceIndex, flow) : 0;
+    const [r, g, b] = this.linearColor(color);
     this.pushQuadFlat(
       buffers,
       faceIndex,
@@ -1376,9 +1508,9 @@ export class Viewer3D {
       low,
       high,
       FLUID_ROTATED_UV[faceIndex][rotation],
-      1,
-      1,
-      1,
+      r,
+      g,
+      b,
       this.faceCornerBrightness(lightAt, faceIndex, x, y, z)
     );
   }
@@ -1435,6 +1567,9 @@ export class Viewer3D {
             const x = chunk.x * 16 + lx;
             const y = sectionY * 16 + ly;
             const z = chunk.z * 16 + lz;
+            // Coluna do chunk (ordem dos tints, `x + z*16`): de onde sai a cor
+            // de bioma da grama/folhagem/água.
+            const column = (lz << 4) | lx;
             const isFluid = (entry.flags & VOXEL_FLAG_FLUID) !== 0;
             const fluidBucket = isFluid ? `${entry.block}_${entry.level === 0 ? "still" : "flow"}` : "opaque";
             // Direção da correnteza só é calculada se alguma face de fluido
@@ -1450,7 +1585,8 @@ export class Viewer3D {
                   flow = this.fluidFlowVector(x, y, z, entry);
                   flowNeeded = false;
                 }
-                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, lightAt);
+                const fluidColor = entry.block === "water" ? this.waterTintAt(column, chunk.tints) : 0xffffff;
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor, lightAt);
                 continue;
               }
               // Sólido: face some se o vizinho é oclusor; oclusão entre
@@ -1462,20 +1598,39 @@ export class Viewer3D {
               }
               const render = this.faceRender(entry.block, f);
               if (!render) continue;
-              this.pushQuadFlat(
-                buffered("opaque"),
-                f,
-                x,
-                y,
-                z,
-                0,
-                1,
-                render.uv,
-                render.r,
-                render.g,
-                render.b,
-                this.faceCornerBrightness(lightAt, f, x, y, z)
-              );
+              // Sem textura real (bloco de mod, atlas degradado): cinza neutro
+              // em vez da textura de outro bloco.
+              const color = render.known
+                ? this.faceTint(entry.block, face.kind, column, chunk.tints)
+                : COLOR_UNKNOWN_BLOCK;
+              const [r, g, b] = this.linearColor(color);
+              const faceLight = this.faceCornerBrightness(lightAt, f, x, y, z);
+              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, r, g, b, faceLight);
+              // Segunda camada do lado do grass_block no modelo vanilla:
+              // cinza no arquivo, tingida com a cor de grama do bioma.
+              if (entry.block === "grass_block" && face.kind === "side") {
+                const overlay = this.grassOverlayRender(f);
+                if (overlay) {
+                  const [overlayR, overlayG, overlayB] = this.linearColor(
+                    this.grassTintAt(column, chunk.tints)
+                  );
+                  this.pushQuadFlat(
+                    buffered("opaque"),
+                    f,
+                    x,
+                    y,
+                    z,
+                    0,
+                    1,
+                    overlay.uv,
+                    overlayR,
+                    overlayG,
+                    overlayB,
+                    faceLight,
+                    GRASS_SIDE_OVERLAY_OFFSET
+                  );
+                }
+              }
             }
           }
         }

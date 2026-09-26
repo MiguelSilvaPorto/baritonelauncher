@@ -16,16 +16,32 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   direcional), então tocha, lava e glowstone não iluminavam nada e uma caverna ficava igual à
   superfície. Agora o addon lê o **motor de luz do próprio jogo** (as duas camadas que o cliente já
   mantém: luz de bloco — tocha, lava, glowstone... — e luz de céu) e manda os níveis por posição no
-  `chunk_voxels` (formato 3: um byte por posição, um nibble por camada, lido direto da `DataLayer` da
+  `chunk_voxels` (formato 4: um byte por posição, um nibble por camada, lido direto da `DataLayer` da
   seção — sem 4096 consultas ao motor por camada). O viewer faz *smooth lighting* como o jogo: para cada
   canto de face, média das 4 posições de ar em volta nos dois canais, `max(céu, bloco)` e a curva de
-  brilho do jogo, multiplicada pelo tint e pelo sombreamento da direção (topo 1.0, norte/sul 0.8,
+  brilho do jogo, multiplicada pelo tint (bioma) e pelo sombreamento da direção (topo 1.0, norte/sul 0.8,
   leste/oeste 0.6, fundo 0.5) — e o material do terreno passou a ser sem luz dinâmica, porque a luz já
   vem assada no vértice. Resultado: degradê em volta da tocha, caverna escura, lava brilhando no escuro.
   Céu conta como dia cheio (não há ciclo dia/noite no viewer ainda) e ar acima da última seção carregada
-  do chunk é céu cheio; o `world.cache` antigo (formato 2) é descartado e reconstruído no próximo
-  carregamento. Reportado pelo usuário ("quero que vc adicione luz que nem no minecraft onde alguns
-  blocos emitem luz e afetam outros no meu render").
+  do chunk é céu cheio; o `world.cache` antigo (v2/v3, sem luz) continua abrindo no dia cheio. **O jar
+  do addon precisa ser rebuildado** — com o jar antigo o app avisa no console e mantém o comportamento
+  antigo. Reportado pelo usuário ("quero que vc adicione luz que nem no minecraft onde alguns blocos
+  emitem luz e afetam outros no meu render").
+- **Cores de bioma reais no viewer — fim do verde único**: o addon agora manda, junto de cada chunk, as
+  cores de bioma **por coluna** (grama, folhagem e água), resolvidas pelo `BiomeColors` do próprio
+  client — o mesmo colormap de temperatura/umidade, override de bioma e modificador de
+  pântano/floresta escura que o jogo aplica ao renderizar. O viewer usa essa cor por bloco: topo do
+  `grass_block`, folhas (carvalho, jungle, acácia, dark oak, mangrove), videira, lírio-d'água,
+  cana-de-açúcar e água (que agora é tingida por vértice, não por material único). Cada bioma passa a
+  ter a cor que tem no jogo — savana amarelada, pântano escuro com água marrom, taiga azulada,
+  badlands alaranjado etc. — em vez de um "verde floresta" fixo. O payload binário dos chunks sobe
+  pro formato 3 (bloco de tints no fim; o `world.cache` gravado antes continua abrindo, só sem tints,
+  caindo nas cores fixas aproximadas) e **o jar do addon precisa ser rebuildado** — com o jar antigo o
+  app avisa no console e mantém o comportamento antigo.
+- **Lado do bloco de grama com a camada de overlay do jogo**: o lado do `grass_block` só tinha a
+  textura base (terra + franja fixa, que não muda de bioma); o modelo vanilla desenha uma segunda
+  camada cinza (`grass_block_side_overlay`) por cima, tingida com a cor de grama do bioma. Agora o
+  viewer desenha essa camada também, então o lado da grama acompanha o bioma tanto quanto o topo.
 - **Aba "Config" com preferências reais, salvas em disco**: quinta view na rail (engrenagem) pra
   ajustar o **viewer 3D** e o **comportamento do app**, sem mudar nada até o usuário mexer — os
   padrões são exatamente as constantes que o app já usava. No viewer: distância do horizonte (fog),
