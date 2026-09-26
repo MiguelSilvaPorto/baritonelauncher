@@ -62,6 +62,23 @@
             <div class="target-popup" id="target-popup">
               <span class="target-coords mono"></span>
               <div class="target-actions">
+                <input
+                  class="composer-input mono"
+                  type="number"
+                  name="radius"
+                  min="16"
+                  max="5000"
+                  step="16"
+                  placeholder="raio 256"
+                  title="Raio da exploração em blocos"
+                />
+                <select class="composer-input mono" name="style" title="Padrão de varredura da exploração">
+                  <option value="Circles">círculos</option>
+                  <option value="Zigzag">zigue-zague</option>
+                  <option value="auto">automático</option>
+                </select>
+              </div>
+              <div class="target-actions">
                 <button type="button" class="composer-btn" data-target-action="travel">Ir para</button>
                 <button type="button" class="composer-btn ghost" data-target-action="explore">Explorar daqui</button>
                 <button type="button" class="target-dismiss" data-target-action="dismiss" title="Dispensar alvo">×</button>
@@ -102,9 +119,26 @@
                 <input class="composer-input mono" type="number" name="x" placeholder="x" step="1" />
                 <input class="composer-input mono" type="number" name="z" placeholder="z" step="1" />
                 <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
+              </div>
+              <div class="composer-row">
+                <input
+                  class="composer-input mono"
+                  type="number"
+                  name="radius"
+                  min="16"
+                  max="5000"
+                  step="16"
+                  placeholder="raio 256"
+                  title="Raio da exploração em blocos"
+                />
+                <select class="composer-input mono" name="style" title="Padrão de varredura da exploração">
+                  <option value="Circles">círculos</option>
+                  <option value="Zigzag">zigue-zague</option>
+                  <option value="auto">automático</option>
+                </select>
                 <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
               </div>
-              <span class="composer-hint">clique no terreno pra mirar um destino · ou digite x/z</span>
+              <span class="composer-hint">clique no terreno pra mirar um destino · Explorar usa o raio/estilo</span>
             </div>
             <div class="queue-list" id="queue-list"></div>
             <div class="side-footer" id="storage-footer"></div>
@@ -137,9 +171,26 @@
                 <input class="composer-input mono" type="number" name="x" placeholder="x" step="1" />
                 <input class="composer-input mono" type="number" name="z" placeholder="z" step="1" />
                 <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
+              </div>
+              <div class="composer-row">
+                <input
+                  class="composer-input mono"
+                  type="number"
+                  name="radius"
+                  min="16"
+                  max="5000"
+                  step="16"
+                  placeholder="raio 256"
+                  title="Raio da exploração em blocos"
+                />
+                <select class="composer-input mono" name="style" title="Padrão de varredura da exploração">
+                  <option value="Circles">círculos</option>
+                  <option value="Zigzag">zigue-zague</option>
+                  <option value="auto">automático</option>
+                </select>
                 <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
               </div>
-              <span class="composer-hint">clique no terreno pra mirar um destino · ou digite x/z</span>
+              <span class="composer-hint">clique no terreno pra mirar um destino · Explorar usa o raio/estilo</span>
             </div>
             <div class="queue-list" id="queue-list-full"></div>
           </aside>

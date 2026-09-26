@@ -119,6 +119,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Explorar com raio e estilo (círculos/zigue-zague)**: o "Explorar" só tinha o modo nativo do
+  Baritone (`explore(origem)`), que anda pro chunk nunca visto mais próximo sem forma definida — e
+  ficava sem fim e sem progresso. Agora dá pra escolher o **raio** em blocos (16–5000) e o **padrão**:
+  *círculos* (anéis concêntricos) ou *zigue-zague* (faixas de ida e volta), com *automático* mantendo
+  o comportamento nativo. O addon gera os waypoints a partir da origem (o passo entre faixas/anéis vem
+  da render distance efetiva do cliente — passar por dentro dela já carrega os chunks, então passos
+  menores só fariam o bot andar mais devagar sem revelar nada novo) e percorre um a um com `GoalXZ`,
+  reportando progresso real (waypoint atual / total); waypoint inalcançável é pulado em vez de travar
+  a exploração inteira. Os controles ficam no popup do alvo ("Explorar daqui") e no painel da fila, ao
+  lado do botão "Explorar". Reportado pelo usuário ("melhore o explorar daqui para poder escrever o
+  raio e o estilo").
+- **Card cancelado some sozinho da fila**: cancelar deixava o card "cancelado" na lista pra sempre,
+  acumulando lixo visual. Agora ele fica ~4s visível (o suficiente pra confirmar que o cancelamento
+  valeu) e depois sai da lista — o backend continua com o histórico, isso é só apresentação.
+  Reportado pelo usuário ("se vc cancela ele não fica um pouco na fila e depois some").
 - **Instruções sem digitar coordenada: clique no terreno pra mirar o destino** — a fila já executava
   de verdade, mas a única forma de criar uma instrução era digitar x/z no composer, o que não combina
   com a proposta de simplicidade do app. Agora um clique parado no terreno (a distinção com o arrastar

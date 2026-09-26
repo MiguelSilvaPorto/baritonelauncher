@@ -419,6 +419,11 @@ button, input { font-family: inherit; }
 .composer-input:focus { outline: none; border-color: var(--amber); }
 .composer-input::-webkit-outer-spin-button,
 .composer-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+select.composer-input { cursor: pointer; }
+
+/* No popup do alvo não existe largura fixa pra dividir (o painel divide com
+ * flex), então os campos usam a largura do conteúdo. */
+.target-popup .composer-input { width: auto; flex: 1 1 auto; min-width: 84px; }
 
 .composer-btn {
   flex: 0 0 auto;

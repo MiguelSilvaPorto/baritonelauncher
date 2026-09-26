@@ -36,6 +36,13 @@ interface InstructionTarget {
   z: number;
 }
 
+/** Padrão de varredura da exploração com raio — espelha `ExploreStyle`. */
+type ExploreStyle = "Circles" | "Zigzag";
+interface ExploreParams {
+  radius: number;
+  style: ExploreStyle;
+}
+
 interface Instruction {
   id: string;
   kind: InstructionKind;
@@ -43,6 +50,7 @@ interface Instruction {
   status: InstructionStatus;
   progress: number;
   target: InstructionTarget | null;
+  explore: ExploreParams | null;
 }
 
 interface ItemTotal {
@@ -111,9 +119,12 @@ const STATUS_LABEL: Record<InstructionStatus, string> = {
 function queueCard(instruction: Instruction): string {
   const statusClass = `status-${instruction.status.toLowerCase()}`;
   const cancellable = instruction.status === "Queued" || instruction.status === "Active";
-  // `Explore` é contínuo e não tem progresso mensurável (o addon não manda
-  // `progress`) — barra só onde existe progresso real, nada de fingir 0%.
-  const showBar = !(instruction.kind === "Explore" && instruction.status === "Active");
+  // Barra só onde existe progresso real: `Explore` sem raio/estilo é contínuo
+  // (o addon não manda `progress`) e cancelado/falhou não têm o que medir.
+  const showBar =
+    instruction.status !== "Canceled" &&
+    instruction.status !== "Failed" &&
+    !(instruction.kind === "Explore" && instruction.status === "Active" && !instruction.explore);
   return `
     <div class="queue-card ${statusClass}">
       <div class="row1">
@@ -141,15 +152,51 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
   if (countId) $(`#${countId}`).textContent = String(items.length);
 }
 
+/** Cancelado fica um tempinho visível (pra você ver que o cancelamento valeu)
+ *  e depois some sozinho da fila — senão os cards cancelados se acumulam pra
+ *  sempre. O backend mantém o histórico; isso é só apresentação. */
+const CANCELED_LINGER_MS = 4000;
+const canceledSeenAt = new Map<string, number>();
+
+function visibleQueue(items: Instruction[]): Instruction[] {
+  const now = performance.now();
+  const visible: Instruction[] = [];
+  for (const item of items) {
+    if (item.status !== "Canceled") {
+      visible.push(item);
+      continue;
+    }
+    const seenAt = canceledSeenAt.get(item.id) ?? now;
+    canceledSeenAt.set(item.id, seenAt);
+    if (now - seenAt < CANCELED_LINGER_MS) visible.push(item);
+  }
+  return visible;
+}
+
 function renderQueue(items: Instruction[]) {
-  renderQueueInto("queue-list", "queue-count", items);
-  renderQueueInto("queue-list-full", "queue-count-full", items);
+  const visible = visibleQueue(items);
+  renderQueueInto("queue-list", "queue-count", visible);
+  renderQueueInto("queue-list-full", "queue-count-full", visible);
+}
+
+/** Raio + estilo do "Explorar" a partir dos controles do painel/popup.
+ *  `null` = exploração nativa do Baritone (sem raio, sem progresso); "auto" no
+ *  select é essa opção, e sem raio digitado o padrão é 256 blocos. */
+function readExploreParams(scope: HTMLElement): ExploreParams | null {
+  const styleValue = scope.querySelector<HTMLSelectElement>('select[name="style"]')?.value ?? "auto";
+  if (styleValue === "auto") return null;
+  const rawRadius = Number(scope.querySelector<HTMLInputElement>('input[name="radius"]')?.value);
+  const radius = Number.isFinite(rawRadius) && rawRadius > 0 ? Math.round(rawRadius) : 256;
+  return {
+    radius: Math.min(Math.max(radius, 16), 5000),
+    style: styleValue === "Zigzag" ? "Zigzag" : "Circles",
+  };
 }
 
 /** Enfileira e re-renderiza a fila na hora — o comando devolve o estado
  *  atualizado, então a UI não espera o polling de 1s. */
-function pushQueueInstruction(kind: InstructionKind, target: InstructionTarget | null) {
-  return invoke<Instruction[]>("queue_push", { kind, target })
+function pushQueueInstruction(kind: InstructionKind, target: InstructionTarget | null, explore: ExploreParams | null = null) {
+  return invoke<Instruction[]>("queue_push", { kind, target, explore })
     .then((queue) => {
       renderQueue(queue);
       return queue;
@@ -194,16 +241,21 @@ function bootstrapQueueComposers() {
     }
 
     exploreBtn?.addEventListener("click", () => {
-      pushQueueInstruction("Explore", lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null);
+      pushQueueInstruction(
+        "Explore",
+        lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null,
+        readExploreParams(composer)
+      );
     });
   });
 }
 
 /** Ações do alvo escolhido clicando no terreno (ver `viewer3d.setTarget`):
- *  "Ir para", "Explorar daqui" e "dispensar". Só existe um popup, então o
- *  listener é único. */
+ *  "Ir para", "Explorar daqui" (com raio/estilo do próprio popup) e
+ *  "dispensar". Só existe um popup, então o listener é único. */
 function bootstrapTargetPopup() {
-  $("#target-popup").addEventListener("click", (event) => {
+  const popup = $<HTMLElement>("#target-popup");
+  popup.addEventListener("click", (event) => {
     const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-target-action]");
     const target = viewer3d?.getTarget();
     if (!btn || !viewer3d || !target) return;
@@ -214,7 +266,8 @@ function bootstrapTargetPopup() {
       return;
     }
     const kind: InstructionKind = action === "travel" ? "TravelTo" : "Explore";
-    pushQueueInstruction(kind, { x: target.x, z: target.z }).then((queue) => {
+    const explore = kind === "Explore" ? readExploreParams(popup) : null;
+    pushQueueInstruction(kind, { x: target.x, z: target.z }, explore).then((queue) => {
       // Alvo virou instrução real: o marcador âmbar sai de cena.
       if (queue) viewer3d?.setTarget(null);
     });

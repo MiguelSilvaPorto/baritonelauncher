@@ -8,7 +8,10 @@ mod vitals;
 mod world_cache;
 mod world_store;
 
-use instructions::{Instruction, InstructionKind, InstructionQueue, InstructionStatus, InstructionTarget};
+use instructions::{
+    ExploreParams, ExploreStyle, Instruction, InstructionKind, InstructionQueue, InstructionStatus,
+    InstructionTarget,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
@@ -56,6 +59,11 @@ pub(crate) struct AppState {
 /// Ids de instrução são gerados aqui (nunca pelo addon) — só precisam ser
 /// únicos dentro de uma sessão do app.
 static NEXT_INSTRUCTION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Limites do raio de exploração em blocos — validados em `queue_push`. O teto
+/// existe porque cada faixa/anél vira waypoint no addon.
+const MIN_EXPLORE_RADIUS: u32 = 16;
+const MAX_EXPLORE_RADIUS: u32 = 5000;
 
 /// Manda uma linha JSON pro addon, se houver alguém conectado. Silencioso de
 /// propósito quando não há: quem chama decide o que fazer com a instrução
@@ -119,21 +127,34 @@ fn encode_instruction(instruction: &Instruction) -> Option<String> {
                 "z": target.z,
             }).to_string())
         }
-        InstructionKind::Explore => Some(match instruction.target {
-            Some(target) => json!({
-                "type": "instruction",
-                "id": id,
-                "kind": "explore",
-                "x": target.x,
-                "z": target.z,
-            }),
-            // Sem alvo: o addon usa a posição atual do bot como origem.
-            None => json!({
-                "type": "instruction",
-                "id": id,
-                "kind": "explore",
-            }),
-        }.to_string()),
+        InstructionKind::Explore => Some({
+            let mut payload = match instruction.target {
+                Some(target) => json!({
+                    "type": "instruction",
+                    "id": id,
+                    "kind": "explore",
+                    "x": target.x,
+                    "z": target.z,
+                }),
+                // Sem alvo: o addon usa a posição atual do bot como origem.
+                None => json!({
+                    "type": "instruction",
+                    "id": id,
+                    "kind": "explore",
+                }),
+            };
+            // Com raio + estilo, o addon percorre uma lista de waypoints em vez
+            // de usar o `explore` nativo (que não tem forma definida).
+            if let Some(params) = instruction.explore {
+                payload["radius"] = json!(params.radius);
+                payload["style"] = json!(match params.style {
+                    ExploreStyle::Circles => "circles",
+                    ExploreStyle::Zigzag => "zigzag",
+                });
+            }
+            payload.to_string()
+        }),
+
         _ => None,
     }
 }
@@ -196,21 +217,45 @@ mod commands {
     /// Enfileira uma instrução e devolve a fila atualizada. Se o addon está
     /// conectado e nada está ativo, ela já sai despachada na mesma hora
     /// (`dispatch_next_instruction`); senão fica `Queued` até a vez.
+    /// `explore` só vale para `Explore` (raio + padrão de varredura).
     #[tauri::command]
     fn queue_push(
         state: State<AppState>,
         kind: InstructionKind,
         target: Option<InstructionTarget>,
+        explore: Option<ExploreParams>,
     ) -> Result<Vec<Instruction>, String> {
+        if let Some(params) = explore {
+            if !(MIN_EXPLORE_RADIUS..=MAX_EXPLORE_RADIUS).contains(&params.radius) {
+                return Err(format!(
+                    "Raio de exploração precisa ficar entre {MIN_EXPLORE_RADIUS} e {MAX_EXPLORE_RADIUS} blocos."
+                ));
+            }
+        }
+
         let label = match kind {
             InstructionKind::TravelTo => {
                 let target = target.ok_or("Ir para precisa de coordenadas (x, z).")?;
                 format!("Ir para ({}, {})", target.x, target.z)
             }
-            InstructionKind::Explore => match target {
-                Some(target) => format!("Explorar a partir de ({}, {})", target.x, target.z),
-                None => "Explorar".to_string(),
-            },
+            InstructionKind::Explore => {
+                let origin = match target {
+                    Some(target) => format!(" a partir de ({}, {})", target.x, target.z),
+                    None => String::new(),
+                };
+                match explore {
+                    Some(params) => format!(
+                        "Explorar {} blocos em {}{}",
+                        params.radius,
+                        match params.style {
+                            ExploreStyle::Circles => "círculos",
+                            ExploreStyle::Zigzag => "zigue-zague",
+                        },
+                        origin
+                    ),
+                    None => format!("Explorar{origin}"),
+                }
+            }
             // A UI ainda não cria esses tipos; falha alto em vez de enfileirar
             // algo que nenhum lado sabe executar.
             _ => return Err("Esse tipo de instrução ainda não é executável.".to_string()),
@@ -223,6 +268,7 @@ mod commands {
             status: InstructionStatus::Queued,
             progress: 0.0,
             target,
+            explore,
         };
         state.queue.lock().unwrap().push(instruction);
         dispatch_next_instruction(&state);
