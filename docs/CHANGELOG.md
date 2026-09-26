@@ -163,6 +163,24 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Editor de schematic (estilo WorldEdit): pintar, quebrar e selecionar região** — o modo Editor
+  agora usa o mesmo renderer do viewer (o canvas é movido pra view ativa, sem abrir um segundo
+  contexto WebGL) com: paleta lateral **visual** (busca + categorias, cada bloco com o ícone real
+  tirado do atlas), ferramentas **Selecionar** (dois cliques fecham a região, como no WorldEdit),
+  **Colocar** (bloco escolhido, na face clicada) e **Quebrar**, com o bloco/posição sob o cursor
+  destacado por um cubo de arame teal e a região por um cubo âmbar. O picking é ray casting em
+  voxels (DDA) sobre os chunks decodificados — as malhas são fundidas por chunk, então não dá pra
+  mapear um `Raycaster` de volta pra um bloco. O que é pintado vira uma **camada de edição
+  separada** do mundo real: ghost âmbar translúcido com a textura real (opacidade menor pra quebrar,
+  maior pra colocar), e o `WorldCache` **nunca é mutado** — o app nunca mostra como existente algo
+  que o bot ainda não construiu. "Aplicar" manda a camada pro Rust, onde o diff contra o mundo real
+  (`schematic.rs`, com testes) vira instruções `Mine`/`Build` na fila; a lista de blocos fica
+  guardada em `AppState.schematics` por id (a fila é pollada a cada segundo e não carrega centenas
+  de blocos). Detalhe honesto: o addon ainda **não executa** build/mina, então a instrução fica
+  `Queued` esperando executor — e, por isso, o dispatch da fila deixou de travar em instruções sem
+  executor: ele pula pra próxima que sabe rodar em vez de pegar a mesma pra sempre. Reportado pelo
+  usuário ("quero que vc adicione o sistema de poder posicionar blocos e destruir selecionar areas
+  para quebrar" / "faça do jeito que o documento relata").
 - **Explorar com raio e estilo (círculos/zigue-zague)**: o "Explorar" só tinha o modo nativo do
   Baritone (`explore(origem)`), que anda pro chunk nunca visto mais próximo sem forma definida — e
   ficava sem fim e sem progresso. Agora dá pra escolher o **raio** em blocos (16–5000) e o **padrão**:

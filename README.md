@@ -91,7 +91,11 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `Recipe`, `IngredientRef`) já existem em `src-tauri/src/items.rs`, incluindo a função
   `fits_inventory_2x2`, mas nada os popula ainda. (Diferente do atlas de texturas, que já lê o jar
   local de verdade — isso aqui ainda não foi implementado.)
-- **Editor de schematic** — placeholder na UI explicando a dependência do atlas de texturas.
+- **Editor de schematic** — a base funciona (paleta visual com texturas reais, seleção de região,
+  colocar/quebrar em ghost, diff contra o mundo real → instrução na fila), mas faltam: inspetor de
+  **blockstate** (escada/eixo de tora/laje — hoje todo bloco é cubo cheio), import de `.litematic`,
+  paleta vinda de um registro real de blocos (hoje é derivada dos nomes de textura do atlas) e
+  executor de `Mine`/`Build` no addon (a instrução fica na fila) — ver `docs/CHANGELOG.md`.
 - **Persistência** do `StorageIndex` (hoje só em memória) — o **mundo explorado** já é salvo em
   disco e reaparece com o jogo fechado (ver `src-tauri/src/world_store.rs`).
 

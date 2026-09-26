@@ -134,6 +134,27 @@ impl WorldCache {
             None => Vec::new(),
         }
     }
+
+    /// Nome do bloco numa posição de mundo. `None` = chunk desconhecido
+    /// (diferente de ar); seção ausente num chunk carregado = ar, como no
+    /// jogo. É o que o diff do editor de schematic (`schematic.rs`) usa pra
+    /// saber o que existe de verdade antes de gerar a instrução.
+    pub fn block_at(&self, pos: BlockPos) -> Option<&str> {
+        let chunk = self.chunks.get(&ChunkPos {
+            x: pos.x >> 4,
+            z: pos.z >> 4,
+        })?;
+        // `>>` com sinal: -1 >> 4 = -1 (seção -1), igual à divisão do jogo.
+        let Some(section) = chunk.sections.iter().find(|s| s.y as i32 == pos.y >> 4) else {
+            return Some("air");
+        };
+        let index = (((pos.y & 15) << 8) | ((pos.z & 15) << 4) | (pos.x & 15)) as usize;
+        let entry = section
+            .indices
+            .get(index)
+            .and_then(|slot| section.palette.get(*slot as usize));
+        Some(entry.map(|e| e.block.as_str()).unwrap_or("air"))
+    }
 }
 
 /// Chunks em cache mais próximos de um ponto (coordenadas de chunk),
