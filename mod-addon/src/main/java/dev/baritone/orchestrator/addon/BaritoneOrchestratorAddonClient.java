@@ -2,25 +2,48 @@ package dev.baritone.orchestrator.addon;
 
 import baritone.api.BaritoneAPI;
 import baritone.api.IBaritone;
+import baritone.api.pathing.goals.Goal;
+import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.utils.BetterBlockPos;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.LevelChunkSection;
+import net.minecraft.world.level.material.FluidState;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.common.EventBusSubscriber;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.event.level.ChunkEvent;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Deque;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.zip.Deflater;
 
 /**
  * Client-only bridge: reads the local player's vitals and position through
@@ -30,9 +53,12 @@ import java.util.Locale;
  * documented in {@code src-tauri/src/addon_socket.rs} (Rust side) and
  * {@code mod-addon/README.md}.
  *
- * <p>This is intentionally the smallest possible end-to-end slice — see
- * {@code docs/CHANGELOG.md} for what's deliberately not sent yet (chunk
- * deltas, chest contents, threat detection, ...).
+ * <p>Besides vitals/position it also streams the <b>whole chunk</b> when the
+ * client loads one ({@code chunk_voxels}): every non-empty 16×16×16 section
+ * serialized as palette + indices, deflated, base64. See
+ * {@code src-tauri/src/world_cache.rs} for the exact binary layout. This is
+ * still intentionally small — block updates after load, chest contents and
+ * threat detection are not sent yet (see {@code docs/CHANGELOG.md}).
  */
 @EventBusSubscriber(modid = BaritoneOrchestratorAddon.MODID, value = Dist.CLIENT)
 public class BaritoneOrchestratorAddonClient {
@@ -46,12 +72,56 @@ public class BaritoneOrchestratorAddonClient {
     private static final String HELLO_MESSAGE =
             "{\"type\":\"hello\",\"addon_version\":\"0.1.0\",\"baritone_version\":\"1.20.0\",\"mc_version\":\"26.3\"}";
 
+    // Layout do payload binário de `chunk_voxels` — precisa bater com
+    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 2):
+    //   u8 versão | u8 nº de seções
+    //   por seção: i8 Y da seção | u16 tamanho da paleta
+    //              por entrada: u16 tamanho do nome | bytes UTF-8 | u8 flags | u8 nível
+    //              u16[4096] índices (x + z*16 + y*256)
+    private static final byte VOXEL_FORMAT_VERSION = 2;
+    private static final int VOXEL_FLAG_RENDER = 1;
+    private static final int VOXEL_FLAG_OCCLUDES = 2;
+    private static final int VOXEL_FLAG_FLUID = 4;
+    private static final int SECTION_VOLUME = 4096; // 16×16×16
+
     private static Socket socket;
     private static OutputStream out;
     private static boolean helloSent;
+    /** Identificador da textura + variante da última skin enviada — ver
+     *  {@code sendPlayerSkinIfChanged}. `null` = nada enviado ainda (ou
+     *  conexão nova: a skin precisa ser reenviada). */
+    private static String lastSkinSignature;
     private static int ticksSinceLastVitals;
     private static int ticksSinceLastPosition;
     private static long nextReconnectAttemptMs;
+
+    // Canal reverso (app → addon): linhas recebidas pela thread leitora e
+    // drenadas na tick do cliente (a API do Baritone é de thread do cliente —
+    // chamar `setGoalAndPath` da thread do socket seria corrida). A fila é
+    // concorrente porque produtora e consumidora são threads diferentes.
+    private static final Queue<String> pendingCommands = new ConcurrentLinkedQueue<>();
+    private static final int ARRIVAL_RADIUS_BLOCKS = 1;
+
+    // Instrução ativa hoje (só uma por vez — a fila do app despacha em
+    // sequência). `activeInstructionId == null` = nada em execução.
+    private static String activeInstructionId;
+    private static String activeInstructionKind;
+    private static double activeTargetX;
+    private static double activeTargetZ;
+    private static double activeInitialDistance;
+    private static int ticksSinceLastInstructionStatus;
+
+    // Serializar um chunk inteiro (até 24 seções × 4096 blocos) + comprimir
+    // dá trabalho pra caber num tick; o backfill de reconexão pode enfileirar
+    // centenas de chunks de uma vez, então a fila drena só alguns por tick em
+    // vez de travar o jogo por um instante.
+    private static final int CHUNK_PAYLOADS_PER_TICK = 2;
+    private static final Deque<LevelChunk> pendingChunkPayloads = new ArrayDeque<>();
+
+    // Reutilizados entre chunks/seções pra não alocar 4096 shorts por seção.
+    private static final short[] sectionIndices = new short[SECTION_VOLUME];
+    private static final HashMap<BlockState, Integer> sectionPaletteIndex = new HashMap<>();
+    private static final ArrayList<BlockState> sectionPalette = new ArrayList<>();
 
     @SubscribeEvent
     static void onClientTick(ClientTickEvent.Post event) {
@@ -66,6 +136,10 @@ public class BaritoneOrchestratorAddonClient {
             return;
         }
 
+        // Instruções do app (chegadas pela thread leitora) executam aqui, na
+        // thread do cliente.
+        drainCommands(baritone);
+
         if (!helloSent) {
             helloSent = send(HELLO_MESSAGE);
             if (helloSent) {
@@ -77,7 +151,14 @@ public class BaritoneOrchestratorAddonClient {
                 // (re)connect, not just the first one — also re-syncs if the
                 // Rust app was restarted while the game kept running.
                 syncAlreadyLoadedChunks(baritone.getPlayerContext().playerFeet());
+                // Reconexão no meio de uma instrução: reenvia o estado atual
+                // pro app não ficar com o card preso em "ativo" sem update.
+                tickActiveInstruction(baritone);
             }
+        }
+
+        for (int i = 0; i < CHUNK_PAYLOADS_PER_TICK && !pendingChunkPayloads.isEmpty(); i++) {
+            sendChunkVoxels(pendingChunkPayloads.poll());
         }
 
         ticksSinceLastPosition++;
@@ -105,13 +186,142 @@ public class BaritoneOrchestratorAddonClient {
                     player.getArmorValue()
             ));
         }
+
+        // Progresso da instrução ativa na mesma cadência da posição (4x/s) —
+        // suficiente pro card da fila andar, sem linha por tick.
+        ticksSinceLastInstructionStatus++;
+        if (ticksSinceLastInstructionStatus >= POSITION_INTERVAL_TICKS) {
+            ticksSinceLastInstructionStatus = 0;
+            tickActiveInstruction(baritone);
+        }
+    }
+
+    /** Drena a fila do canal reverso e executa na thread do cliente. */
+    private static void drainCommands(IBaritone baritone) {
+        String line;
+        while ((line = pendingCommands.poll()) != null) {
+            try {
+                JsonObject message = JsonParser.parseString(line).getAsJsonObject();
+                switch (message.get("type").getAsString()) {
+                    case "instruction" -> handleInstruction(baritone, message);
+                    case "cancel" -> cancelActiveInstruction(baritone);
+                    default -> { }
+                }
+            } catch (RuntimeException e) {
+                // Linha malformada (JSON quebrado, campo faltando) não pode
+                // derrubar o jogo — ignora e segue.
+            }
+        }
     }
 
     /**
-     * Marks a client-rendered chunk as seen. Fires once per chunk load, so
-     * this can be noisy right after joining a world (one message per chunk
-     * already in render distance) — that's fine, each line is tiny and the
-     * Rust side just does a HashMap insert.
+     * Executa uma instrução do app chamando o processo nativo do Baritone:
+     * {@code travel_to} → {@link GoalXZ} + {@code ICustomGoalProcess},
+     * {@code explore} → {@code IExploreProcess.explore(origemX, origemZ)}.
+     */
+    private static void handleInstruction(IBaritone baritone, JsonObject message) {
+        String id = message.get("id").getAsString();
+        String kind = message.get("kind").getAsString();
+        BetterBlockPos feet = baritone.getPlayerContext().playerFeet();
+
+        switch (kind) {
+            case "travel_to" -> {
+                int x = message.get("x").getAsInt();
+                int z = message.get("z").getAsInt();
+                baritone.getCustomGoalProcess().setGoalAndPath(new GoalXZ(x, z));
+                activeInstructionId = id;
+                activeInstructionKind = kind;
+                activeTargetX = x;
+                activeTargetZ = z;
+                // Progresso = fração da distância em linha reta já vencida;
+                // é aproximado (o caminho real do Baritone desvia de
+                // obstáculos), mas é medido do mundo real, não chutado.
+                activeInitialDistance = Math.max(1.0, Math.hypot(x - feet.x, z - feet.z));
+                sendInstructionStatus("active", 0.0f);
+            }
+            case "explore" -> {
+                int originX = message.has("x") ? message.get("x").getAsInt() : feet.x;
+                int originZ = message.has("z") ? message.get("z").getAsInt() : feet.z;
+                baritone.getExploreProcess().explore(originX, originZ);
+                activeInstructionId = id;
+                activeInstructionKind = kind;
+                // Explore é contínuo (não tem "chegou"): fica ativo, sem
+                // progresso, até o app cancelar.
+                sendInstructionStatus("active", 0.0f);
+            }
+            default -> { }
+        }
+    }
+
+    private static void cancelActiveInstruction(IBaritone baritone) {
+        if (activeInstructionId == null) {
+            return;
+        }
+        baritone.getPathingBehavior().cancelEverything();
+        activeInstructionId = null;
+        activeInstructionKind = null;
+    }
+
+    /**
+     * Confere se a instrução ativa terminou e reporta progresso. `travel_to`:
+     * o Baritone larga o goal ao chegar (`getGoal() == null`) — se estava
+     * perto do alvo é `done`, senão foi interrompido (`failed`, ex: `#stop`
+     * digitado no jogo). `explore`: se o processo parou sozinho, `failed`.
+     */
+    private static void tickActiveInstruction(IBaritone baritone) {
+        if (activeInstructionId == null) {
+            return;
+        }
+        if ("travel_to".equals(activeInstructionKind)) {
+            BetterBlockPos feet = baritone.getPlayerContext().playerFeet();
+            double distance = Math.hypot(activeTargetX - feet.x, activeTargetZ - feet.z);
+            Goal goal = baritone.getCustomGoalProcess().getGoal();
+            if (goal == null) {
+                finishActiveInstruction(distance <= ARRIVAL_RADIUS_BLOCKS ? "done" : "failed");
+                return;
+            }
+            if (distance <= ARRIVAL_RADIUS_BLOCKS) {
+                finishActiveInstruction("done");
+                return;
+            }
+            float progress = (float) Math.min(1.0, Math.max(0.0, 1.0 - distance / activeInitialDistance));
+            sendInstructionStatus("active", progress);
+        } else if ("explore".equals(activeInstructionKind) && !baritone.getExploreProcess().isActive()) {
+            finishActiveInstruction("failed");
+        }
+    }
+
+    private static void finishActiveInstruction(String status) {
+        sendInstructionStatus(status, "done".equals(status) ? 1.0f : null);
+        activeInstructionId = null;
+        activeInstructionKind = null;
+    }
+
+    /** `progress` só vai no JSON quando existe — ver `addon_socket.rs`. */
+    private static void sendInstructionStatus(String status, Float progress) {
+        if (activeInstructionId == null) {
+            return;
+        }
+        if (progress == null) {
+            send(String.format(
+                    Locale.ROOT,
+                    "{\"type\":\"instruction_status\",\"id\":\"%s\",\"status\":\"%s\"}",
+                    activeInstructionId, status
+            ));
+        } else {
+            send(String.format(
+                    Locale.ROOT,
+                    "{\"type\":\"instruction_status\",\"id\":\"%s\",\"status\":\"%s\",\"progress\":%.3f}",
+                    activeInstructionId, status, progress
+            ));
+        }
+    }
+
+    /**
+     * Enfileira o chunk recém-carregado pro envio de {@code chunk_voxels}.
+     * Só enfileira: a serialização roda na fila drenada por
+     * {@code onClientTick}, pra um teleport/join que carrega centenas de
+     * chunks de uma vez não travar o jogo.
      *
      * <p>Deliberately does NOT send on {@link ChunkEvent.Unload} — see
      * {@code addon_socket.rs} for why this is a cumulative "seen" footprint,
@@ -122,17 +332,174 @@ public class BaritoneOrchestratorAddonClient {
         if (!(event.getLevel() instanceof ClientLevel) || out == null) {
             return;
         }
-        ChunkPos pos = event.getChunk().getPos();
-        send(String.format(Locale.ROOT, "{\"type\":\"chunk_loaded\",\"x\":%d,\"z\":%d}", pos.x(), pos.z()));
+        pendingChunkPayloads.add((LevelChunk) event.getChunk());
     }
 
     /**
-     * Backfills {@code chunk_loaded} for chunks that were already resident
-     * on the client before this connection existed — see the call site.
-     * Scans a square of {@code getEffectiveRenderDistance()} chunks around
-     * the player and checks each with {@code getChunk(x, z, false)}
-     * (non-forcing: returns null instead of loading it), so this never
-     * pulls in chunks the client doesn't already have.
+     * Manda o chunk inteiro: cada seção 16×16×16 não-vazia vira paleta +
+     * 4096 índices, tudo comprimido com zlib e base64 no JSON. É o mundo real
+     * (relevo, cavernas, minérios), não só a superfície que dá pra ver de
+     * cima — ver {@code docs/SPEC.md}, "Blocos 3D", e {@code world_cache.rs}.
+     */
+    private static void sendChunkVoxels(LevelChunk chunk) {
+        ChunkPos pos = chunk.getPos();
+        byte[] payload = serializeChunk(chunk);
+        String encoded = Base64.getEncoder().encodeToString(payload);
+        send(String.format(
+                Locale.ROOT,
+                "{\"type\":\"chunk_voxels\",\"x\":%d,\"z\":%d,\"data\":\"%s\"}",
+                pos.x(), pos.z(), encoded
+        ));
+    }
+
+    private static byte[] serializeChunk(LevelChunk chunk) {
+        LevelChunkSection[] sections = chunk.getSections();
+
+        int nonEmptySections = 0;
+        for (LevelChunkSection section : sections) {
+            if (!section.hasOnlyAir()) {
+                nonEmptySections++;
+            }
+        }
+
+        ByteArrayOutputStream raw = new ByteArrayOutputStream(64 * 1024);
+        raw.write(VOXEL_FORMAT_VERSION);
+        raw.write(nonEmptySections);
+
+        for (int i = 0; i < sections.length; i++) {
+            LevelChunkSection section = sections[i];
+            if (section.hasOnlyAir()) {
+                continue; // seção ausente = ar (ver decode_voxels no Rust)
+            }
+
+            sectionPalette.clear();
+            sectionPaletteIndex.clear();
+
+            // Ordem dos índices igual à do PalettedContainer vanilla:
+            // x + z*16 + y*256.
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        BlockState state = section.getBlockState(x, y, z);
+                        Integer index = sectionPaletteIndex.get(state);
+                        if (index == null) {
+                            index = sectionPalette.size();
+                            sectionPalette.add(state);
+                            sectionPaletteIndex.put(state, index);
+                        }
+                        sectionIndices[(y << 8) | (z << 4) | x] = (short) (int) index;
+                    }
+                }
+            }
+
+            writeI8(raw, chunk.getSectionYFromSectionIndex(i));
+            writeU16(raw, sectionPalette.size());
+            for (BlockState state : sectionPalette) {
+                byte[] name = BuiltInRegistries.BLOCK
+                        .getKey(state.getBlock())
+                        .getPath()
+                        .getBytes(StandardCharsets.UTF_8);
+                writeU16(raw, name.length);
+                raw.write(name, 0, name.length);
+                raw.write(voxelFlags(state));
+                raw.write(voxelLevel(state));
+            }
+            for (short index : sectionIndices) {
+                writeU16(raw, index & 0xFFFF);
+            }
+        }
+
+        return deflate(raw.toByteArray());
+    }
+
+    /**
+     * Flags de renderização por entrada de paleta — o viewer do app usa isso
+     * pro face culling sem precisar de uma lista de nomes de bloco:
+     * {@code RENDER} = dá pra desenhar como cubo/bloco (ar e decoração
+     * substituível, tipo grama alta, ficam de fora); {@code OCCLUDES} = o
+     * bloco esconde as faces dos vizinhos; {@code FLUID} = água/lava — o
+     * viewer desenha com altura de superfície (nível) e textura animada em
+     * vez de cubo opaco.
+     *
+     * <p>Fluido de propósito NÃO é marcado como oclusor: se marcasse, a face
+     * do chão/fundo contra a água sumiria e, como a água é translúcida, daria
+     * pra ver o cenário vazio através dela. Mesmo-fluido o viewer culla pelo
+     * nome do bloco.
+     */
+    private static int voxelFlags(BlockState state) {
+        boolean liquid = state.getBlock() instanceof LiquidBlock;
+        boolean fluid = liquid && !state.getFluidState().isEmpty();
+        boolean render = !state.isAir() && (fluid || !state.canBeReplaced());
+        if (!render) {
+            return 0;
+        }
+        int flags = VOXEL_FLAG_RENDER;
+        if (fluid) {
+            flags |= VOXEL_FLAG_FLUID;
+        } else if (state.isSolidRender()) {
+            flags |= VOXEL_FLAG_OCCLUDES;
+        }
+        return flags;
+    }
+
+    /**
+     * Nível do fluido no formato do blockstate vanilla: {@code 0} = fonte,
+     * {@code 1..=7} = fluindo (mais alto = mais raso), {@code 8} = caindo.
+     * Fora de água/lava é sempre 0 (o viewer só interpreta com a flag FLUID).
+     * O viewer converte isso na altura da superfície — ver
+     * {@code PaletteEntry::fluid_height} no Rust e {@code fluidHeight} no
+     * viewer.
+     */
+    private static int voxelLevel(BlockState state) {
+        if (!(state.getBlock() instanceof LiquidBlock)) {
+            return 0;
+        }
+        FluidState fluid = state.getFluidState();
+        if (fluid.isEmpty() || fluid.isSource()) {
+            return 0;
+        }
+        int amount = fluid.getAmount(); // 1..8, maior = mais cheio
+        return amount >= 8 ? 8 : 8 - amount;
+    }
+
+    private static void writeU16(ByteArrayOutputStream out, int value) {
+        out.write(value & 0xFF);
+        out.write((value >>> 8) & 0xFF);
+    }
+
+    private static void writeI8(ByteArrayOutputStream out, int value) {
+        out.write(value & 0xFF);
+    }
+
+    /** zlib (formato com header, igual ao `flate2::ZlibDecoder` do lado Rust). */
+    private static byte[] deflate(byte[] input) {
+        Deflater deflater = new Deflater(Deflater.DEFAULT_COMPRESSION);
+        try {
+            deflater.setInput(input);
+            deflater.finish();
+            ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(1024, input.length / 8));
+            byte[] buffer = new byte[16 * 1024];
+            while (!deflater.finished()) {
+                int written = deflater.deflate(buffer);
+                if (written > 0) {
+                    out.write(buffer, 0, written);
+                } else if (deflater.needsInput()) {
+                    break; // não deve acontecer depois de finish(), mas evita loop infinito
+                }
+            }
+            return out.toByteArray();
+        } finally {
+            deflater.end();
+        }
+    }
+
+    /**
+     * Backfills the chunks that were already resident on the client before
+     * this connection existed — see the call site. Scans a square of
+     * {@code getEffectiveRenderDistance()} chunks around the player and
+     * enqueues each with {@code getChunk(x, z, false)} (non-forcing: returns
+     * null instead of loading it), so this never pulls in chunks the client
+     * doesn't already have.
      */
     private static void syncAlreadyLoadedChunks(BetterBlockPos center) {
         ClientLevel level = Minecraft.getInstance().level;
@@ -145,11 +512,9 @@ public class BaritoneOrchestratorAddonClient {
 
         for (int dx = -radius; dx <= radius; dx++) {
             for (int dz = -radius; dz <= radius; dz++) {
-                int cx = centerX + dx;
-                int cz = centerZ + dz;
-                LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, false);
+                LevelChunk chunk = level.getChunkSource().getChunk(centerX + dx, centerZ + dz, false);
                 if (chunk != null) {
-                    send(String.format(Locale.ROOT, "{\"type\":\"chunk_loaded\",\"x\":%d,\"z\":%d}", cx, cz));
+                    pendingChunkPayloads.add(chunk);
                 }
             }
         }
@@ -170,11 +535,35 @@ public class BaritoneOrchestratorAddonClient {
             socket = newSocket;
             out = newSocket.getOutputStream();
             helloSent = false;
+            startReader(newSocket);
         } catch (IOException e) {
             // The Rust app probably isn't running yet — quietly retry later.
             socket = null;
             out = null;
         }
+    }
+
+    /**
+     * Thread leitora do canal reverso: só acumula linhas em
+     * {@link #pendingCommands} (concorrente); quem executa é {@code
+     * onClientTick}, na thread do cliente, onde a API do Baritone é segura.
+     * Daemon pra não segurar o processo do jogo se a conexão ficar pendurada.
+     */
+    private static void startReader(Socket newSocket) {
+        Thread reader = new Thread(() -> {
+            try (BufferedReader in = new BufferedReader(
+                    new InputStreamReader(newSocket.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = in.readLine()) != null) {
+                    pendingCommands.add(line);
+                }
+            } catch (IOException e) {
+                // Conexão caiu — a próxima tick detecta (o `send` falha) e
+                // tenta reconectar.
+            }
+        }, "baritone-orchestrator-socket-reader");
+        reader.setDaemon(true);
+        reader.start();
     }
 
     private static boolean send(String json) {

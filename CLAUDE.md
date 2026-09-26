@@ -1,5 +1,8 @@
 # Baritone Orchestrator — working guide (AI)
 
+> **Mirror:** [`CLAUDE.md`](CLAUDE.md) is a byte-for-byte copy of this file. Every edit here must be
+> applied to both — the cheap way is `cp AGENTS.md CLAUDE.md` after editing.
+
 ## 1. What it is
 
 A desktop app (Tauri 2, Rust backend + TypeScript frontend) that orchestrates a **Baritone**
@@ -86,8 +89,10 @@ There is no test suite yet.
 6. **New Rust commands** go under `mod commands` in `lib.rs` and must be added to both the
    `tauri::generate_handler![...]` list inside `commands::register` — Tauri won't expose one without
    the other.
-7. **Do not commit/push without explicit permission** for that specific change. Leave changes in the
-   working tree and say so; committing is the user's call.
+7. **Commits follow the worktree flow (section 9).** Commit on your task branch; merging that branch
+   into the local `main` is pre-authorized there — check for conflicts first, fix them on the branch,
+   verify the merged result. **Pushing to `origin` still needs explicit permission** for that specific
+   push, and so does committing directly on the primary checkout instead of a branch.
 8. **Never commit `mod-addon/libs/*.jar`.** The Baritone jar is fetched by `mod-addon/scripts/
    fetch-baritone.sh` (which verifies its SHA-1 against the official release's `checksums.txt`) and is
    gitignored — don't vendor third-party binaries into the repo.
@@ -200,3 +205,71 @@ There is no test suite yet.
   messages shown to the user) are in Brazilian Portuguese — see rule 5 above.
 - Keep comments concise; add them only to explain non-obvious behavior or point back to the relevant
   `docs/SPEC.md` section, not to restate what the code already says.
+
+## 9. Parallel work: one worktree per task, auto-merge into `main` when clean
+
+More than one agent session can be working on this repo at the same time. Concurrent edits to the
+same checkout lose writes and leave half-refactored trees behind (a Rust refactor and a texture fix
+already landed on top of each other once). So: **one task = one worktree + one branch**, and the
+primary checkout stays on `main`, used only to merge and verify.
+
+### Start a task
+
+```bash
+git worktree add ../baritonelauncher-<slug> -b <slug> main
+cd ../baritonelauncher-<slug>
+npm install          # a fresh worktree has no node_modules/
+```
+
+- Worktrees live **as siblings** of the repo (`../baritonelauncher-<slug>`), never inside it — Vite,
+  `tsc` and the app watchers would pick them up and rebuild over each other's files.
+- If your harness can move the session's working directory into the worktree (e.g. OpenCode's
+  `session_move`), do that — a `cd` inside one shell command does **not** change where the file
+  editing tools write, and you'd silently keep editing the primary checkout.
+- `<slug>` is short kebab-case for the task (`player-renderer`, `leaf-tint`, …).
+- Never edit files in another session's worktree, and never edit the primary checkout while you have
+  a task branch — the primary checkout must stay clean so it can merge.
+- A new worktree builds Rust from scratch (`target/` is per-worktree). If disk/time matter more than
+  build-cache isolation, share one `CARGO_TARGET_DIR` (builds then wait on each other's lock instead
+  of duplicating the dependency tree).
+- Do the work, follow rule 4 (changelog), run the checks **in the worktree** (`npm run build`; `cd
+  src-tauri && cargo check`, plus `cargo test` when you touched Rust), then commit — English commit
+  messages, per section 8.
+
+### Finish: verify, merge, verify again
+
+Run this from inside the task worktree, only with the branch committed and its checks green:
+
+1. Integrate `main` into your branch first — this is where conflicts show up, and fixing them on your
+   own branch keeps the context fresh:
+   ```bash
+   git merge main
+   ```
+   Resolve every conflict (the merge target is the **local** `main`; pulling from `origin` is the
+   user's call), re-run the checks, commit.
+   Optional dry run without touching anything: `git merge-tree --write-tree main <slug>` — exit 0
+   means no textual conflict.
+2. Merge into `main` from the primary checkout:
+   ```bash
+   cd /path/to/baritonelauncher     # the primary checkout, on main
+   git status                       # must be clean
+   git merge --no-ff <slug>
+   ```
+   If `git status` shows uncommitted work, **stop and report it** — never stash, commit or discard
+   another session's work to unblock yourself.
+3. Verify the merged result on `main` with the same checks. If the merge broke something, roll back
+   (`git reset --hard ORIG_HEAD`) and go back to the worktree — never leave `main` broken.
+4. Clean up only after (3) is green:
+   ```bash
+   git worktree remove ../baritonelauncher-<slug>
+   git branch -d <slug>
+   ```
+
+Notes:
+
+- Textual conflicts are the easy case — the dangerous ones are semantic (main renamed a command
+  while your branch still calls the old name). The checks **after** the merge are the real gate.
+- One merge at a time: if `.git/MERGE_HEAD` exists, another session is mid-merge; wait.
+- Abandoning a task? `git worktree remove --force ../baritonelauncher-<slug>` and `git branch -D
+  <slug>` — don't leave stale worktrees around.
+- Pushing to `origin` stays out of this flow — see rule 7.

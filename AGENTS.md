@@ -1,5 +1,8 @@
 # Baritone Orchestrator — working guide (AI)
 
+> **Mirror:** [`CLAUDE.md`](CLAUDE.md) is a byte-for-byte copy of this file. Every edit here must be
+> applied to both — the cheap way is `cp AGENTS.md CLAUDE.md` after editing.
+
 ## 1. What it is
 
 A desktop app (Tauri 2, Rust backend + TypeScript frontend) that orchestrates a **Baritone**
@@ -66,11 +69,12 @@ There is no test suite yet.
 ## 5. Non-negotiable rules
 
 1. **No fabricated data in shipped UI.** Every Tauri command in `src-tauri/src/lib.rs` returns real
-   state — `connection_status`/`vitals_snapshot` now reflect the addon's actual socket messages when
-   connected; `queue_snapshot`/`storage_totals` still return empty vectors because nothing populates
-   them yet. If you're tempted to hardcode a sample queue or chest so the UI "looks alive," don't —
-   render the honest empty state instead (see `renderQueueInto`/`renderStorage` in `src/main.ts` for
-   the pattern) and say in your reply that the feature has no backend yet.
+   state — `connection_status`/`vitals_snapshot` reflect the addon's actual socket messages when
+   connected, `queue_snapshot` reflects the real instruction queue (`queue_push`/`queue_cancel` +
+   `instruction_status` from the addon), and `storage_totals` still returns an empty vector because
+   nothing populates it yet. If you're tempted to hardcode a sample queue or chest so the UI "looks
+   alive," don't — render the honest empty state instead (see `renderQueueInto`/`renderStorage` in
+   `src/main.ts` for the pattern) and say in your reply that the feature has no backend yet.
 2. **Never hardcode colors in CSS/inline styles.** Use the custom properties in `:root` in
    `src/styles.css` (`--bg-*`, `--amber`, `--teal`, `--success`, `--text-*`, `--border*`). They are the
    literal tokens from `docs/SPEC.md`'s "Identidade visual" table — don't introduce new colors without
@@ -86,8 +90,10 @@ There is no test suite yet.
 6. **New Rust commands** go under `mod commands` in `lib.rs` and must be added to both the
    `tauri::generate_handler![...]` list inside `commands::register` — Tauri won't expose one without
    the other.
-7. **Do not commit/push without explicit permission** for that specific change. Leave changes in the
-   working tree and say so; committing is the user's call.
+7. **Commits follow the worktree flow (section 9).** Commit on your task branch; merging that branch
+   into the local `main` is pre-authorized there — check for conflicts first, fix them on the branch,
+   verify the merged result. **Pushing to `origin` still needs explicit permission** for that specific
+   push, and so does committing directly on the primary checkout instead of a branch.
 8. **Never commit `mod-addon/libs/*.jar`.** The Baritone jar is fetched by `mod-addon/scripts/
    fetch-baritone.sh` (which verifies its SHA-1 against the official release's `checksums.txt`) and is
    gitignored — don't vendor third-party binaries into the repo.
@@ -127,23 +133,27 @@ There is no test suite yet.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, all behind `Mutex`) + the seven
-  commands currently exposed: `connection_status`, `world_summary`, `world_chunks`, `queue_snapshot`,
-  `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns `addon_socket::listen` in `setup()`.
-- `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line. Handles `hello`
-  (marks `AppState.connection` as connected), `vitals` (fills `AppState.vitals`), `position` (fills
-  `AppState.bot_pos`), and `chunk_loaded` (marks presence in `AppState.world` via `apply_delta` with
-  an empty block map — deliberately cumulative, not removed on unload; see the module doc-comment for
-  why) and stores the version from `hello` in `AppState.mc_version` (used by `texture_atlas.rs` to
-  find the matching local jar — never hardcode a version here, read it from this field). The matching
-  Java client is
+  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, plus `addon_tx` — the outbound
+  write channel to the addon, all behind `Mutex`) + the commands currently exposed:
+  `connection_status`, `world_summary`, `world_chunks`, `chunk_voxels`, `queue_snapshot`,
+  `queue_push`, `queue_cancel`, `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns
+  `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
+  are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
+  handler and when an instruction reaches a terminal status.
+- `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line, **both
+  directions**. Addon → app: `hello` (marks `AppState.connection` as connected + dispatches queued
+  instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos`),
+  `chunk_voxels` (full chunk, palette + indices per section, deflate+base64 → `world_cache.rs`) and
+  `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
+  the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
+  a task consuming `AppState.addon_tx`, registered per connection. Stores the version from `hello`
+  in `AppState.mc_version` (used by `texture_atlas.rs` to find the matching local jar — never
+  hardcode a version here, read it from this field). The matching Java client is
   `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
-  Extending the protocol further (e.g. real block data, chest contents) means updating the
-  `AddonMessage` enum here **and** the Java sender in lockstep — they're not generated from a shared
-  schema.
-- `world_cache.rs` — sparse per-chunk block cache (`WorldCache`). Chunk presence is real
-  (`chunk_loaded` messages), but no chunk has actual block data yet — the addon doesn't send any.
-  Also `CrossingStrategy` for the learned water/lava crossing policy.
+  Extending the protocol further (e.g. chest contents) means updating the `AddonMessage` enum here
+  **and** the Java sender/receiver in lockstep — they're not generated from a shared schema.
+- `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
+  + indices per 16×16×16 section). Also `CrossingStrategy` for the learned water/lava crossing policy.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
   `src-tauri/.cache/` (gitignored). **Never download or bundle Mojang assets** — this reads only what
@@ -176,18 +186,18 @@ There is no test suite yet.
 
 ## 7. Known gaps (be honest about these, don't paper over them)
 
-- **`chunk_loaded` only marks presence, no block data.** `WorldCache.chunks[pos].blocks` stays empty —
-  no chest/inventory data, no instructions sent from the Rust side to the addon yet either;
-  `StorageIndex`/`InstructionQueue` stay empty even with the addon connected.
+- **No chest/inventory data.** `StorageIndex` stays empty — `chunk_voxels` carries terrain, but no
+  block entities, and there's no `ContainerScreen` simulation to read chests (see `docs/SPEC.md`,
+  "Índice de armazenamento").
+- **Instructions only cover `travel_to`/`explore`.** The reverse channel works end to end
+  (`queue_push` → addon → `instruction_status`), but `Mine`/`Build`/`FetchFromChest`/`Craft`/`Smelt`
+  have no executor in the addon yet, and the UI composer only creates the two executable kinds.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **No real terrain, only a placeholder texture.** The texture atlas pipeline (`texture_atlas.rs`)
-  works and is wired into `viewer3d.ts`, but every chunk plate gets the same hardcoded
-  `PLACEHOLDER_TEXTURE` ("dirt" — not a tinted texture like grass, which is stored gray in the jar and
-  needs runtime biome-tint multiplication we don't do; see the constant's comment in `viewer3d.ts`)
-  because `chunk_loaded` is still presence-only — no actual
-  block content or height-per-column comes from the addon. Fixing this needs a protocol change
-  (addon sends real block/height data), not more atlas work.
+- **Biome tint is a fixed approximation, not the real colormap.** Grass/foliage/water textures are
+  gray in the jar and get fixed tints (`GRASS_TINT` and friends in `viewer3d.ts`) instead of a
+  per-column biome lookup — visually close, not exact. Blockstates (stair orientation, log axis,
+  slabs) also aren't modeled yet: every block renders as a full cube.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
 - **`StorageIndex` is in-memory only** — no persistence across restarts.
@@ -200,3 +210,71 @@ There is no test suite yet.
   messages shown to the user) are in Brazilian Portuguese — see rule 5 above.
 - Keep comments concise; add them only to explain non-obvious behavior or point back to the relevant
   `docs/SPEC.md` section, not to restate what the code already says.
+
+## 9. Parallel work: one worktree per task, auto-merge into `main` when clean
+
+More than one agent session can be working on this repo at the same time. Concurrent edits to the
+same checkout lose writes and leave half-refactored trees behind (a Rust refactor and a texture fix
+already landed on top of each other once). So: **one task = one worktree + one branch**, and the
+primary checkout stays on `main`, used only to merge and verify.
+
+### Start a task
+
+```bash
+git worktree add ../baritonelauncher-<slug> -b <slug> main
+cd ../baritonelauncher-<slug>
+npm install          # a fresh worktree has no node_modules/
+```
+
+- Worktrees live **as siblings** of the repo (`../baritonelauncher-<slug>`), never inside it — Vite,
+  `tsc` and the app watchers would pick them up and rebuild over each other's files.
+- If your harness can move the session's working directory into the worktree (e.g. OpenCode's
+  `session_move`), do that — a `cd` inside one shell command does **not** change where the file
+  editing tools write, and you'd silently keep editing the primary checkout.
+- `<slug>` is short kebab-case for the task (`player-renderer`, `leaf-tint`, …).
+- Never edit files in another session's worktree, and never edit the primary checkout while you have
+  a task branch — the primary checkout must stay clean so it can merge.
+- A new worktree builds Rust from scratch (`target/` is per-worktree). If disk/time matter more than
+  build-cache isolation, share one `CARGO_TARGET_DIR` (builds then wait on each other's lock instead
+  of duplicating the dependency tree).
+- Do the work, follow rule 4 (changelog), run the checks **in the worktree** (`npm run build`; `cd
+  src-tauri && cargo check`, plus `cargo test` when you touched Rust), then commit — English commit
+  messages, per section 8.
+
+### Finish: verify, merge, verify again
+
+Run this from inside the task worktree, only with the branch committed and its checks green:
+
+1. Integrate `main` into your branch first — this is where conflicts show up, and fixing them on your
+   own branch keeps the context fresh:
+   ```bash
+   git merge main
+   ```
+   Resolve every conflict (the merge target is the **local** `main`; pulling from `origin` is the
+   user's call), re-run the checks, commit.
+   Optional dry run without touching anything: `git merge-tree --write-tree main <slug>` — exit 0
+   means no textual conflict.
+2. Merge into `main` from the primary checkout:
+   ```bash
+   cd /path/to/baritonelauncher     # the primary checkout, on main
+   git status                       # must be clean
+   git merge --no-ff <slug>
+   ```
+   If `git status` shows uncommitted work, **stop and report it** — never stash, commit or discard
+   another session's work to unblock yourself.
+3. Verify the merged result on `main` with the same checks. If the merge broke something, roll back
+   (`git reset --hard ORIG_HEAD`) and go back to the worktree — never leave `main` broken.
+4. Clean up only after (3) is green:
+   ```bash
+   git worktree remove ../baritonelauncher-<slug>
+   git branch -d <slug>
+   ```
+
+Notes:
+
+- Textual conflicts are the easy case — the dangerous ones are semantic (main renamed a command
+  while your branch still calls the old name). The checks **after** the merge are the real gate.
+- One merge at a time: if `.git/MERGE_HEAD` exists, another session is mid-merge; wait.
+- Abandoning a task? `git worktree remove --force ../baritonelauncher-<slug>` and `git branch -D
+  <slug>` — don't leave stale worktrees around.
+- Pushing to `origin` stays out of this flow — see rule 7.

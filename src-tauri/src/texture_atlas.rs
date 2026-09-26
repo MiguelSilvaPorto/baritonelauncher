@@ -7,11 +7,16 @@
 //! instalado"). O atlas gerado fica cacheado em `src-tauri/.cache/`
 //! (gitignored — texturas da Mojang não podem ir pro repositório público).
 //!
-//! v0 deliberadamente simples: só texturas 16×16 (pula animadas tipo
-//! água/lava/fogo, que vêm como PNG mais alto com frames empilhados — exige
-//! animação no shader, não implementado), empacotadas num grid uniforme
-//! (não é bin-packing real, mas com tiles todos do mesmo tamanho não faz
-//! diferença de espaço desperdiçado).
+//! v0 deliberadamente simples: um tile 16×16 por textura, empacotado num
+//! grid uniforme (não é bin-packing real, mas com tiles todos do mesmo
+//! tamanho não faz diferença de espaço desperdiçado). Texturas animadas
+//! (água, lava, fogo...) vêm como PNG mais alto com os frames empilhados:
+//! cada frame vira um tile `"{nome}_f{n}"` (o nome puro continua no mapa,
+//! apontando pro frame 0), e é isso que permite o viewer animar água/lava de
+//! verdade em vez de mostrar um fotograma congelado. Frames de 32×32
+//! (`water_flow`, `lava_flow`) são reduzidos pra 16×16 — o atlas é uniforme
+//! 16×16; texturas estáticas de outro tamanho (ex: 32×32 de placa) continuam
+//! puladas.
 
 use base64::Engine;
 use image::{DynamicImage, RgbaImage};
@@ -21,6 +26,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 const TILE_SIZE: u32 = 16;
+
+/// Sobe isto sempre que a extração/empacotamento mudar de formato: o cache
+/// em disco é reaproveitado sem checar conteúdo (`build_or_load_atlas`),
+/// então sem a versão no nome um atlas antigo continuaria valendo pra sempre.
+const ATLAS_CACHE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct UvRect {
@@ -43,6 +53,14 @@ fn cache_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cache")
 }
 
+/// Caminho do par PNG+JSON do atlas em cache pra uma versão — centralizado
+/// aqui pra `build_or_load_atlas`, `build_atlas` e o teste usarem o mesmo
+/// nome (a versão do formato acima faz parte do nome).
+fn cache_paths(mc_version: &str) -> (PathBuf, PathBuf) {
+    let base = cache_dir().join(format!("atlas_v{ATLAS_CACHE_VERSION}_{mc_version}"));
+    (base.with_extension("png"), base.with_extension("json"))
+}
+
 /// Onde o client jar já instalado deveria estar. Não baixa nada se não
 /// encontrar — devolve `None` e quem chamou decide o que fazer (hoje: erro
 /// honesto pedindo pra instalar a versão certa).
@@ -58,8 +76,7 @@ fn find_local_client_jar(mc_version: &str) -> Option<PathBuf> {
 /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco pra
 /// versão pedida.
 pub fn build_or_load_atlas(mc_version: &str) -> Result<TextureAtlas, String> {
-    let png_path = cache_dir().join(format!("atlas_{mc_version}.png"));
-    let json_path = cache_dir().join(format!("atlas_{mc_version}.json"));
+    let (png_path, json_path) = cache_paths(mc_version);
 
     if png_path.is_file() && json_path.is_file() {
         return load_cached(&png_path, &json_path);
@@ -113,10 +130,32 @@ fn build_atlas(jar_path: &Path, mc_version: &str) -> Result<TextureAtlas, String
         let Ok(img) = image::load_from_memory(&bytes) else {
             continue;
         };
-        if img.width() != TILE_SIZE || img.height() != TILE_SIZE {
-            continue; // animada (frames empilhados) ou atípica — pulada por enquanto
+
+        // Estática 16×16 → um tile; animada com frames empilhados na vertical
+        // (water_still 16×512, lava_flow 32×512…) → um tile por frame. Frames
+        // de 32×32 são reduzidos pra 16×16: o atlas é uniforme, e é o que
+        // deixa água/lava fluindo no shader (`water_flow` nunca é 16×16).
+        let (frame_size, frame_count) = match (img.width(), img.height()) {
+            (TILE_SIZE, TILE_SIZE) => (TILE_SIZE, 1),
+            (TILE_SIZE, h) if h > TILE_SIZE && h % TILE_SIZE == 0 => (TILE_SIZE, h / TILE_SIZE),
+            (32, h) if h > 32 && h % 32 == 0 => (32, h / 32),
+            _ => continue, // atípica/estática de outro tamanho (ex: 32×32 de placa) — pulada
+        };
+
+        if frame_count == 1 {
+            raw.push((stem.to_string(), img.to_rgba8()));
+            continue;
         }
-        raw.push((stem.to_string(), img.to_rgba8()));
+
+        for frame in 0..frame_count {
+            let cropped = img.crop_imm(0, frame * frame_size, frame_size, frame_size);
+            let tile = if frame_size == TILE_SIZE {
+                cropped
+            } else {
+                cropped.resize_exact(TILE_SIZE, TILE_SIZE, image::imageops::FilterType::Triangle)
+            };
+            raw.push((format!("{stem}_f{frame}"), tile.to_rgba8()));
+        }
     }
     raw.sort_by(|a, b| a.0.cmp(&b.0)); // saída determinística, cache estável
 
@@ -149,9 +188,20 @@ fn build_atlas(jar_path: &Path, mc_version: &str) -> Result<TextureAtlas, String
         );
     }
 
+    // Textura animada também fica no mapa pelo nome "puro", apontando pro
+    // frame 0 — quem só quer um frame estático (blocos opacos, lava parada)
+    // continua funcionando sem saber da animação. O viewer acha os outros
+    // frames procurando `"{nome}_f1"`, `"_f2"`… em ordem.
+    let frame_zero: Vec<(String, UvRect)> = textures
+        .iter()
+        .filter_map(|(name, rect)| name.strip_suffix("_f0").map(|stem| (stem.to_string(), *rect)))
+        .collect();
+    for (stem, rect) in frame_zero {
+        textures.insert(stem, rect);
+    }
+
     std::fs::create_dir_all(cache_dir()).map_err(|e| e.to_string())?;
-    let png_path = cache_dir().join(format!("atlas_{mc_version}.png"));
-    let json_path = cache_dir().join(format!("atlas_{mc_version}.json"));
+    let (png_path, json_path) = cache_paths(mc_version);
 
     DynamicImage::ImageRgba8(atlas.clone())
         .save(&png_path)
@@ -197,9 +247,27 @@ mod tests {
         );
         let rect = atlas.textures["grass_block_top"];
         assert!(rect.u1 > rect.u0 && rect.v1 > rect.v0, "UV rect inválido: {rect:?}");
+        assert!(
+            atlas.textures.contains_key("water_still"),
+            "textura animada (alias do frame 0) deveria entrar no atlas"
+        );
+        assert!(
+            atlas.textures.contains_key("water_still_f0"),
+            "primeiro frame da textura animada deveria entrar no atlas"
+        );
+        assert!(
+            atlas.textures.contains_key("water_still_f1"),
+            "segundo frame da textura animada deveria entrar no atlas"
+        );
+        // water_flow é 32×32 por frame — precisa ser reduzida, não pulada.
+        assert!(
+            atlas.textures.contains_key("water_flow_f0"),
+            "frame de textura 32×32 (water_flow) deveria ser reduzido e entrar no atlas"
+        );
 
         // limpa o cache de teste pra não sujar o diretório real
-        let _ = std::fs::remove_file(cache_dir().join("atlas_26.3-test.png"));
-        let _ = std::fs::remove_file(cache_dir().join("atlas_26.3-test.json"));
+        let (png_path, json_path) = cache_paths("26.3-test");
+        let _ = std::fs::remove_file(png_path);
+        let _ = std::fs::remove_file(json_path);
     }
 }
