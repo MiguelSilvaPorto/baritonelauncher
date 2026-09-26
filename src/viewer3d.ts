@@ -82,12 +82,22 @@ const MOVE_KEYS = new Set([
 // usuário se afastava.
 const FOG_NEAR_BASE = 60;
 const FOG_FAR_BASE = 260;
+/** Início do fog como fração do fim — a aba Config expõe só a distância do
+ * horizonte (`fog_far`), e o início acompanha nessa proporção. */
+const FOG_NEAR_RATIO = FOG_NEAR_BASE / FOG_FAR_BASE;
 
 // Perseguição do jogador: a pose real chega 4x/s (ver `addon_socket.rs`), e
 // estes valores são o que evita o modelo "piscar" de posição em posição — o
 // alvo é interpolado a cada frame (constante de tempo ~83ms com 12), e um
 // salto grande (reconexão, `/tp`) encaixa direto em vez de deslizar pelo mapa.
-const BOT_FOLLOW_RATE = 12; // 1/s
+// O addon manda `bot_pose` a cada 250 ms (mesma cadência do `POSE_INTERVAL_MS`
+// no `main.ts`); o follow do boneco cobre a distância da pose no intervalo real
+// entre elas, em velocidade constante — chegando exato no alvo, sem a
+// aproximação exponencial que nunca fechava a conta e deixava o boneco
+// deslizando depois que o bot parava. O teto evita que um ajuste grande (mas
+// abaixo do teleporte) vire um borrão.
+const BOT_FOLLOW_INTERVAL_FALLBACK = 0.25; // s — primeira pose, sem histórico
+const BOT_FOLLOW_MAX_SPEED = 40; // blocos/s
 const BOT_TELEPORT_DISTANCE = 8; // blocos
 const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
 const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
@@ -177,9 +187,10 @@ export const CHUNKS_PER_REFRESH = 16;
  * persistido (que cresce sem limite). */
 export const NEARBY_CHUNK_LIMIT = 1024;
 
-/** Orçamento de CPU por frame pra montar malhas de chunk, em ms. Um backfill
- * pode enfileirar centenas de chunks; montar todos de uma vez derruba o fps,
- * então a fila é drenada em pedaços por frame. */
+/** Orçamento de CPU por frame pra montar malhas de chunk, em ms — padrão do
+ * app; a aba Config pode mudar (`applySettings`). Um backfill pode enfileirar
+ * centenas de chunks; montar todos de uma vez derruba o fps, então a fila é
+ * drenada em pedaços por frame. */
 const MESH_BUDGET_MS = 8;
 
 export interface BotPos {
@@ -218,6 +229,20 @@ export interface BlockPos {
 /** Ferramenta ativa do editor de schematic. `null` = viewer puro (clique não
  * edita nada). */
 export type EditMode = "select" | "place" | "break";
+
+/** Preferências do viewer vindas da aba Config (comando `settings_get`, ver
+ * `src-tauri/src/settings.rs`). O backend já prende os valores na faixa
+ * válida — o viewer só aplica o que chegou. */
+export interface ViewerSettings {
+  /** Distância (blocos) em que o fog fecha o horizonte. */
+  fogFar: number;
+  /** Orçamento por frame (ms) pra montar malhas de chunk. */
+  meshBudgetMs: number;
+  /** Teto do device pixel ratio do canvas. */
+  maxPixelRatio: number;
+  /** Teto de FPS — 0 = sem limite (vsync). */
+  fpsCap: number;
+}
 
 /** Uma edição da camada de pintura: `block = null` = quebrar (vira ar). O
  * frontend manda isso inteiro em `schematic_apply` e o diff real acontece no
@@ -446,6 +471,15 @@ export class Viewer3D {
   private container: HTMLElement;
   private fog: THREE.Fog;
 
+  // Preferências da aba Config (ver `applySettings`). Os valores iniciais são
+  // os padrões do backend (`src-tauri/src/settings.rs`); `main.ts` substitui
+  // assim que o `settings_get` responde.
+  private fogFar = FOG_FAR_BASE;
+  private meshBudgetMs = MESH_BUDGET_MS;
+  private maxPixelRatio = 2;
+  private fpsCap = 0;
+  private lastRenderMs = 0;
+
   /** Chunks decodificados (voxels crus), chave = `chunkKey`. */
   private chunks = new Map<number, DecodedChunk>();
   /** Malhas de um chunk, uma por bucket de material — ver `buildChunkMesh`. */
@@ -459,6 +493,11 @@ export class Viewer3D {
   private playerModel = new MinecraftPlayerModel();
   /** Alvo da interpolação da pose; `null` = sem jogador. */
   private targetBotPos: THREE.Vector3 | null = null;
+  /** Velocidade do follow do boneco (blocos/s), calculada na última pose pra
+   * cobrir a distância no intervalo real entre poses — ver `setBotPose`. */
+  private followSpeed = 0;
+  /** Timestamp (ms) da última pose recebida; 0 = sem histórico ainda. */
+  private lastPoseAtMs = 0;
   private botYaw = 0;
   private botPitch = 0;
 
@@ -586,7 +625,12 @@ export class Viewer3D {
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
+    // Inércia curta: soltando o mouse, a órbita para em ~0,4 s em vez de
+    // continuar girando por segundos.
+    this.controls.dampingFactor = 0.22;
+    // Rotação por arrasto um pouco menos sensível — um arrasto curto não
+    // joga a câmera pro outro lado do bot.
+    this.controls.rotateSpeed = 0.8;
     // Zoom livre na prática: antes travava em 8–400 blocos (não dava pra
     // chegar perto de um bloco pra inspecionar nem ver o relevo de longe).
     this.controls.minDistance = 1.5;
@@ -1325,7 +1369,7 @@ export class Viewer3D {
     this.chunkMeshes.set(key, meshes);
   }
 
-  /** Monta no máximo `MESH_BUDGET_MS` de malhas por frame. Um backfill (ou o
+  /** Monta no máximo `meshBudgetMs` de malhas por frame. Um backfill (ou o
    * mundo persistido abrindo) enfileira centenas de chunks de uma vez;
    * montar tudo num tick só derrubava o fps, então a fila anda em pedaços —
    * o resto aparece nos frames seguintes, começando pelos mais próximos do
@@ -1339,7 +1383,7 @@ export class Viewer3D {
       this.queuedChunks.delete(key);
       const chunk = this.chunks.get(key);
       if (chunk && this.atlasUvByName) this.buildChunkMesh(chunk);
-    } while (this.meshQueue.length > 0 && performance.now() - start < MESH_BUDGET_MS);
+    } while (this.meshQueue.length > 0 && performance.now() - start < this.meshBudgetMs);
   }
 
   private disposeChunkMeshes(key: number) {
@@ -1367,6 +1411,8 @@ export class Viewer3D {
   setBotPose(pose: BotPose | null) {
     if (!pose) {
       this.targetBotPos = null;
+      this.followSpeed = 0;
+      this.lastPoseAtMs = 0;
       this.botMarker.visible = false;
       this.labelEl.style.display = "none";
       this.playerModel.resetWalk();
@@ -1391,6 +1437,18 @@ export class Viewer3D {
       this.playerModel.resetWalk();
     }
 
+    // Velocidade constante pra cobrir a distância no intervalo real entre
+    // poses: o boneco anda no ritmo do bot e chega exato antes da próxima.
+    // Sem isso (regime exponencial antigo) o follow nunca fechava a conta e
+    // continuava deslizando por cima do alvo depois que o bot parava.
+    const now = performance.now();
+    const interval =
+      this.lastPoseAtMs > 0
+        ? Math.max((now - this.lastPoseAtMs) / 1000, 0.05)
+        : BOT_FOLLOW_INTERVAL_FALLBACK;
+    this.lastPoseAtMs = now;
+    this.followSpeed = Math.min(target.distanceTo(this.botMarker.position) / interval, BOT_FOLLOW_MAX_SPEED);
+
     this.targetBotPos = target;
     this.botMarker.visible = true;
     this.labelEl.textContent = `${pose.x}, ${pose.y}, ${pose.z}`;
@@ -1402,12 +1460,16 @@ export class Viewer3D {
     this.playerModel.setSkin(skin);
   }
 
-  /** Move o modelo (interpolando até o alvo) e a câmera pelo mesmo passo. */
+  /** Move o modelo (em velocidade constante até o alvo) e a câmera pelo mesmo
+   * passo. Quando o resto cabe no passo do frame, `step` já é o resto exato —
+   * o boneco chega e para junto com o bot, sem sobra pra deslizar depois. */
   private updateBotMarker(dt: number) {
     if (!this.targetBotPos) return;
 
     const step = this.targetBotPos.clone().sub(this.botMarker.position);
-    step.multiplyScalar(1 - Math.exp(-BOT_FOLLOW_RATE * dt));
+    const distance = step.length();
+    const maxStep = this.followSpeed * dt;
+    if (distance > maxStep) step.multiplyScalar(maxStep / distance);
     this.botMarker.position.add(step);
     this.camera.position.add(step);
     this.controls.target.add(step);
@@ -1606,13 +1668,17 @@ export class Viewer3D {
 
     this.camera.getWorldDirection(this.moveForward);
     this.moveForward.y = 0;
-    if (this.moveForward.lengthSq() < 1e-6) {
-      // Olhando reto pra baixo/cima não existe "frente" no plano horizontal;
-      // o eixo local -Y da câmera (o "para cima" da tela) é horizontal nesse
-      // caso e serve de frente — sem isso o vetor seria zero e normalizar
-      // daria NaN.
-      this.moveForward.set(0, -1, 0).applyQuaternion(this.camera.quaternion);
+    if (this.moveForward.lengthSq() < 0.01) {
+      // Câmera quase na vertical (olhando reto pra baixo/cima): a projeção
+      // "para frente" degenera e fica instável. Usa o "para cima da tela" —
+      // o +Y local da câmera, que deitado no chão aponta pra longe de quem
+      // olha. O código antigo usava o -Y (o "para baixo" da tela), e era
+      // exatamente isso que invertia o W/S quando se olhava pra baixo. O
+      // fallback final só cobre a câmera cravada na vertical, caso em que o
+      // +Y também degenera.
+      this.moveForward.set(0, 1, 0).applyQuaternion(this.camera.quaternion);
       this.moveForward.y = 0;
+      if (this.moveForward.lengthSq() < 1e-6) this.moveForward.set(0, 0, -1);
     }
     this.moveForward.normalize();
     // right = (-fz, 0, fx) — o eixo +X da câmera projetado no chão.
@@ -1641,11 +1707,12 @@ export class Viewer3D {
 
   /** O fog acompanha a distância câmera→alvo: mantém o gradiente de
    * profundidade no enquadramento normal, mas não deixa o terreno distante
-   * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). */
+   * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). O piso
+   * das duas pontas é a preferência da aba Config (`fogFar`). */
   private updateFog() {
     const distance = this.camera.position.distanceTo(this.controls.target);
-    this.fog.near = Math.max(FOG_NEAR_BASE, distance * 0.85);
-    this.fog.far = Math.max(FOG_FAR_BASE, distance * 3);
+    this.fog.near = Math.max(this.fogFar * FOG_NEAR_RATIO, distance * 0.85);
+    this.fog.far = Math.max(this.fogFar, distance * 3);
   }
 
   /** Troca o frame das texturas animadas de fluido (água/lava). */
@@ -2064,6 +2131,8 @@ export class Viewer3D {
     this.clearEdits();
     this.clearSelection();
     this.targetBotPos = null;
+    this.followSpeed = 0;
+    this.lastPoseAtMs = 0;
     this.playerModel.resetWalk();
     this.setTarget(null);
     for (const [id, mesh] of this.instructionMarkers) {
@@ -2073,6 +2142,19 @@ export class Viewer3D {
     // Uma nova conexão tenta o atlas de novo (ex: a versão do jogo foi
     // instalada nesse meio tempo) — a falha anterior não é definitiva.
     this.atlasUnavailable = false;
+  }
+
+  /** Aplica as preferências da aba Config (`settings_get`): fog, orçamento de
+   * malha por frame, teto de pixel ratio e teto de FPS. Os valores já chegam
+   * presos na faixa pelo backend (`settings.rs`) — aqui é só aplicar no
+   * renderer. */
+  applySettings(settings: ViewerSettings) {
+    this.fogFar = settings.fogFar;
+    this.meshBudgetMs = settings.meshBudgetMs;
+    this.maxPixelRatio = settings.maxPixelRatio;
+    this.fpsCap = settings.fpsCap;
+    this.updateFog();
+    this.resize(); // o teto de pixel ratio mudou
   }
 
   resize() {
@@ -2095,14 +2177,19 @@ export class Viewer3D {
     // tamanho certo — foi exatamente o bug relatado ("visualização
     // erradíssima", rótulo de coordenada em lugar diferente do marcador).
     this.renderer.setSize(width, height, false);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.maxPixelRatio));
   }
 
   private animate = () => {
     requestAnimationFrame(this.animate);
+    const now = performance.now();
+    // Teto de FPS da aba Config: um viewer parado não precisa queimar GPU a
+    // 144 fps. `- 1` de tolerância pra um rAF que oscila décimos de ms não
+    // pular dois frames seguidos (60 caindo pra 30 por jitter do timer).
+    if (this.fpsCap > 0 && now - this.lastRenderMs < 1000 / this.fpsCap - 1) return;
+    this.lastRenderMs = now;
     // Delta-time com teto de 100ms: se a janela ficar em segundo plano (o
     // rAF pausa) e voltar, o primeiro frame não pode dar um salto gigante.
-    const now = performance.now();
     const dt = Math.min((now - this.lastFrameMs) / 1000, 0.1);
     this.lastFrameMs = now;
 
