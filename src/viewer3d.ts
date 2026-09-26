@@ -87,7 +87,14 @@ const FOG_FAR_BASE = 260;
 // estes valores são o que evita o modelo "piscar" de posição em posição — o
 // alvo é interpolado a cada frame (constante de tempo ~83ms com 12), e um
 // salto grande (reconexão, `/tp`) encaixa direto em vez de deslizar pelo mapa.
-const BOT_FOLLOW_RATE = 12; // 1/s
+// O addon manda `bot_pose` a cada 250 ms (mesma cadência do `POSE_INTERVAL_MS`
+// no `main.ts`); o follow do boneco cobre a distância da pose no intervalo real
+// entre elas, em velocidade constante — chegando exato no alvo, sem a
+// aproximação exponencial que nunca fechava a conta e deixava o boneco
+// deslizando depois que o bot parava. O teto evita que um ajuste grande (mas
+// abaixo do teleporte) vire um borrão.
+const BOT_FOLLOW_INTERVAL_FALLBACK = 0.25; // s — primeira pose, sem histórico
+const BOT_FOLLOW_MAX_SPEED = 40; // blocos/s
 const BOT_TELEPORT_DISTANCE = 8; // blocos
 const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
 const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
@@ -459,6 +466,11 @@ export class Viewer3D {
   private playerModel = new MinecraftPlayerModel();
   /** Alvo da interpolação da pose; `null` = sem jogador. */
   private targetBotPos: THREE.Vector3 | null = null;
+  /** Velocidade do follow do boneco (blocos/s), calculada na última pose pra
+   * cobrir a distância no intervalo real entre poses — ver `setBotPose`. */
+  private followSpeed = 0;
+  /** Timestamp (ms) da última pose recebida; 0 = sem histórico ainda. */
+  private lastPoseAtMs = 0;
   private botYaw = 0;
   private botPitch = 0;
 
@@ -586,7 +598,12 @@ export class Viewer3D {
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
+    // Inércia curta: soltando o mouse, a órbita para em ~0,4 s em vez de
+    // continuar girando por segundos.
+    this.controls.dampingFactor = 0.22;
+    // Rotação por arrasto um pouco menos sensível — um arrasto curto não
+    // joga a câmera pro outro lado do bot.
+    this.controls.rotateSpeed = 0.8;
     // Zoom livre na prática: antes travava em 8–400 blocos (não dava pra
     // chegar perto de um bloco pra inspecionar nem ver o relevo de longe).
     this.controls.minDistance = 1.5;
@@ -1367,6 +1384,8 @@ export class Viewer3D {
   setBotPose(pose: BotPose | null) {
     if (!pose) {
       this.targetBotPos = null;
+      this.followSpeed = 0;
+      this.lastPoseAtMs = 0;
       this.botMarker.visible = false;
       this.labelEl.style.display = "none";
       this.playerModel.resetWalk();
@@ -1391,6 +1410,18 @@ export class Viewer3D {
       this.playerModel.resetWalk();
     }
 
+    // Velocidade constante pra cobrir a distância no intervalo real entre
+    // poses: o boneco anda no ritmo do bot e chega exato antes da próxima.
+    // Sem isso (regime exponencial antigo) o follow nunca fechava a conta e
+    // continuava deslizando por cima do alvo depois que o bot parava.
+    const now = performance.now();
+    const interval =
+      this.lastPoseAtMs > 0
+        ? Math.max((now - this.lastPoseAtMs) / 1000, 0.05)
+        : BOT_FOLLOW_INTERVAL_FALLBACK;
+    this.lastPoseAtMs = now;
+    this.followSpeed = Math.min(target.distanceTo(this.botMarker.position) / interval, BOT_FOLLOW_MAX_SPEED);
+
     this.targetBotPos = target;
     this.botMarker.visible = true;
     this.labelEl.textContent = `${pose.x}, ${pose.y}, ${pose.z}`;
@@ -1402,12 +1433,16 @@ export class Viewer3D {
     this.playerModel.setSkin(skin);
   }
 
-  /** Move o modelo (interpolando até o alvo) e a câmera pelo mesmo passo. */
+  /** Move o modelo (em velocidade constante até o alvo) e a câmera pelo mesmo
+   * passo. Quando o resto cabe no passo do frame, `step` já é o resto exato —
+   * o boneco chega e para junto com o bot, sem sobra pra deslizar depois. */
   private updateBotMarker(dt: number) {
     if (!this.targetBotPos) return;
 
     const step = this.targetBotPos.clone().sub(this.botMarker.position);
-    step.multiplyScalar(1 - Math.exp(-BOT_FOLLOW_RATE * dt));
+    const distance = step.length();
+    const maxStep = this.followSpeed * dt;
+    if (distance > maxStep) step.multiplyScalar(maxStep / distance);
     this.botMarker.position.add(step);
     this.camera.position.add(step);
     this.controls.target.add(step);
@@ -1606,13 +1641,17 @@ export class Viewer3D {
 
     this.camera.getWorldDirection(this.moveForward);
     this.moveForward.y = 0;
-    if (this.moveForward.lengthSq() < 1e-6) {
-      // Olhando reto pra baixo/cima não existe "frente" no plano horizontal;
-      // o eixo local -Y da câmera (o "para cima" da tela) é horizontal nesse
-      // caso e serve de frente — sem isso o vetor seria zero e normalizar
-      // daria NaN.
-      this.moveForward.set(0, -1, 0).applyQuaternion(this.camera.quaternion);
+    if (this.moveForward.lengthSq() < 0.01) {
+      // Câmera quase na vertical (olhando reto pra baixo/cima): a projeção
+      // "para frente" degenera e fica instável. Usa o "para cima da tela" —
+      // o +Y local da câmera, que deitado no chão aponta pra longe de quem
+      // olha. O código antigo usava o -Y (o "para baixo" da tela), e era
+      // exatamente isso que invertia o W/S quando se olhava pra baixo. O
+      // fallback final só cobre a câmera cravada na vertical, caso em que o
+      // +Y também degenera.
+      this.moveForward.set(0, 1, 0).applyQuaternion(this.camera.quaternion);
       this.moveForward.y = 0;
+      if (this.moveForward.lengthSq() < 1e-6) this.moveForward.set(0, 0, -1);
     }
     this.moveForward.normalize();
     // right = (-fz, 0, fx) — o eixo +X da câmera projetado no chão.
@@ -2064,6 +2103,8 @@ export class Viewer3D {
     this.clearEdits();
     this.clearSelection();
     this.targetBotPos = null;
+    this.followSpeed = 0;
+    this.lastPoseAtMs = 0;
     this.playerModel.resetWalk();
     this.setTarget(null);
     for (const [id, mesh] of this.instructionMarkers) {

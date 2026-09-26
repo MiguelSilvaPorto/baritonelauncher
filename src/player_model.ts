@@ -304,9 +304,12 @@ export class MinecraftPlayerModel {
       if (this.hasLastTickPos) {
         const distance = Math.hypot(pos.x - this.lastTickPos.x, pos.z - this.lastTickPos.z);
         // targetSpeed = min(distância/tick * 4, 1) e suavização 0.4 — igual
-        // ao `updateWalkAnimation` do jogo.
-        const targetSpeed = Math.min(distance * 4, 1);
+        // ao `updateWalkAnimation` do jogo. Abaixo do limiar é ruído de
+        // interpolação: zera de verdade, senão a perna fica micro-abanando
+        // pra sempre depois que o bot para.
+        const targetSpeed = distance < 0.002 ? 0 : Math.min(distance * 4, 1);
         this.walkSpeed += (targetSpeed - this.walkSpeed) * 0.4;
+        if (this.walkSpeed < 0.005) this.walkSpeed = 0;
         this.walkPosition += this.walkSpeed;
       }
       this.lastTickPos.copy(pos);
