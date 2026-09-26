@@ -38,8 +38,8 @@ There is no component framework and no bundled state library: `main.ts` renders 
 ## 3. Stack
 
 - **Frontend:** TypeScript (strict) · Vite 8 · vanilla DOM, no UI framework · Three.js for the 3D
-  viewer only (`src/viewer3d.ts`) — a graphics library, not an app framework; everything else stays
-  plain DOM/innerHTML.
+  viewer only (`src/viewer3d.ts` + `src/player_model.ts`) — a graphics library, not an app framework;
+  everything else stays plain DOM/innerHTML.
 - **Backend:** Rust (edition 2021) · Tauri 2 · `serde`/`serde_json` · `tauri-plugin-opener` ·
   `tauri-plugin-dialog` · `tokio` (powers `addon_socket.rs`, the local TCP server the Java addon
   connects to) · `image`/`zip`/`base64` (read-only jar/texture extraction in `texture_atlas.rs`, see
@@ -114,34 +114,45 @@ There is no test suite yet.
 **Frontend (`src/main.ts`)**
 - View router: `setMode(name)` toggles `.view.active` / `.rail-btn.active`; views are `viewer`,
   `editor`, `fila`, `armazem`.
-- `refreshState()` polls all six Tauri commands every `REFRESH_INTERVAL_MS` (1s, matching the addon's
+- `refreshState()` polls the Tauri commands every `REFRESH_INTERVAL_MS` (1s, matching the addon's
   vitals cadence) — there is no push from the Rust side, so this is polling, not a stream. It used to
   run once on load only; that was a real bug (UI froze on whatever was true at page load) fixed once
-  the addon bridge existed and made it observable — don't reintroduce a one-shot call.
+  the addon bridge existed and made it observable — don't reintroduce a one-shot call. Player pose is
+  polled separately (`refreshPose`, 250ms = the addon's `position` cadence) so the model walks
+  smoothly instead of jumping once a second.
 - `renderViewer`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest empty state when
   the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
   rows.
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
-  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop.
-  Chunks arrive as decoded voxels (`addChunkVoxels`, fed by `main.ts` → `chunk_voxels`), become merged
-  meshes per chunk (face culling between loaded neighbors, one material for opaque terrain + one per
-  fluid bucket, animated fluid frames from the atlas) and are never removed — cumulative "explored"
-  semantics, matching `WorldCache`. It also hosts the **schematic editor**: voxel DDA picking
-  (`pickBlock`, meshes are merged per chunk so a `Raycaster` can't map back to a block), the edit
-  layer (`edits` + `rebuildGhosts`, amber translucent ghost, never mutates `WorldCache`), region
+- **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
+  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
+  `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
+  `resize()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real face culling
+  (including against already-loaded neighbors); chunks are added once and never removed (cumulative
+  "explored" semantics, matching `WorldCache`). It also hosts the **schematic editor**: voxel DDA
+  picking (`pickBlock` — meshes are merged per chunk, so a `Raycaster` can't map back to a block), the
+  edit layer (`edits` + `rebuildGhosts`, amber translucent ghost, never mutates `WorldCache`), region
   selection/hover wire boxes, and `mountTo()` — the viewer and the editor share this one renderer, the
   canvas is moved to the active view instead of opening a second WebGL context (`main.ts`, `setMode`).
   This intentionally uses WebGL inside the existing webview instead of a native wgpu surface (which
   the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in a
   separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
   redo that tradeoff; if wgpu comes up again, confirm first.
+- **`src/player_model.ts`** (`MinecraftPlayerModel`) — the player the viewer draws: a port of the
+  game's `ModelPart.Cube` geometry/UVs (64×64 skin layout, `slim`/`wide` arms, overlay layers) plus
+  the `WalkAnimationState` walk cycle. The skin is the real PNG sent by the addon (see
+  `player_skin.rs`); with no skin yet the model renders untextured (neutral gray) instead of an
+  invented skin. `viewer3d.ts` feeds it the interpolated `bot_pose` at 4x/s, and a flat teal ring on
+  the ground keeps the position readable now that the old glowing sphere is gone.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, plus `addon_tx` — the outbound
+  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`player_skin`, plus
+  `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
   `connection_status`, `world_summary`, `world_chunks`, `chunk_voxels`, `queue_snapshot`,
-  `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`, `vitals_snapshot`,
+  `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`, `vitals_snapshot`, `bot_pose`,
+  `player_skin`,
   `get_texture_atlas`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
@@ -150,7 +161,9 @@ There is no test suite yet.
   `RunEvent::Exit` does a final save.
 - `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line, **both
   directions**. Addon → app: `hello` (marks `AppState.connection` as connected + dispatches queued
-  instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos`),
+  instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos` and
+  `AppState.bot_pose` — feet coordinates plus yaw/pitch), `player_skin` (the player's own skin as a
+  base64 PNG, sent whenever the texture changes → `player_skin.rs`),
   `chunk_voxels` (full chunk, palette + indices per section, deflate+base64 → `world_cache.rs`) and
   `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
   the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
@@ -160,6 +173,10 @@ There is no test suite yet.
   `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
   Extending the protocol further (e.g. chest contents) means updating the `AddonMessage` enum here
   **and** the Java sender/receiver in lockstep — they're not generated from a shared schema.
+- **`player_skin.rs`** — the player's own skin (PNG data URL + `slim`/`wide` variant) as sent by the
+  addon. Validates the base64/PNG before trusting it. The addon reads the texture the running client
+  already has (its texture cache for downloaded skins, or the installed resource pack/jar for the
+  default one) — **never** fetched from Mojang's CDN, same rule as `texture_atlas.rs`.
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
   + indices per 16×16×16 section). Also `CrossingStrategy` for the learned water/lava crossing policy.
 - **`world_store.rs`** — persists `WorldCache` + the last `mc_version` to `world.cache` in the app
@@ -201,9 +218,11 @@ There is no test suite yet.
   code risks a `NoClassDefFoundError` on a dedicated server).
 - `BaritoneOrchestratorAddonClient.java` — `Dist.CLIENT`-only. On `ClientTickEvent.Post`, reads the
   player through `BaritoneAPI.getProvider().getPrimaryBaritone()` (proof the Baritone dependency works
-  at runtime, not just compiles) and streams vitals (1x/s) and position (4x/s, `playerFeet()`) to the
-  socket, with a 5s reconnect backoff if the Rust app isn't up. Also subscribes to `ChunkEvent.Load`
-  (filtered to `ClientLevel`) to send one `chunk_loaded` per chunk — separate from the tick loop.
+  at runtime, not just compiles) and streams vitals (1x/s) and position + yaw/pitch (4x/s,
+  `playerFeet()`) to the socket, with a 5s reconnect backoff if the Rust app isn't up. Also sends the
+  player's own skin (`player_skin`, only when the texture changes — read from the client's own
+  texture cache/resource pack) and subscribes to `ChunkEvent.Load` (filtered to `ClientLevel`) to
+  send one `chunk_voxels` per chunk — separate from the tick loop.
 - `neoforge.mods.toml` (templated from `gradle.properties`) declares Baritone as a required dependency
   — modid is `baritoe`, confirmed from the real jar, not `baritone`.
 

@@ -12,6 +12,14 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Mensagem de protocolo desconhecido era descartada em silêncio**: quando o app recebe uma mensagem
+  que o `AddonMessage` não conhece (ex: um jar do addon antigo ainda mandando `chunk_surface`, do
+  protocolo antigo), ela era simplesmente ignorada — sem nenhum aviso, o viewer ficava vazio sem
+  pista do motivo. Agora a primeira ocorrência de cada tipo vira um aviso no console com o `type` e o
+  erro de parse, e ao fim da conexão sai um resumo por tipo (`chunk_surface × 412, chunk_loaded × 57`)
+  junto com a contagem de linhas que nem eram JSON. Foi esse silêncio que transformou um jar do addon
+  desatualizado (esquecido sem rebuild depois da mudança pra `chunk_voxels`) num "parou de carregar
+  chunks" sem nenhuma mensagem de erro.
 - **Folhas, videira e lírio-d'água saíam cinza**: essas texturas vêm em tons de cinza no próprio jar
   — o verde só existe em runtime via "biome tint" (colormap/JSON de bioma, não implementado). Agora
   levam tint fixo aproximado, igual já era feito com a grama: folhagem no tom de floresta (carvalho,
@@ -149,6 +157,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   conectado — mostrando o mundo em cache"; sem cache nenhum, continua o estado vazio honesto de
   sempre. Nada é inventado: é o dado real que o addon mandou e foi salvo. Reportado pelo usuário
   ("quero que adicione um cache que evita eu sempre ter o jogo aberto para ver oque já carreguei").
+- **Renderizador do jogador de verdade — com a skin do próprio jogador**: o viewer mostrava uma bola
+  teal no lugar do jogador. Agora desenha o modelo do Minecraft (cabeça, tronco, braços e pernas, nas
+  proporções e UVs do `HumanoidModel`/`PlayerModel` do jogo, incluindo as camadas de sobreposição —
+  chapéu, jaqueta, mangas, calças) com a skin real que o jogador usa em jogo, na variante `slim`
+  (Alex, braço de 3px) ou `wide` (Steve, 4px). O addon lê a textura que o client **já tem carregada**
+  (a skin baixada/customizada no cache de texturas ou a padrão do resource pack/jar — nada é baixado
+  da Mojang, mesma regra do atlas de blocos) e manda um `player_skin` (PNG em base64) quando ela
+  muda; o app valida, guarda em memória e expõe o comando `player_skin`. A caminhada usa as contas do
+  `WalkAnimationState` do jogo, e a pose real (a mensagem `position` agora carrega yaw/pitch,
+  expostos pelo comando `bot_pose`) é interpolada entre os updates de 4x/s — o modelo anda em vez de
+  piscar de posição em posição e gira pra onde o jogador olha. Um anel teal raso no chão substitui o
+  glow da esfera antiga, pra posição continuar legível de longe. Enquanto a skin não chega, o modelo
+  aparece sem textura (cinza neutro) — nunca uma skin inventada. Reportado pelo usuário ("quero que
+  vc adicione um renderizador do jogador no meu aplicativo hoje é só um bola azul... adicione um
+  player do minecraft de verdade que pega a textura do próprio jogador").
 - **Água e lava renderizadas de verdade — nível, transparência, animação e fluxo direcional** — o
   viewer tratava (quando renderizava) fluido como cubo opaco de 1×1×1, e `water_flow`/`lava_flow`
   eram puladas de vez, então não existia "fluxo" visual nenhum. Agora o protocolo `chunk_voxels`
