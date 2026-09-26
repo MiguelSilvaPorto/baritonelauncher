@@ -106,6 +106,9 @@ public class BaritoneOrchestratorAddonClient {
     // concorrente porque produtora e consumidora são threads diferentes.
     private static final Queue<String> pendingCommands = new ConcurrentLinkedQueue<>();
     private static final int ARRIVAL_RADIUS_BLOCKS = 1;
+    /** Teto de waypoints por exploração — o app já limita o raio a 5000
+     *  blocos; isso é a segunda barreira contra uma lista gigante. */
+    private static final int MAX_EXPLORE_WAYPOINTS = 4000;
 
     // Instrução ativa hoje (só uma por vez — a fila do app despacha em
     // sequência). `activeInstructionId == null` = nada em execução.
@@ -115,6 +118,12 @@ public class BaritoneOrchestratorAddonClient {
     private static double activeTargetZ;
     private static double activeInitialDistance;
     private static int ticksSinceLastInstructionStatus;
+
+    /** Waypoints da exploração com raio/estilo (ver `buildExploreWaypoints`):
+     *  "círculos" e "zigue-zague" são uma sequência de Goals que este addon
+     *  percorre, porque o Baritone só tem `explore(origem)` sem forma definida. */
+    private static ArrayList<int[]> exploreWaypoints;
+    private static int exploreWaypointIndex;
 
     // Serializar um chunk inteiro (até 24 seções × 4096 blocos) + comprimir
     // dá trabalho pra caber num tick; o backfill de reconexão pode enfileirar
@@ -311,8 +320,10 @@ public class BaritoneOrchestratorAddonClient {
 
     /**
      * Executa uma instrução do app chamando o processo nativo do Baritone:
-     * {@code travel_to} → {@link GoalXZ} + {@code ICustomGoalProcess},
-     * {@code explore} → {@code IExploreProcess.explore(origemX, origemZ)}.
+     * {@code travel_to} → {@link GoalXZ} + {@code ICustomGoalProcess};
+     * {@code explore} → com `radius`+`style`, percorre waypoints próprios
+     * ({@link #buildExploreWaypoints}); sem eles, {@code IExploreProcess}
+     * nativo ({@code explore(origemX, origemZ)}), que não tem forma definida.
      */
     private static void handleInstruction(IBaritone baritone, JsonObject message) {
         String id = message.get("id").getAsString();
@@ -337,15 +348,68 @@ public class BaritoneOrchestratorAddonClient {
             case "explore" -> {
                 int originX = message.has("x") ? message.get("x").getAsInt() : feet.x;
                 int originZ = message.has("z") ? message.get("z").getAsInt() : feet.z;
+                if (message.has("radius") && message.has("style")) {
+                    ArrayList<int[]> waypoints = buildExploreWaypoints(
+                            originX, originZ, message.get("radius").getAsInt(), message.get("style").getAsString());
+                    if (!waypoints.isEmpty()) {
+                        exploreWaypoints = waypoints;
+                        exploreWaypointIndex = 0;
+                        activeInstructionId = id;
+                        activeInstructionKind = "explore_waypoints";
+                        int[] first = waypoints.get(0);
+                        baritone.getCustomGoalProcess().setGoalAndPath(new GoalXZ(first[0], first[1]));
+                        sendInstructionStatus("active", 0.0f);
+                        return;
+                    }
+                }
                 baritone.getExploreProcess().explore(originX, originZ);
                 activeInstructionId = id;
                 activeInstructionKind = kind;
-                // Explore é contínuo (não tem "chegou"): fica ativo, sem
-                // progresso, até o app cancelar.
+                // Explore nativo é contínuo (não tem "chegou"): fica ativo,
+                // sem progresso, até o app cancelar.
                 sendInstructionStatus("active", 0.0f);
             }
             default -> { }
         }
+    }
+
+    /**
+     * Gera os waypoints do raio pedido nos dois padrões. O passo entre faixas
+     * (zigue-zague) e anéis (círculos) vem da render distance efetiva do
+     * cliente: passar por dentro dela já carrega os chunks, então repetir de 16
+     * em 16 blocos só faria o bot andar mais devagar sem revelar nada novo.
+     */
+    private static ArrayList<int[]> buildExploreWaypoints(int originX, int originZ, int radius, String style) {
+        int step = Math.max(16, Minecraft.getInstance().options.getEffectiveRenderDistance() * 16);
+        ArrayList<int[]> points = new ArrayList<>();
+        if ("zigzag".equals(style)) {
+            boolean leftToRight = true;
+            for (int dz = 0; dz <= radius && points.size() < MAX_EXPLORE_WAYPOINTS; dz += step) {
+                // Faixa central uma vez; acima e abaixo dela, uma de cada lado.
+                for (int sign = dz == 0 ? 1 : -1; sign <= 1 && points.size() < MAX_EXPLORE_WAYPOINTS; sign += 2) {
+                    int z = originZ + dz * sign;
+                    points.add(new int[]{leftToRight ? originX - radius : originX + radius, z});
+                    points.add(new int[]{leftToRight ? originX + radius : originX - radius, z});
+                    leftToRight = !leftToRight;
+                }
+            }
+        } else {
+            boolean clockwise = true;
+            for (int ring = step; ring <= radius && points.size() < MAX_EXPLORE_WAYPOINTS; ring += step) {
+                // Pontos a cada ~meio passo de arco: caminhar entre dois pontos
+                // consecutivos é uma corda curta, então o anel sai suave.
+                int samples = Math.max(8, (int) Math.round(2 * Math.PI * ring / (step / 2.0)));
+                for (int i = 0; i < samples && points.size() < MAX_EXPLORE_WAYPOINTS; i++) {
+                    double angle = 2 * Math.PI * i / samples * (clockwise ? 1 : -1);
+                    points.add(new int[]{
+                        originX + (int) Math.round(ring * Math.cos(angle)),
+                        originZ + (int) Math.round(ring * Math.sin(angle)),
+                    });
+                }
+                clockwise = !clockwise; // anéis em sentidos alternados: menos deslocamento entre eles
+            }
+        }
+        return points;
     }
 
     private static void cancelActiveInstruction(IBaritone baritone) {
@@ -353,15 +417,17 @@ public class BaritoneOrchestratorAddonClient {
             return;
         }
         baritone.getPathingBehavior().cancelEverything();
-        activeInstructionId = null;
-        activeInstructionKind = null;
+        clearActiveInstruction();
     }
 
     /**
      * Confere se a instrução ativa terminou e reporta progresso. `travel_to`:
      * o Baritone larga o goal ao chegar (`getGoal() == null`) — se estava
      * perto do alvo é `done`, senão foi interrompido (`failed`, ex: `#stop`
-     * digitado no jogo). `explore`: se o processo parou sozinho, `failed`.
+     * digitado no jogo). `explore_waypoints`: cada waypoint alcançado (ou
+     * abandonado, se o pathing desistiu — um ponto sobre lava não pode travar
+     * a exploração inteira) avança o índice; o último fecha a instrução.
+     * `explore` nativo: se o processo parou sozinho, `failed`.
      */
     private static void tickActiveInstruction(IBaritone baritone) {
         if (activeInstructionId == null) {
@@ -381,6 +447,21 @@ public class BaritoneOrchestratorAddonClient {
             }
             float progress = (float) Math.min(1.0, Math.max(0.0, 1.0 - distance / activeInitialDistance));
             sendInstructionStatus("active", progress);
+        } else if ("explore_waypoints".equals(activeInstructionKind)) {
+            BetterBlockPos feet = baritone.getPlayerContext().playerFeet();
+            int[] waypoint = exploreWaypoints.get(exploreWaypointIndex);
+            double distance = Math.hypot(waypoint[0] - feet.x, waypoint[1] - feet.z);
+            boolean arrived = distance <= ARRIVAL_RADIUS_BLOCKS;
+            if (arrived || baritone.getCustomGoalProcess().getGoal() == null) {
+                exploreWaypointIndex++;
+                if (exploreWaypointIndex >= exploreWaypoints.size()) {
+                    finishActiveInstruction("done");
+                    return;
+                }
+                int[] next = exploreWaypoints.get(exploreWaypointIndex);
+                baritone.getCustomGoalProcess().setGoalAndPath(new GoalXZ(next[0], next[1]));
+            }
+            sendInstructionStatus("active", (float) exploreWaypointIndex / exploreWaypoints.size());
         } else if ("explore".equals(activeInstructionKind) && !baritone.getExploreProcess().isActive()) {
             finishActiveInstruction("failed");
         }
@@ -388,8 +469,14 @@ public class BaritoneOrchestratorAddonClient {
 
     private static void finishActiveInstruction(String status) {
         sendInstructionStatus(status, "done".equals(status) ? 1.0f : null);
+        clearActiveInstruction();
+    }
+
+    private static void clearActiveInstruction() {
         activeInstructionId = null;
         activeInstructionKind = null;
+        exploreWaypoints = null;
+        exploreWaypointIndex = 0;
     }
 
     /** `progress` só vai no JSON quando existe — ver `addon_socket.rs`. */

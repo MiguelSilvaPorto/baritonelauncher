@@ -41,6 +41,13 @@ interface InstructionTarget {
   z: number;
 }
 
+/** Padrão de varredura da exploração com raio — espelha `ExploreStyle`. */
+type ExploreStyle = "Circles" | "Zigzag";
+interface ExploreParams {
+  radius: number;
+  style: ExploreStyle;
+}
+
 interface Instruction {
   id: string;
   kind: InstructionKind;
@@ -48,6 +55,7 @@ interface Instruction {
   status: InstructionStatus;
   progress: number;
   target: InstructionTarget | null;
+  explore: ExploreParams | null;
 }
 
 interface ItemTotal {
@@ -116,9 +124,12 @@ const STATUS_LABEL: Record<InstructionStatus, string> = {
 function queueCard(instruction: Instruction): string {
   const statusClass = `status-${instruction.status.toLowerCase()}`;
   const cancellable = instruction.status === "Queued" || instruction.status === "Active";
-  // `Explore` é contínuo e não tem progresso mensurável (o addon não manda
-  // `progress`) — barra só onde existe progresso real, nada de fingir 0%.
-  const showBar = !(instruction.kind === "Explore" && instruction.status === "Active");
+  // Barra só onde existe progresso real: `Explore` sem raio/estilo é contínuo
+  // (o addon não manda `progress`) e cancelado/falhou não têm o que medir.
+  const showBar =
+    instruction.status !== "Canceled" &&
+    instruction.status !== "Failed" &&
+    !(instruction.kind === "Explore" && instruction.status === "Active" && !instruction.explore);
   return `
     <div class="queue-card ${statusClass}">
       <div class="row1">
@@ -137,7 +148,7 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
     list.innerHTML = `
       <div class="empty-state">
         <span class="headline">Fila vazia</span>
-        <span class="detail">Enfileire uma instrução acima: "Ir para" manda o bot viajar até as coordenadas x/z e "Explorar" cobre a área a partir de onde ele está — o addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
+        <span class="detail">Clique num bloco do terreno pra mirar um destino ("Ir para" ou "Explorar daqui"), ou digite as coordenadas x/z acima. O addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
       </div>
     `;
   } else {
@@ -146,19 +157,73 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
   if (countId) $(`#${countId}`).textContent = String(items.length);
 }
 
+/** Cancelado fica um tempinho visível (pra você ver que o cancelamento valeu)
+ *  e depois some sozinho da fila — senão os cards cancelados se acumulam pra
+ *  sempre. O backend mantém o histórico; isso é só apresentação. */
+const CANCELED_LINGER_MS = 4000;
+const canceledSeenAt = new Map<string, number>();
+
+function visibleQueue(items: Instruction[]): Instruction[] {
+  const now = performance.now();
+  const visible: Instruction[] = [];
+  for (const item of items) {
+    if (item.status !== "Canceled") {
+      visible.push(item);
+      continue;
+    }
+    const seenAt = canceledSeenAt.get(item.id) ?? now;
+    canceledSeenAt.set(item.id, seenAt);
+    if (now - seenAt < CANCELED_LINGER_MS) visible.push(item);
+  }
+  return visible;
+}
+
 function renderQueue(items: Instruction[]) {
-  renderQueueInto("queue-list", "queue-count", items);
-  renderQueueInto("queue-list-full", "queue-count-full", items);
+  const visible = visibleQueue(items);
+  renderQueueInto("queue-list", "queue-count", visible);
+  renderQueueInto("queue-list-full", "queue-count-full", visible);
+}
+
+/** Raio + estilo do "Explorar" a partir dos controles do painel/popup.
+ *  `null` = exploração nativa do Baritone (sem raio, sem progresso); "auto" no
+ *  select é essa opção, e sem raio digitado o padrão é 256 blocos. */
+function readExploreParams(scope: HTMLElement): ExploreParams | null {
+  const styleValue = scope.querySelector<HTMLSelectElement>('select[name="style"]')?.value ?? "auto";
+  if (styleValue === "auto") return null;
+  const rawRadius = Number(scope.querySelector<HTMLInputElement>('input[name="radius"]')?.value);
+  const radius = Number.isFinite(rawRadius) && rawRadius > 0 ? Math.round(rawRadius) : 256;
+  return {
+    radius: Math.min(Math.max(radius, 16), 5000),
+    style: styleValue === "Zigzag" ? "Zigzag" : "Circles",
+  };
+}
+
+/** Enfileira e re-renderiza a fila na hora — o comando devolve o estado
+ *  atualizado, então a UI não espera o polling de 1s. */
+function pushQueueInstruction(kind: InstructionKind, target: InstructionTarget | null, explore: ExploreParams | null = null) {
+  return invoke<Instruction[]>("queue_push", { kind, target, explore })
+    .then((queue) => {
+      renderQueue(queue);
+      return queue;
+    })
+    .catch((err) => {
+      console.error("[fila] enfileirar falhou:", err);
+      return null;
+    });
 }
 
 /** Mesma instrução "Ir para"/"Explorar" nos dois painéis de fila (viewer e
- *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar". */
+ *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar".
+ *  Digitar continua sendo o caminho secundário: o principal é clicar no
+ *  terreno (ver `bootstrapTargetPopup`). */
 function bootstrapQueueComposers() {
   $$<HTMLElement>(".queue-composer").forEach((composer) => {
     const xInput = composer.querySelector<HTMLInputElement>('input[name="x"]');
     const zInput = composer.querySelector<HTMLInputElement>('input[name="z"]');
+    const travelBtn = composer.querySelector<HTMLButtonElement>('[data-queue-action="travel"]');
+    const exploreBtn = composer.querySelector<HTMLButtonElement>('[data-queue-action="explore"]');
 
-    composer.querySelector('[data-queue-action="travel"]')?.addEventListener("click", () => {
+    const travel = () => {
       // Campo vazio não é zero: `Number("")` é 0 e passaria pelo
       // `Number.isFinite`, enfileirando "ir para (0, 0)" sem o usuário pedir.
       const xRaw = xInput?.value.trim() ?? "";
@@ -173,16 +238,51 @@ function bootstrapQueueComposers() {
         zInput?.focus();
         return;
       }
-      invoke<Instruction[]>("queue_push", { kind: "TravelTo", target: { x: Math.round(x), z: Math.round(z) } })
-        .then(renderQueue)
-        .catch((err) => console.error("[fila] ir para falhou:", err));
-    });
+      pushQueueInstruction("TravelTo", { x: Math.round(x), z: Math.round(z) });
+    };
 
-    composer.querySelector('[data-queue-action="explore"]')?.addEventListener("click", () => {
-      const target = lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null;
-      invoke<Instruction[]>("queue_push", { kind: "Explore", target })
-        .then(renderQueue)
-        .catch((err) => console.error("[fila] explorar falhou:", err));
+    travelBtn?.addEventListener("click", travel);
+    // Enter no campo confirma o "Ir para" — digitar coordenada não deveria
+    // exigir tirar a mão do teclado.
+    for (const input of [xInput, zInput]) {
+      input?.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          travel();
+        }
+      });
+    }
+
+    exploreBtn?.addEventListener("click", () => {
+      pushQueueInstruction(
+        "Explore",
+        lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null,
+        readExploreParams(composer)
+      );
+    });
+  });
+}
+
+/** Ações do alvo escolhido clicando no terreno (ver `viewer3d.setTarget`):
+ *  "Ir para", "Explorar daqui" (com raio/estilo do próprio popup) e
+ *  "dispensar". Só existe um popup, então o listener é único. */
+function bootstrapTargetPopup() {
+  const popup = $<HTMLElement>("#target-popup");
+  popup.addEventListener("click", (event) => {
+    const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-target-action]");
+    const target = viewer3d?.getTarget();
+    if (!btn || !viewer3d || !target) return;
+
+    const action = btn.dataset.targetAction;
+    if (action === "dismiss") {
+      viewer3d.setTarget(null);
+      return;
+    }
+    const kind: InstructionKind = action === "travel" ? "TravelTo" : "Explore";
+    const explore = kind === "Explore" ? readExploreParams(popup) : null;
+    pushQueueInstruction(kind, { x: target.x, z: target.z }, explore).then((queue) => {
+      // Alvo virou instrução real: o marcador âmbar sai de cena.
+      if (queue) viewer3d?.setTarget(null);
     });
   });
 }
@@ -401,6 +501,15 @@ async function refreshState() {
     // modelo sem textura em vez de inventar uma skin.
     viewer3d.setPlayerSkin(skin ? { model: skin.model, imageDataUrl: skin.image_data_url } : null);
 
+    // Instruções com alvo viram caixas de arame no mundo (âmbar = na fila,
+    // teal = ativa) — o viewer reflete a fila real, não uma decoração.
+    const ghosts: { id: string; active: boolean; x: number; z: number }[] = [];
+    for (const item of queue) {
+      if (!item.target || (item.status !== "Queued" && item.status !== "Active")) continue;
+      ghosts.push({ id: item.id, active: item.status === "Active", x: item.target.x, z: item.target.z });
+    }
+    viewer3d.setInstructionTargets(ghosts);
+
     // Voxels são buscados aos poucos: montar malha é CPU na thread
     // principal, então um backfill de centenas de chunks numa tacada
     // travaria o viewer. O resto fica na fila implícita do Rust e chega
@@ -441,8 +550,13 @@ window.addEventListener("DOMContentLoaded", () => {
   bootstrapTitlebar();
   bootstrapQueueComposers();
   bootstrapQueueActions();
+  bootstrapTargetPopup();
 
-  viewer3d = new Viewer3D($<HTMLElement>("#viewer-3d"), $<HTMLDivElement>("#bot-label"));
+  viewer3d = new Viewer3D(
+    $<HTMLElement>("#viewer-3d"),
+    $<HTMLDivElement>("#bot-label"),
+    $<HTMLDivElement>("#target-popup")
+  );
   window.addEventListener("resize", () => viewer3d?.resize());
 
   refreshState();
