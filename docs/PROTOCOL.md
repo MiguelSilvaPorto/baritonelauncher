@@ -45,6 +45,13 @@ tints, e um jar do addon antigo segue funcionando (o app avisa no console).
 - `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` — quando a skin muda;
   `model` é `slim` ou `wide`. O PNG é lido do cache de texturas/resource pack do client, nunca
   baixado pela Mojang.
+- `{"type":"entities","radius":32.0,"entities":[{"id":42,"kind":"zombie","name":"Zumbi",
+  "category":"hostile","x":1.5,"y":64.0,"z":-3.25,"health":20.0,"max_health":20.0,"distance":6.2,
+  "height":1.95}, ...]}` — snapshot (~4x/s, teto de 64) das criaturas vivas no raio `radius` ao
+  redor do jogador, ordenadas por distância. `kind` é o path do registry, `name` já vem localizado
+  pelo client e `category` ∈ `hostile`/`neutral`/`passive`/`other`; `distance`/`height` são medidos
+  no jogo. Jogadores ficam de fora e a lista é o estado atual, não um delta — mob que saiu do raio
+  simplesmente não aparece mais.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"<base64>"}` — um por chunk carregado
   (`ChunkEvent.Load`) mais o backfill de reconexão (2 chunks por tick). `data` é o payload binário
   descrito abaixo (com as cores de bioma do formato 3), comprimido com zlib.
