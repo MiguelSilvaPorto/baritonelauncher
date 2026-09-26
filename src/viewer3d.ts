@@ -92,6 +92,14 @@ const BOT_TELEPORT_DISTANCE = 8; // blocos
 const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
 const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
 
+// Marcadores de mob (`nearby_mobs`): a posição chega 4x/s e é interpolada a
+// cada frame, como a pose do bot — sem isso os rótulos piscariam de posição
+// em posição. Um salto grande é teleporte (enderman) ou id reciclado: encaixa
+// direto em vez de deslizar pelo mapa.
+const MOB_FOLLOW_RATE = 10; // 1/s
+const MOB_TELEPORT_DISTANCE = 16; // blocos
+const MOB_LABEL_GAP = 0.4; // acima da hitbox do mob (que já tem altura própria)
+
 // Aproximação, não tint real por bioma (isso exigiria saber o bioma da
 // coluna e amostrar o colormap/JSON de bioma — não implementado, ver
 // docs/SPEC.md "Blocos 3D"). "grass_block_top" vem cinza no jar por design
@@ -197,6 +205,27 @@ export interface BotPose {
   pitch: number;
 }
 
+/** Categoria do mob, classificada pelo addon a partir do tipo real do jogo —
+ *  ver `MobCategory` em `src-tauri/src/mobs.rs`. */
+export type MobCategory = "hostile" | "neutral" | "passive" | "other";
+
+/** Um mob vivo ao redor do bot (comando `nearby_mobs`, espelha `NearbyMob` em
+ *  `src-tauri/src/mobs.rs`). Posição em blocos (double), `distance` já é a
+ *  distância real até o jogador medida pelo addon na varredura. */
+export interface NearbyMob {
+  id: number;
+  kind: string;
+  name: string;
+  category: MobCategory;
+  x: number;
+  y: number;
+  z: number;
+  health: number;
+  max_health: number;
+  height: number;
+  distance: number;
+}
+
 export interface ChunkPos {
   x: number;
   z: number;
@@ -255,6 +284,18 @@ interface DecodedChunk {
   z: number;
   /** Seção Y (mundo / 16) → seção; ausente = ar. */
   sections: Map<number, DecodedSection>;
+}
+
+/** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido e
+ *  as posições desenhada (interpolada) e alvo — ver
+ *  `setNearbyMobs`/`updateMobs`. */
+interface MobMarker {
+  el: HTMLDivElement;
+  nameEl: HTMLSpanElement;
+  metaEl: HTMLSpanElement;
+  mob: NearbyMob;
+  target: THREE.Vector3;
+  position: THREE.Vector3;
 }
 
 /** Uma face do cubo, na ordem dos vértices em sentido anti-horário visto de
@@ -462,6 +503,16 @@ export class Viewer3D {
   private botYaw = 0;
   private botPitch = 0;
 
+  /** Rótulos dos mobs vivos ao redor (comando `nearby_mobs`), chave = id de
+   *  rede da entidade — ver `setNearbyMobs`. */
+  private readonly mobMarkers = new Map<number, MobMarker>();
+  /** Camada dos rótulos de mob — mesmo padrão do `bot-label` (HTML projetado
+   *  por cima do canvas), um elemento por mob. */
+  private readonly mobLayer: HTMLDivElement;
+  /** Scratch da projeção dos rótulos (`updateMobLabels`) — evita alocar um
+   *  `Vector3` por mob por frame. */
+  private readonly mobScratch = new THREE.Vector3();
+
   private labelEl: HTMLDivElement;
 
   /** Alvo escolhido clicando no terreno (âmbar) + popup de ações — ver
@@ -568,6 +619,12 @@ export class Viewer3D {
     this.container = container;
     this.labelEl = labelEl;
     this.targetEl = targetEl;
+
+    // Camada dos rótulos de mob: filha do mesmo overlay do `bot-label` — o
+    // canvas (e o container) troca entre viewer/editor, o overlay não.
+    this.mobLayer = document.createElement("div");
+    this.mobLayer.className = "mob-layer";
+    (labelEl.parentElement ?? container).appendChild(this.mobLayer);
 
     this.scene = new THREE.Scene();
     this.fog = new THREE.Fog(SKY_HORIZON, FOG_NEAR_BASE, FOG_FAR_BASE);
@@ -1393,6 +1450,86 @@ export class Viewer3D {
     this.playerModel.setSkin(skin);
   }
 
+  /** Recebe o snapshot dos mobs vivos ao redor (comando `nearby_mobs`) e
+   * mantém um rótulo por mob — nome, categoria (hostil em vermelho), distância
+   * e vida. A lista é o estado atual, não um delta: mob que saiu do raio tem o
+   * rótulo removido aqui. É o que "identifica" o mob: o viewer ainda não
+   * desenha os modelos reais de entidade (ver "Known gaps"), então o marcador
+   * é a informação honesta que temos — nome, tipo e vida vêm do jogo. */
+  setNearbyMobs(mobs: NearbyMob[]) {
+    const seen = new Set<number>();
+    for (const mob of mobs) {
+      seen.add(mob.id);
+      let marker = this.mobMarkers.get(mob.id);
+      if (!marker) {
+        const el = document.createElement("div");
+        const nameEl = document.createElement("span");
+        nameEl.className = "mob-name";
+        const metaEl = document.createElement("span");
+        metaEl.className = "mob-meta mono";
+        el.append(nameEl, metaEl);
+        this.mobLayer.appendChild(el);
+        const position = new THREE.Vector3(mob.x, mob.y, mob.z);
+        marker = { el, nameEl, metaEl, mob, target: position.clone(), position };
+        this.mobMarkers.set(mob.id, marker);
+      }
+      marker.mob = mob;
+      marker.target.set(mob.x, mob.y, mob.z);
+      // A classe carrega a categoria (hostil = perigo no CSS); reaplicar
+      // inteira mantém a cor certa mesmo se o mob mudar de categoria.
+      marker.el.className = `mob-label mob-${mob.category}`;
+      // Nome do jogo (pode ter nome customizado de name tag): textContent,
+      // nunca innerHTML.
+      marker.nameEl.textContent = mob.name;
+      marker.metaEl.textContent = `${mob.distance.toFixed(0)} m · ${Math.round(mob.health)}/${Math.round(
+        mob.max_health
+      )}`;
+    }
+    for (const [id, marker] of this.mobMarkers) {
+      if (seen.has(id)) continue;
+      marker.el.remove();
+      this.mobMarkers.delete(id);
+    }
+  }
+
+  /** Interpola a posição desenhada dos mobs até o alvo do último snapshot —
+   * mesma ideia do `updateBotMarker`, numa cadência mais lenta (mob anda
+   * menos que o bot correndo) e com encaixe direto em salto grande. */
+  private updateMobs(dt: number) {
+    if (this.mobMarkers.size === 0) return;
+    const step = 1 - Math.exp(-MOB_FOLLOW_RATE * dt);
+    for (const marker of this.mobMarkers.values()) {
+      if (marker.position.distanceTo(marker.target) > MOB_TELEPORT_DISTANCE) {
+        marker.position.copy(marker.target);
+        continue;
+      }
+      marker.position.lerp(marker.target, step);
+    }
+  }
+
+  /** Projeta cada rótulo de mob na tela, acima da hitbox dele (galinha e
+   * enderman não têm a mesma altura) — mesmo padrão do rótulo do bot, um por
+   * mob. Atrás da câmera, some. */
+  private updateMobLabels() {
+    if (this.mobMarkers.size === 0) return;
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    if (width === 0 || height === 0) return;
+    for (const marker of this.mobMarkers.values()) {
+      const vector = this.mobScratch
+        .copy(marker.position)
+        .setY(marker.position.y + marker.mob.height + MOB_LABEL_GAP)
+        .project(this.camera);
+      if (vector.z > 1) {
+        marker.el.style.display = "none";
+        continue;
+      }
+      marker.el.style.display = "flex";
+      marker.el.style.left = `${(vector.x * 0.5 + 0.5) * width}px`;
+      marker.el.style.top = `${(-vector.y * 0.5 + 0.5) * height}px`;
+    }
+  }
+
   /** Move o modelo (interpolando até o alvo) e a câmera pelo mesmo passo. */
   private updateBotMarker(dt: number) {
     if (!this.targetBotPos) return;
@@ -2052,6 +2189,10 @@ export class Viewer3D {
     this.queuedChunks.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
+    // Mobs são do mundo daquela conexão — sem addon online o snapshot deixa
+    // de existir no Rust e os rótulos não podem ficar congelados no mapa.
+    for (const marker of this.mobMarkers.values()) marker.el.remove();
+    this.mobMarkers.clear();
     this.clearEdits();
     this.clearSelection();
     this.targetBotPos = null;
@@ -2099,6 +2240,7 @@ export class Viewer3D {
 
     this.applyMovement(dt);
     this.updateBotMarker(dt);
+    this.updateMobs(dt);
     this.controls.update();
     this.updateSky();
     this.updateFog();
@@ -2107,6 +2249,7 @@ export class Viewer3D {
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
     this.updateTargetPosition();
+    this.updateMobLabels();
   };
 
   /** Mantém o popup do alvo grudado no bloco clicado (mesma projeção do
