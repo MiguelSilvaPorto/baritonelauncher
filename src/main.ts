@@ -738,8 +738,9 @@ async function refreshState() {
       });
       // Voxels são buscados aos poucos; a montagem em si já é orçada por
       // frame no viewer (`drainMeshQueue`), então pedir vários por refresh
-      // não trava — só acelera o preenchimento ao redor do bot.
-      let budget = CHUNKS_PER_REFRESH;
+      // não trava — só acelera o preenchimento ao redor do bot. O quanto é
+      // preferência da aba Config; o padrão do backend vale até ela responder.
+      let budget = settings?.chunks_per_refresh ?? CHUNKS_PER_REFRESH;
       for (const pos of chunks) {
         if (budget <= 0) break;
         if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
@@ -755,14 +756,196 @@ async function refreshState() {
   renderStorage(totals);
 }
 
-// 1s = mesmo intervalo de envio de vitais do addon (ver addon_socket.rs) — não
-// há push do backend pro frontend ainda, então isso é polling, não streaming.
-const REFRESH_INTERVAL_MS = 1000;
+/* ---------- Configurações (aba Config) ---------- */
 
-// 250ms = mesma cadência do envio de `position` do addon (4x/s). A pose anda
-// em intervalo próprio porque no polling de 1s o modelo andaria em saltos; o
-// payload é minúsculo (5 números), então não pesa.
-const POSE_INTERVAL_MS = 250;
+/** Espelha `Settings` em `src-tauri/src/settings.rs`. Os valores exibidos e
+ *  aplicados vêm sempre do backend (`settings_get`) — o frontend não tem
+ *  defaults próprios pra divergir. */
+interface Settings {
+  fog_far: number;
+  mesh_budget_ms: number;
+  max_pixel_ratio: number;
+  fps_cap: number;
+  state_interval_ms: number;
+  pose_interval_ms: number;
+  chunks_per_refresh: number;
+}
+
+let settings: Settings | null = null;
+
+/** Números em pt-BR (vírgula decimal), como o resto da UI. */
+function decimal(value: number): string {
+  return String(value).replace(".", ",");
+}
+
+/** Rótulo do valor efetivo ao lado de cada controle. */
+const CONFIG_VALUE_FORMAT: Record<keyof Settings, (value: number) => string> = {
+  fog_far: (v) => `${decimal(v)} blocos`,
+  mesh_budget_ms: (v) => `${decimal(v)} ms`,
+  max_pixel_ratio: (v) => `${decimal(v)}×`,
+  fps_cap: (v) => (v === 0 ? "sem limite" : `${v} fps`),
+  state_interval_ms: (v) => `${v} ms`,
+  pose_interval_ms: (v) => `${v} ms`,
+  chunks_per_refresh: (v) => `${v} chunks`,
+};
+
+let configStatusTimer: number | undefined;
+
+/** Status no canto do header da aba. Erro fica visível até algo dar certo;
+ *  confirmação de sucesso some sozinha (o controle já mostra o valor). */
+function setConfigStatus(message: string, kind: "info" | "error" = "info") {
+  const el = $<HTMLElement>("#config-status");
+  if (configStatusTimer !== undefined) window.clearTimeout(configStatusTimer);
+  el.textContent = message;
+  el.classList.toggle("error", kind === "error");
+  if (kind === "error") return;
+  configStatusTimer = window.setTimeout(() => {
+    el.textContent = "";
+    configStatusTimer = undefined;
+  }, 2500);
+}
+
+/** Reflete o estado real nos controles: desabilitados enquanto o backend não
+ *  respondeu (nada de valor inventado no markup), depois com o valor efetivo
+ *  — que pode ser diferente do pedido, se o backend prendeu na faixa. */
+function renderConfig() {
+  const loaded = settings !== null;
+  $<HTMLButtonElement>("#config-reset").disabled = !loaded;
+  $$<HTMLInputElement | HTMLSelectElement>("[data-setting]").forEach((el) => {
+    el.disabled = !loaded;
+    if (loaded) el.value = String(settings![el.dataset.setting as keyof Settings]);
+  });
+  $$<HTMLElement>("[data-setting-value]").forEach((el) => {
+    if (!loaded) {
+      el.textContent = "—";
+      return;
+    }
+    const key = el.dataset.settingValue as keyof Settings;
+    el.textContent = CONFIG_VALUE_FORMAT[key](settings![key]);
+  });
+}
+
+function applySettings(next: Settings) {
+  // O polling só reinicia quando o intervalo mudou de verdade — o slider de
+  // fog, por exemplo, aplica a cada `input` e não precisa mexer nos timers.
+  const intervalsChanged =
+    settings === null ||
+    settings.state_interval_ms !== next.state_interval_ms ||
+    settings.pose_interval_ms !== next.pose_interval_ms;
+  settings = next;
+  viewer3d?.applySettings({
+    fogFar: next.fog_far,
+    meshBudgetMs: next.mesh_budget_ms,
+    maxPixelRatio: next.max_pixel_ratio,
+    fpsCap: next.fps_cap,
+  });
+  if (intervalsChanged) restartPolling();
+  renderConfig();
+}
+
+/** Gravação com debounce: arrastar um slider dispara `input` por frame, e
+ *  gravar a cada um seria uma escrita de disco por pixel. */
+const SETTINGS_SAVE_DEBOUNCE_MS = 300;
+let settingsSaveTimer: number | undefined;
+
+function persistSettings() {
+  settingsSaveTimer = undefined;
+  const payload = settings;
+  if (!payload) return;
+  invoke<Settings>("settings_set", { settings: payload })
+    .then((effective) => {
+      // Se o usuário mexeu em outro controle enquanto a gravação estava em
+      // voo, o estado local mais novo manda — não regride pra este snapshot.
+      if (settings === payload) applySettings(effective);
+      setConfigStatus("preferências salvas");
+    })
+    .catch((err) => {
+      console.error("[config] salvar falhou:", err);
+      setConfigStatus("não consegui salvar as preferências — veja o console", "error");
+      // O backend recusou (ex: falha de escrita): volta pro que ele realmente
+      // tem em vez de deixar a UI mostrando um valor que não foi salvo.
+      void loadSettings();
+    });
+}
+
+function scheduleSettingsSave() {
+  if (settingsSaveTimer !== undefined) window.clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = window.setTimeout(persistSettings, SETTINGS_SAVE_DEBOUNCE_MS);
+}
+
+function updateSetting(key: keyof Settings, value: number) {
+  if (!settings) return;
+  applySettings({ ...settings, [key]: value });
+  scheduleSettingsSave();
+}
+
+/** Recarrega do backend e limpa o status quando deu certo — usar nas ações em
+ *  que "carregou" é a mensagem (Recarregar, boot). O rollback do save chama
+ *  `loadSettings` direto pra não apagar o aviso de erro. */
+function reloadSettings() {
+  void loadSettings().then((ok) => {
+    if (ok) setConfigStatus("");
+  });
+}
+
+function bootstrapConfig() {
+  $$<HTMLInputElement | HTMLSelectElement>("[data-setting]").forEach((el) => {
+    const key = el.dataset.setting as keyof Settings;
+    // `input` dá feedback ao vivo no viewer enquanto o slider anda; o
+    // debounce segura a gravação em disco (ver `scheduleSettingsSave`).
+    el.addEventListener("input", () => updateSetting(key, Number(el.value)));
+    el.addEventListener("change", () => updateSetting(key, Number(el.value)));
+  });
+
+  $("#config-reset").addEventListener("click", () => {
+    invoke<Settings>("settings_reset")
+      .then((effective) => {
+        applySettings(effective);
+        setConfigStatus("padrões restaurados");
+      })
+      .catch((err) => {
+        console.error("[config] restaurar falhou:", err);
+        setConfigStatus("não consegui restaurar os padrões — veja o console", "error");
+      });
+  });
+
+  $("#config-reload").addEventListener("click", reloadSettings);
+
+  renderConfig();
+  reloadSettings();
+}
+
+async function loadSettings(): Promise<boolean> {
+  try {
+    applySettings(await invoke<Settings>("settings_get"));
+    return true;
+  } catch (err) {
+    console.error("[config] carregar falhou:", err);
+    setConfigStatus("não consegui carregar as preferências — veja o console", "error");
+    return false;
+  }
+}
+
+/* ---------- Polling ---------- */
+
+// Valores de partida até o `settings_get` responder (aba Config): 1s = cadência
+// dos vitais do addon (ver addon_socket.rs); 250ms = cadência do `position`
+// (4x/s). Depois disso quem manda é a preferência salva.
+const BOOT_REFRESH_INTERVAL_MS = 1000;
+const BOOT_POSE_INTERVAL_MS = 250;
+
+let stateTimer: number | undefined;
+let poseTimer: number | undefined;
+
+/** (Re)inicia os dois pollings com os intervalos atuais — `setInterval` não
+ *  aceita um intervalo novo sem ser recriado. Chamado no boot e quando a aba
+ *  Config muda um dos dois. */
+function restartPolling() {
+  if (stateTimer !== undefined) window.clearInterval(stateTimer);
+  if (poseTimer !== undefined) window.clearInterval(poseTimer);
+  stateTimer = window.setInterval(refreshState, settings?.state_interval_ms ?? BOOT_REFRESH_INTERVAL_MS);
+  poseTimer = window.setInterval(refreshPose, settings?.pose_interval_ms ?? BOOT_POSE_INTERVAL_MS);
+}
 
 async function refreshPose() {
   try {
@@ -778,6 +961,7 @@ window.addEventListener("DOMContentLoaded", () => {
   bootstrapQueueComposers();
   bootstrapQueueActions();
   bootstrapTargetPopup();
+  bootstrapConfig();
 
   viewer3d = new Viewer3D(
     $<HTMLElement>("#viewer-3d"),
@@ -788,7 +972,6 @@ window.addEventListener("DOMContentLoaded", () => {
   bootstrapEditor();
 
   refreshState();
-  setInterval(refreshState, REFRESH_INTERVAL_MS);
   refreshPose();
-  setInterval(refreshPose, POSE_INTERVAL_MS);
+  restartPolling();
 });
