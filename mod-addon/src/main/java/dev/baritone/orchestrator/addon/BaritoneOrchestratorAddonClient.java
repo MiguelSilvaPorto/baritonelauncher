@@ -179,7 +179,26 @@ public class BaritoneOrchestratorAddonClient {
     // centenas de chunks de uma vez, então a fila drena só alguns por tick em
     // vez de travar o jogo por um instante.
     private static final int CHUNK_PAYLOADS_PER_TICK = 2;
-    private static final Deque<LevelChunk> pendingChunkPayloads = new ArrayDeque<>();
+    /** No instante do `ChunkEvent.Load` o motor de luz do client ainda pode
+     *  não ter calculado nada — serializar aí grava luz zero (um chunk preto
+     *  pra sempre; foi o "chão preto" relatado). A fila segura o chunk até a
+     *  luz ficar pronta; passado este teto, manda assim mesmo com o fallback
+     *  de dia (céu 15) nas camadas que faltarem. */
+    private static final long LIGHT_WAIT_TIMEOUT_MS = 5000;
+    private static final Deque<PendingChunk> pendingChunkPayloads = new ArrayDeque<>();
+
+    /** Chunk na fila de envio + controle de quanto já esperou pela luz. */
+    private static final class PendingChunk {
+        final LevelChunk chunk;
+        final long enqueuedMs = System.currentTimeMillis();
+        /** O motor de luz já ficou ocioso ao menos uma vez desde que este
+         *  chunk entrou na fila — sinal de que a luz dele foi calculada. */
+        boolean sawLightIdle;
+
+        PendingChunk(LevelChunk chunk) {
+            this.chunk = chunk;
+        }
+    }
 
     // Reutilizados entre chunks/seções pra não alocar 4096 shorts por seção.
     private static final short[] sectionIndices = new short[SECTION_VOLUME];
@@ -226,8 +245,21 @@ public class BaritoneOrchestratorAddonClient {
             sendPlayerSkinIfChanged(player);
         }
 
+        ClientLevel level = Minecraft.getInstance().level;
+        boolean lightIdle = level == null || !level.getLightEngine().hasLightWork();
         for (int i = 0; i < CHUNK_PAYLOADS_PER_TICK && !pendingChunkPayloads.isEmpty(); i++) {
-            sendChunkVoxels(pendingChunkPayloads.poll());
+            PendingChunk pending = pendingChunkPayloads.peek();
+            if (lightIdle) {
+                pending.sawLightIdle = true;
+            }
+            boolean forced = System.currentTimeMillis() - pending.enqueuedMs >= LIGHT_WAIT_TIMEOUT_MS;
+            if (!pending.sawLightIdle && !forced) {
+                break; // luz em processamento: mantém a ordem da fila e tenta depois
+            }
+            if (!sendChunkVoxels(pending.chunk, forced) && !forced) {
+                break; // camada de luz ainda não existe — tenta no próximo tick
+            }
+            pendingChunkPayloads.poll();
         }
 
         ticksSinceLastPosition++;
@@ -809,7 +841,7 @@ public class BaritoneOrchestratorAddonClient {
         if (!(event.getLevel() instanceof ClientLevel) || out == null) {
             return;
         }
-        pendingChunkPayloads.add((LevelChunk) event.getChunk());
+        pendingChunkPayloads.add(new PendingChunk((LevelChunk) event.getChunk()));
     }
 
     /**
@@ -818,18 +850,22 @@ public class BaritoneOrchestratorAddonClient {
      * (relevo, cavernas, minérios), não só a superfície que dá pra ver de
      * cima — ver {@code docs/SPEC.md}, "Blocos 3D", e {@code world_cache.rs}.
      */
-    private static void sendChunkVoxels(LevelChunk chunk) {
+    private static boolean sendChunkVoxels(LevelChunk chunk, boolean force) {
         ChunkPos pos = chunk.getPos();
-        byte[] payload = serializeChunk(chunk);
+        byte[] payload = serializeChunk(chunk, force);
+        if (payload == null) {
+            return false; // luz ainda não pronta — ver `onClientTick`
+        }
         String encoded = Base64.getEncoder().encodeToString(payload);
         send(String.format(
                 Locale.ROOT,
                 "{\"type\":\"chunk_voxels\",\"x\":%d,\"z\":%d,\"data\":\"%s\"}",
                 pos.x(), pos.z(), encoded
         ));
+        return true;
     }
 
-    private static byte[] serializeChunk(LevelChunk chunk) {
+    private static byte[] serializeChunk(LevelChunk chunk, boolean force) {
         LevelChunkSection[] sections = chunk.getSections();
 
         int nonEmptySections = 0;
@@ -851,6 +887,9 @@ public class BaritoneOrchestratorAddonClient {
         raw.write(VOXEL_FORMAT_VERSION);
         raw.write(nonEmptySections);
         ClientLevel level = Minecraft.getInstance().level;
+        if (!force && level != null && level.getLightEngine().hasLightWork()) {
+            return null; // motor de luz ainda processando — tenta no próximo tick
+        }
 
         for (int i = 0; i < sections.length; i++) {
             LevelChunkSection section = sections[i];
@@ -919,11 +958,16 @@ public class BaritoneOrchestratorAddonClient {
             DataLayer skyLight = level == null
                     ? null
                     : level.getLightEngine().getLayerListener(LightLayer.SKY).getDataLayerData(sectionPos);
+            if (!force && (blockLight == null || skyLight == null)) {
+                return null; // camada ainda não carregada — tenta no próximo tick
+            }
             for (int y = 0; y < 16; y++) {
                 for (int z = 0; z < 16; z++) {
                     for (int x = 0; x < 16; x++) {
+                        // Camada ausente no envio forçado: fallback de dia (céu
+                        // 15, bloco 0) — melhor que um chunk preto.
                         int block = blockLight == null ? 0 : blockLight.get(x, y, z);
-                        int sky = skyLight == null ? 0 : skyLight.get(x, y, z);
+                        int sky = skyLight == null ? 15 : skyLight.get(x, y, z);
                         raw.write((block & 0xF) | (sky << 4));
                     }
                 }
@@ -1123,7 +1167,7 @@ public class BaritoneOrchestratorAddonClient {
             for (int dz = -radius; dz <= radius; dz++) {
                 LevelChunk chunk = level.getChunkSource().getChunk(centerX + dx, centerZ + dz, false);
                 if (chunk != null) {
-                    pendingChunkPayloads.add(chunk);
+                    pendingChunkPayloads.add(new PendingChunk(chunk));
                 }
             }
         }

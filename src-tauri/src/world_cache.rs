@@ -568,6 +568,33 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<DecodedVoxels, String> {
         });
     }
 
+    // Reparo de captura sem luz: o addon serializava o chunk no
+    // `ChunkEvent.Load`, antes de o motor de luz do client calcular qualquer
+    // coisa — o payload saía com tudo zero e o terreno ficava preto pra sempre
+    // (e já ficou assim no `world.log` de quem rodou aquela versão). Um chunk
+    // com luz zero em TODAS as posições não é escuridão real (nem uma caverna:
+    // o ar acima da superfície teria céu 15), então ele é aceso como dia em
+    // vez de virar um buraco preto. O addon novo não gera mais isso (espera a
+    // luz ficar pronta; ver `LIGHT_WAIT_TIMEOUT_MS` no lado Java).
+    let looks_unlit = !sections.is_empty()
+        && sections.iter().all(|section| section.light.iter().all(|byte| *byte == 0))
+        && sections
+            .iter()
+            .max_by_key(|section| section.y)
+            .map(|top| {
+                top.indices.iter().any(|index| {
+                    top.palette
+                        .get(*index as usize)
+                        .is_some_and(|entry| entry.block == "air")
+                })
+            })
+            .unwrap_or(false);
+    if version >= VOXEL_FORMAT_VERSION_LIGHT && looks_unlit {
+        for section in &mut sections {
+            section.light.fill(0xf0); // céu 15, bloco 0 = dia claro
+        }
+    }
+
     // v2 termina aqui (sem tints); v3+ traz a flag + o bloco por coluna.
     let tints = if version >= VOXEL_FORMAT_VERSION_TINTS {
         match reader.u8()? {
@@ -803,6 +830,46 @@ mod tests {
         assert_eq!(decoded.sections.len(), 1);
         assert_eq!(decoded.sections[0].palette[0].props, "");
         assert_eq!(decoded.sections[0].light.len(), 4096);
+    }
+
+    #[test]
+    fn voxels_repair_unlit_capture_as_day() {
+        // Payload com tudo zero de luz e ar na seção de topo = captura antes
+        // do motor de luz do client (o "chão preto"): a leitura acende como
+        // dia em vez de manter o buraco preto.
+        let mut sections = example_sections();
+        // A seção de topo do fixture precisa ter ar (é o que caracteriza a
+        // superfície sem luz de verdade).
+        sections[1].palette.push(PaletteEntry {
+            block: "air".to_string(),
+            flags: 0,
+            level: 0,
+            props: String::new(),
+        });
+        sections[1].indices[0] = (sections[1].palette.len() - 1) as u16;
+        for section in &mut sections {
+            section.light.fill(0);
+        }
+        let encoded = encode_voxels(&sections, Some(&example_tints()));
+        let decoded = decode_voxels(&encoded).expect("payload deveria decodificar");
+        assert!(
+            decoded.sections.iter().all(|s| s.light.iter().all(|b| *b == 0xf0)),
+            "luz toda zero deveria virar dia"
+        );
+
+        // Luz real (mesmo parcialmente acesa) não é mexida.
+        let mut sections = example_sections();
+        for section in &mut sections {
+            section.light.fill(0);
+        }
+        sections[0].light[0] = 0xf0;
+        let encoded = encode_voxels(&sections, None);
+        let decoded = decode_voxels(&encoded).expect("payload deveria decodificar");
+        assert_eq!(decoded.sections[0].light[0], 0xf0);
+        assert_eq!(
+            decoded.sections[0].light[1], 0,
+            "luz real (mesmo parcial) continua como veio"
+        );
     }
 
     #[test]
