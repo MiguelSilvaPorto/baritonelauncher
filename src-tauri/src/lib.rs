@@ -2,6 +2,7 @@ mod addon_socket;
 mod block_models;
 mod instructions;
 mod items;
+mod minecraft_launch;
 mod mobs;
 mod player_skin;
 mod schematic;
@@ -84,6 +85,10 @@ pub(crate) struct AppState {
     /// aplica o que veio daqui: o backend é a fonte da verdade e prende cada
     /// campo na faixa válida.
     pub(crate) settings: Mutex<settings::Settings>,
+    /// Processo do Minecraft aberto pela aba "Jogar" (`minecraft_launch.rs`).
+    /// `None` = o app não abriu jogo nenhum (um jogo aberto por fora — pelo
+    /// CurseForge — não aparece aqui; o addon conecta do mesmo jeito).
+    pub(crate) minecraft_process: Mutex<Option<std::process::Child>>,
 }
 
 /// Ids de instrução são gerados aqui (nunca pelo addon) — só precisam ser
@@ -585,6 +590,167 @@ mod commands {
         Ok(defaults)
     }
 
+    /* ---------- aba "Jogar": abrir o Minecraft direto ---------- */
+
+    /// Onde está a instalação do CurseForge, qual Java seria usado e o
+    /// primeiro problema encontrado (se houver) — a aba Jogar mostra isso
+    /// antes de qualquer botão.
+    #[tauri::command]
+    fn minecraft_setup(state: State<AppState>) -> crate::minecraft_launch::MinecraftSetup {
+        let settings = state.settings.lock().unwrap().clone();
+        crate::minecraft_launch::setup(&settings)
+    }
+
+    fn curseforge_root(state: &AppState) -> Result<std::path::PathBuf, String> {
+        let settings = state.settings.lock().unwrap().clone();
+        crate::minecraft_launch::detect_root(&settings.curseforge_root).ok_or_else(|| {
+            if settings.curseforge_root.trim().is_empty() {
+                "Instalação do CurseForge não encontrada — aponte a pasta na aba Config.".to_string()
+            } else {
+                format!(
+                    "O caminho configurado não é uma instalação do CurseForge: {}",
+                    settings.curseforge_root.trim()
+                )
+            }
+        })
+    }
+
+    #[tauri::command]
+    fn minecraft_instances(state: State<AppState>) -> Result<Vec<crate::minecraft_launch::InstanceInfo>, String> {
+        let root = curseforge_root(&state)?;
+        crate::minecraft_launch::list_instances(&root)
+    }
+
+    #[tauri::command]
+    fn minecraft_worlds(
+        state: State<AppState>,
+        instance_id: String,
+    ) -> Result<Vec<crate::minecraft_launch::WorldInfo>, String> {
+        let root = curseforge_root(&state)?;
+        let dir = crate::minecraft_launch::instance_dir(&root, &instance_id)?;
+        crate::minecraft_launch::list_worlds(&dir)
+    }
+
+    /// Monta a linha de comando sem abrir o jogo — serve pra conferir o que
+    /// seria executado (e testar por fora) quando algo não abrir.
+    #[tauri::command]
+    fn minecraft_launch_preview(
+        app: tauri::AppHandle,
+        state: State<AppState>,
+        instance_id: String,
+        world_id: Option<String>,
+    ) -> Result<crate::minecraft_launch::LaunchPreview, String> {
+        let settings = state.settings.lock().unwrap().clone();
+        let root = curseforge_root(&state)?;
+        let log_dir = app_data_dir(&app)?;
+        let plan = crate::minecraft_launch::build_launch_plan(
+            &settings,
+            &root,
+            &instance_id,
+            world_id.as_deref(),
+            &log_dir,
+        )?;
+        Ok(crate::minecraft_launch::LaunchPreview {
+            command: crate::minecraft_launch::preview_command_line(&plan),
+            java: plan.java.to_string_lossy().to_string(),
+            java_version: plan.java_version.clone(),
+            log_path: plan.log_path.to_string_lossy().to_string(),
+            version: plan.version,
+            world: plan.world,
+        })
+    }
+
+    /// Abre o Minecraft direto (offline, singleplayer) — com `world_id`, cai
+    /// dentro do mundo via `--quickPlaySingleplayer`. A saída do jogo vai pro
+    /// `minecraft-launch.log` no diretório de dados do app.
+    #[tauri::command]
+    fn minecraft_launch(
+        app: tauri::AppHandle,
+        state: State<AppState>,
+        instance_id: String,
+        world_id: Option<String>,
+    ) -> Result<crate::minecraft_launch::LaunchOutcome, String> {
+        {
+            let mut running = state.minecraft_process.lock().unwrap();
+            if let Some(child) = running.as_mut() {
+                match child.try_wait() {
+                    Ok(None) => {
+                        return Err(format!(
+                            "O jogo já está aberto por este app (pid {}) — feche antes de abrir outro.",
+                            child.id()
+                        ));
+                    }
+                    _ => *running = None,
+                }
+            }
+        }
+
+        let settings = state.settings.lock().unwrap().clone();
+        let root = curseforge_root(&state)?;
+        let log_dir = app_data_dir(&app)?;
+        let plan = crate::minecraft_launch::build_launch_plan(
+            &settings,
+            &root,
+            &instance_id,
+            world_id.as_deref(),
+            &log_dir,
+        )?;
+
+        let mut command = std::process::Command::new(&plan.java);
+        command.args(&plan.args).current_dir(&plan.cwd);
+        if let Ok(log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&plan.log_path)
+        {
+            if let Ok(clone) = log.try_clone() {
+                command.stdout(clone);
+            }
+            command.stderr(log);
+        }
+        let child = command
+            .spawn()
+            .map_err(|err| format!("não consegui abrir o Java ({}): {err}", plan.java.display()))?;
+        let pid = child.id();
+        *state.minecraft_process.lock().unwrap() = Some(child);
+
+        Ok(crate::minecraft_launch::LaunchOutcome {
+            pid,
+            java: plan.java.to_string_lossy().to_string(),
+            java_version: plan.java_version,
+            version: plan.version,
+            world: plan.world,
+        })
+    }
+
+    /// Estado do processo aberto pela aba Jogar — `running` só fica `true`
+    /// enquanto o processo que **este app** abriu estiver vivo; o jogo aberto
+    /// pelo CurseForge não é rastreado aqui (a conexão com o addon é que
+    /// conta).
+    #[tauri::command]
+    fn minecraft_game_status(state: State<AppState>) -> crate::minecraft_launch::GameStatus {
+        let mut process = state.minecraft_process.lock().unwrap();
+        let Some(child) = process.as_mut() else {
+            return crate::minecraft_launch::GameStatus::default();
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                *process = None;
+                crate::minecraft_launch::GameStatus {
+                    running: false,
+                    pid: None,
+                    exit_code: status.code(),
+                }
+            }
+            Ok(None) => crate::minecraft_launch::GameStatus {
+                running: true,
+                pid: Some(child.id()),
+                exit_code: None,
+            },
+            Err(_) => crate::minecraft_launch::GameStatus::default(),
+        }
+    }
+
     pub(super) fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         builder.invoke_handler(tauri::generate_handler![
             connection_status,
@@ -607,6 +773,12 @@ mod commands {
             settings_get,
             settings_set,
             settings_reset,
+            minecraft_setup,
+            minecraft_instances,
+            minecraft_worlds,
+            minecraft_launch_preview,
+            minecraft_launch,
+            minecraft_game_status,
         ])
     }
 }

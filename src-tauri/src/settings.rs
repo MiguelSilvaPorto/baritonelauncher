@@ -36,6 +36,14 @@ pub(crate) struct Settings {
     pub(crate) pose_interval_ms: u32,
     /// Chunks pedidos por atualização de estado (ver `main.ts`, `refreshState`).
     pub(crate) chunks_per_refresh: u32,
+    /// Raiz da instalação do CurseForge (a pasta que contém `Install/` e
+    /// `Instances/`). Vazio = detectar sozinho (`~/Documents/curseforge/minecraft`).
+    /// Usada pela aba "Jogar" (`minecraft_launch.rs`).
+    pub(crate) curseforge_root: String,
+    /// Nick usado na sessão offline do jogo (a aba "Jogar" abre sem login).
+    pub(crate) offline_username: String,
+    /// Memória alocada pro jogo (`-Xmx`), em MB.
+    pub(crate) java_memory_mb: u32,
 }
 
 impl Default for Settings {
@@ -48,6 +56,9 @@ impl Default for Settings {
             state_interval_ms: 1000,
             pose_interval_ms: 250,
             chunks_per_refresh: 16,
+            curseforge_root: String::new(),
+            offline_username: "Player".to_string(),
+            java_memory_mb: 4096,
         }
     }
 }
@@ -76,7 +87,29 @@ impl Settings {
         self.state_interval_ms = self.state_interval_ms.clamp(250, 10_000);
         self.pose_interval_ms = self.pose_interval_ms.clamp(100, 5_000);
         self.chunks_per_refresh = self.chunks_per_refresh.clamp(1, 64);
+        self.curseforge_root = self.curseforge_root.trim().to_string();
+        self.offline_username = sanitize_username(&self.offline_username);
+        self.java_memory_mb = self
+            .java_memory_mb
+            .clamp(crate::minecraft_launch::MIN_MEMORY_MB, crate::minecraft_launch::MAX_MEMORY_MB);
         self
+    }
+}
+
+/// Nick da sessão offline: sem controle/espaço, não vazio e com tamanho
+/// razoável. Não valida contra a Mojang (não há login) — só evita um valor que
+/// quebraria a linha de comando.
+fn sanitize_username(value: &str) -> String {
+    let cleaned: String = value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control() && !ch.is_whitespace())
+        .take(32)
+        .collect();
+    if cleaned.is_empty() {
+        "Player".to_string()
+    } else {
+        cleaned
     }
 }
 
@@ -125,6 +158,9 @@ mod tests {
             state_interval_ms: 2000,
             pose_interval_ms: 500,
             chunks_per_refresh: 32,
+            curseforge_root: "/tmp/curseforge".to_string(),
+            offline_username: "Steve".to_string(),
+            java_memory_mb: 8192,
         };
         save(&path, &settings).expect("gravação deveria funcionar");
 
@@ -176,6 +212,37 @@ mod tests {
         assert_eq!(loaded.chunks_per_refresh, 1);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn launch_settings_are_sanitized() {
+        let path = temp_path("launch");
+        std::fs::write(
+            &path,
+            br#"{
+                "curseforge_root": "  /tmp/cf  ",
+                "offline_username": "  bad name  ",
+                "java_memory_mb": 999999
+            }"#,
+        )
+        .expect("escrever o arquivo deveria funcionar");
+
+        let loaded = load(&path).expect("leitura deveria funcionar").expect("arquivo deveria existir");
+        assert_eq!(loaded.curseforge_root, "/tmp/cf");
+        assert_eq!(loaded.offline_username, "badname");
+        assert_eq!(loaded.java_memory_mb, crate::minecraft_launch::MAX_MEMORY_MB);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_username_falls_back_to_player() {
+        let sanitized = Settings {
+            offline_username: "   ".to_string(),
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(sanitized.offline_username, "Player");
     }
 
     #[test]

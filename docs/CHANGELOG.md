@@ -241,6 +241,19 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Aba "Jogar" — o app abre o Minecraft direto, com seleção de mundo**: nova view na rail (ícone de
+  play) que detecta a instalação do CurseForge (padrão `~/Documents/curseforge/minecraft`, com a pasta
+  configurável na aba Config), lista as **instâncias** (nome, versão e modloader lidos do
+  `minecraftinstance.json`) e os **mundos** de `saves/` (nome + última alteração do `level.dat`), e
+  abre o jogo pelo Java do próprio CurseForge — sem launcher externo no meio. Cada mundo tem seu botão
+  "Abrir neste mundo", que entra direto nele via `--quickPlaySingleplayer`; "Abrir Minecraft" abre sem
+  mundo. A linha de comando é montada dos JSONs de versão **já instalados** (cadeia `inheritsFrom`,
+  classpath com as bibliotecas e nativos, Java escolhido pelo `major` que a versão pede, `-Xmx`
+  configurável), e "Prévia do comando" mostra exatamente o que seria executado sem abrir nada. Limite
+  honesto desta versão: **sessão offline** — singleplayer entra (é o caso dos mundos), servidor com
+  `online-mode` não; o app não lê nem copia token do CurseForge, e login Microsoft fica pra depois. O
+  log do jogo vai pra `minecraft-launch.log` no diretório de dados do app, e o addon conecta sozinho
+  quando o jogo abre. Nada é baixado da Mojang: usa só o que já está instalado.
 - **Editor de schematic agora executa de verdade (posicionar e quebrar blocos)**: antes o "Aplicar" só
   enfileirava `Mine`/`Build` e parava ali — o addon não tinha executor e os cards ficavam `Queued` para
   sempre. Agora a lista de blocos viaja na própria instrução e o addon usa o `IBuilderProcess` do

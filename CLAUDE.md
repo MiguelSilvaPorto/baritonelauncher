@@ -26,7 +26,7 @@ At the repository root — the app directory. It contains:
 - `src-tauri/` — Rust/Tauri backend, single crate (`src/lib.rs` + one module per domain concept:
   `world_cache.rs`, `storage_index.rs`, `items.rs`, `vitals.rs`, `time_estimate.rs`,
   `instructions.rs`, `addon_socket.rs`, `settings.rs`).
-- `index.html` — the entire UI markup (titlebar, rail, the five views: viewer/editor/fila/armazém/config).
+- `index.html` — the entire UI markup (titlebar, rail, the six views: viewer/editor/fila/armazém/config/jogar).
 - `mod-addon/` — **real NeoForge project** (from the official MDK), bridges Baritone to the socket
   above. See its `README.md` for what's implemented vs. still missing.
 - `docs/SPEC.md` — the full product/architecture spec. Treat it as the source of truth for behavior
@@ -202,7 +202,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
   `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
   `vitals_snapshot`, `bot_pose`, `world_time`, `player_skin`, `nearby_mobs`,
-  `get_texture_atlas`, `get_block_models`, `settings_get`, `settings_set`, `settings_reset`. Spawns
+  `get_texture_atlas`, `get_block_models`, `settings_get`, `settings_set`, `settings_reset`,
+  `minecraft_setup`, `minecraft_instances`, `minecraft_worlds`, `minecraft_launch_preview`,
+  `minecraft_launch`, `minecraft_game_status`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also opens the persisted world
@@ -361,6 +363,11 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   (static 32×32, e.g. signs/shelves) render as tinted white on those faces.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
+- **Aba Jogar: lançamento offline, só CurseForge.** `minecraft_launch.rs` monta a linha de comando
+  dos JSONs de versão já instalados e abre o jogo com `--accessToken 0` (UUID fixo): singleplayer
+  entra (inclusive `--quickPlaySingleplayer <mundo>`), servidor com `online-mode` recusa; login
+  Microsoft fica pra depois e o token do CurseForge não é lido. A detecção cobre a instalação do
+  CurseForge (`~/Documents/curseforge/minecraft`, configurável) — outros launchers não.
 - **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*
   persisted now — one global `world.log` per app, so switching between servers/worlds mixes their
   chunks in the same cache; there's no per-world separation yet.)
