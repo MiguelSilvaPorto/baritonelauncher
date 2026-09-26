@@ -16,6 +16,7 @@ import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.LivingEntity;
@@ -29,10 +30,12 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.MultifaceBlock;
 import net.minecraft.world.level.block.VineBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.material.FluidState;
@@ -100,14 +103,16 @@ public class BaritoneOrchestratorAddonClient {
             "{\"type\":\"hello\",\"addon_version\":\"0.1.0\",\"baritone_version\":\"1.20.0\",\"mc_version\":\"26.3\"}";
 
     // Layout do payload binário de `chunk_voxels` — precisa bater com
-    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 3):
+    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 4):
     //   u8 versão | u8 nº de seções
     //   por seção: i8 Y da seção | u16 tamanho da paleta
     //              por entrada: u16 tamanho do nome | bytes UTF-8 | u8 flags | u8 nível
     //              u16[4096] índices (x + z*16 + y*256)
+    //              u8[4096] luz (x + z*16 + y*256; nibble baixo = bloco, alto = céu)
     //   u8 tem_tints | 256×3 bytes de grama, 256×3 de folhagem e 256×3 de água
-    //              (colunas x + z*16; v2 = sem esse bloco, ainda aceito na leitura)
-    private static final byte VOXEL_FORMAT_VERSION = 3;
+    //              (colunas x + z*16; v3 = sem luz, v2 = sem tints nem luz,
+    //              os dois ainda aceitos na leitura)
+    private static final byte VOXEL_FORMAT_VERSION = 4;
     private static final int VOXEL_FLAG_RENDER = 1;
     private static final int VOXEL_FLAG_OCCLUDES = 2;
     private static final int VOXEL_FLAG_FLUID = 4;
@@ -720,6 +725,7 @@ public class BaritoneOrchestratorAddonClient {
         ByteArrayOutputStream raw = new ByteArrayOutputStream(64 * 1024);
         raw.write(VOXEL_FORMAT_VERSION);
         raw.write(nonEmptySections);
+        ClientLevel level = Minecraft.getInstance().level;
 
         for (int i = 0; i < sections.length; i++) {
             LevelChunkSection section = sections[i];
@@ -769,6 +775,28 @@ public class BaritoneOrchestratorAddonClient {
             }
             for (short index : sectionIndices) {
                 writeU16(raw, index & 0xFFFF);
+            }
+
+            // Luz real do jogo (tocha, lava, céu — já propagadas pelo motor de
+            // luz do cliente) por posição: dois nibbles por byte, mesmo índice
+            // dos blocos. `getDataLayerData` entrega a seção inteira já em
+            // nibbles; 4096 consultas ao motor por camada custariam caro
+            // demais na serialização de um chunk.
+            SectionPos sectionPos = SectionPos.of(chunk.getPos(), chunk.getSectionYFromSectionIndex(i));
+            DataLayer blockLight = level == null
+                    ? null
+                    : level.getLightEngine().getLayerListener(LightLayer.BLOCK).getDataLayerData(sectionPos);
+            DataLayer skyLight = level == null
+                    ? null
+                    : level.getLightEngine().getLayerListener(LightLayer.SKY).getDataLayerData(sectionPos);
+            for (int y = 0; y < 16; y++) {
+                for (int z = 0; z < 16; z++) {
+                    for (int x = 0; x < 16; x++) {
+                        int block = blockLight == null ? 0 : blockLight.get(x, y, z);
+                        int sky = skyLight == null ? 0 : skyLight.get(x, y, z);
+                        raw.write((block & 0xF) | (sky << 4));
+                    }
+                }
             }
         }
 
