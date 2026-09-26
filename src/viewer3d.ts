@@ -62,6 +62,33 @@ const SUN_DISTANCE = 300;
  * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
 const SKY_RADIUS = 3000;
 
+// Nuvens vanilla — porte do `CloudRenderer` do client: o padrão vem de
+// `textures/environment/clouds.png` (256×256 texels = uma célula por texel,
+// corte em alpha < 10), cada célula é uma caixa de 12×12×4 blocos com topo em
+// 192.33 (altura padrão do overworld), cor branca com alpha 0.8, sombreamento
+// por face e deriva de 0.6 bloco/s no X (+3.96 fixo no Z, como no jogo); o
+// padrão se repete a cada 3072 blocos. A cor acompanha o ciclo dia/noite
+// (`daylightFactor`); a altura ainda é sempre a do overworld, porque o addon
+// não manda a dimensão (ver "Known gaps").
+const CLOUD_CELL_SIZE = 12;
+const CLOUD_THICKNESS = 4;
+const CLOUD_HEIGHT = 192.33;
+const CLOUD_ALPHA = 0.8;
+const CLOUD_ALPHA_CUTOFF = 10;
+const CLOUD_DRIFT_PER_SECOND = 0.6;
+const CLOUD_Z_OFFSET = 3.96;
+const CLOUD_TEXTURE_PX = 256;
+const CLOUD_SHADE_TOP = 1;
+const CLOUD_SHADE_BOTTOM = 0.7;
+const CLOUD_SHADE_NORTH_SOUTH = 0.8;
+const CLOUD_SHADE_EAST_WEST = 0.9;
+/** Período do padrão de nuvens em blocos (256 células × 12 blocos). */
+const CLOUD_PERIOD_BLOCKS = CLOUD_CELL_SIZE * CLOUD_TEXTURE_PX;
+// Multiplicador noturno do jogo (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`):
+// as nuvens escurecem pra um azul quase preto quando não há sol.
+const CLOUD_NIGHT_COLOR = new THREE.Color(0.1, 0.1, 0.15);
+const CLOUD_DAY_COLOR = new THREE.Color(0xffffff);
+
 // Cores pré-alocadas do ciclo: `updateDayNight` roda por frame e não pode
 // alocar `THREE.Color` a cada chamada.
 const SKY_DAY_ZENITH = new THREE.Color(SKY_DAY.zenith);
@@ -828,6 +855,17 @@ export class Viewer3D {
   private readonly linearColorCache = new Map<number, [number, number, number]>();
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
+  /** Layer de nuvens (3×3 tiles do padrão) — `null` até o PNG do jar chegar. */
+  private cloudGroup: THREE.Group | null = null;
+  /** Material compartilhado pelos 9 tiles — a cor é retintada por dia/noite
+   * em `updateClouds` (`daylightFactor`). */
+  private cloudMaterial: THREE.MeshBasicMaterial | null = null;
+  /** Base do relógio da deriva das nuvens (o jogo mede em ticks; aqui é o
+   * tempo real desde a primeira textura de nuvens carregada). */
+  private cloudStartMs = 0;
+  /** Fator 0..1 de luz do dia, calculado em `updateDayNight` — as nuvens usam
+   * pra escurecer à noite como no jogo. */
+  private daylightFactor = 1;
   /** Canvas/textura do gradiente do domo — `paintSky` redesenha os dois. */
   private skyCanvas: HTMLCanvasElement | null = null;
   private skyTexture: THREE.CanvasTexture | null = null;
@@ -1041,6 +1079,194 @@ export class Viewer3D {
     return sky;
   }
 
+  /** Monta o layer de nuvens a partir do PNG do jar (ver `texture_atlas.rs`):
+   * uma geometria com as caixas de todas as células do padrão, replicada em
+   * 3×3 tiles que compartilham a malha (o padrão é periódico — ver
+   * `updateClouds`), o que cobre a vista mesmo com o zoom afastado. */
+  private buildClouds(dataUrl: string | null) {
+    if (!dataUrl) return;
+    new THREE.TextureLoader().load(
+      dataUrl,
+      (texture) => {
+        const image = texture.image as HTMLImageElement | undefined;
+        if (!image) return;
+        const geometry = this.buildCloudGeometry(image);
+        if (!geometry) return;
+
+        const material = new THREE.MeshBasicMaterial({
+          vertexColors: true,
+          transparent: true,
+          opacity: CLOUD_ALPHA,
+          depthWrite: false,
+        });
+        this.cloudMaterial = material;
+        const group = new THREE.Group();
+        for (let ix = -1; ix <= 1; ix++) {
+          for (let iz = -1; iz <= 1; iz++) {
+            const tile = new THREE.Mesh(geometry, material);
+            tile.position.set(ix * CLOUD_PERIOD_BLOCKS, 0, iz * CLOUD_PERIOD_BLOCKS);
+            group.add(tile);
+          }
+        }
+        if (this.cloudGroup) {
+          this.scene.remove(this.cloudGroup);
+          for (const child of this.cloudGroup.children) {
+            if (child instanceof THREE.Mesh) child.geometry.dispose();
+          }
+        }
+        this.cloudGroup = group;
+        this.scene.add(group);
+        this.updateClouds(performance.now());
+      },
+      undefined,
+      (err) => console.error("[viewer3d] falha ao carregar textura de nuvens:", err)
+    );
+  }
+
+  /** Caixas do padrão de nuvens a partir dos pixels do PNG: cada texel com
+   * alpha ≥ `CLOUD_ALPHA_CUTOFF` é uma célula; topo e base sempre, os lados só
+   * quando o vizinho (com wrap, como no `CloudRenderer`) é vazio. */
+  private buildCloudGeometry(image: HTMLImageElement): THREE.BufferGeometry | null {
+    const width = image.width;
+    const height = image.height;
+    if (width !== CLOUD_TEXTURE_PX || height !== CLOUD_TEXTURE_PX) {
+      console.warn(`[viewer3d] textura de nuvens inesperada: ${width}×${height}`);
+      return null;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.drawImage(image, 0, 0);
+    const pixels = ctx.getImageData(0, 0, width, height).data;
+
+    const solid = new Uint8Array(width * height);
+    for (let i = 0; i < solid.length; i++) {
+      solid[i] = pixels[i * 4 + 3] >= CLOUD_ALPHA_CUTOFF ? 1 : 0;
+    }
+    const wrapX = (v: number) => ((v % width) + width) % width;
+    const wrapZ = (v: number) => ((v % height) + height) % height;
+    const at = (x: number, z: number) => solid[wrapZ(z) * width + wrapX(x)];
+
+    const positions: number[] = [];
+    const colors: number[] = [];
+    const indices: number[] = [];
+    const size = CLOUD_CELL_SIZE;
+    const top = CLOUD_THICKNESS;
+    const addQuad = (corners: readonly (readonly [number, number, number])[], shade: number) => {
+      const base = positions.length / 3;
+      for (const [x, y, z] of corners) {
+        positions.push(x, y, z);
+        colors.push(shade, shade, shade);
+      }
+      indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+
+    for (let z = 0; z < height; z++) {
+      for (let x = 0; x < width; x++) {
+        if (!solid[z * width + x]) continue;
+        const bx = x * size;
+        const bz = z * size;
+        addQuad(
+          [
+            [bx, top, bz],
+            [bx, top, bz + size],
+            [bx + size, top, bz + size],
+            [bx + size, top, bz],
+          ],
+          CLOUD_SHADE_TOP
+        );
+        addQuad(
+          [
+            [bx, 0, bz],
+            [bx + size, 0, bz],
+            [bx + size, 0, bz + size],
+            [bx, 0, bz + size],
+          ],
+          CLOUD_SHADE_BOTTOM
+        );
+        if (!at(x, z - 1)) {
+          addQuad(
+            [
+              [bx, 0, bz],
+              [bx, top, bz],
+              [bx + size, top, bz],
+              [bx + size, 0, bz],
+            ],
+            CLOUD_SHADE_NORTH_SOUTH
+          );
+        }
+        if (!at(x, z + 1)) {
+          addQuad(
+            [
+              [bx, 0, bz + size],
+              [bx + size, 0, bz + size],
+              [bx + size, top, bz + size],
+              [bx, top, bz + size],
+            ],
+            CLOUD_SHADE_NORTH_SOUTH
+          );
+        }
+        if (!at(x - 1, z)) {
+          addQuad(
+            [
+              [bx, 0, bz],
+              [bx, 0, bz + size],
+              [bx, top, bz + size],
+              [bx, top, bz],
+            ],
+            CLOUD_SHADE_EAST_WEST
+          );
+        }
+        if (!at(x + 1, z)) {
+          addQuad(
+            [
+              [bx + size, 0, bz + size],
+              [bx + size, 0, bz],
+              [bx + size, top, bz],
+              [bx + size, top, bz + size],
+            ],
+            CLOUD_SHADE_EAST_WEST
+          );
+        }
+      }
+    }
+    if (indices.length === 0) return null;
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
+    geometry.computeBoundingSphere();
+    return geometry;
+  }
+
+  /** Ancora o layer de nuvens no mundo: a célula `i` da textura fica em
+   * `i * 12 − drift` no X e `i * 12 − 3.96` no Z (mesma conta do
+   * `CloudRenderer`: `cloudX = camera.x + drift`, `cloudZ = camera.z + 3.96`,
+   * com o padrão andando pra −X a 0.6 bloco/s) — e o grupo vai pro múltiplo do
+   * período mais perto da câmera, o que não muda o visual (o padrão repete a
+   * cada 3072 blocos) e mantém os 3×3 tiles cobrindo a vista. */
+  private updateClouds(now: number) {
+    const group = this.cloudGroup;
+    if (!group) return;
+    if (this.cloudStartMs === 0) this.cloudStartMs = now;
+    // Cor do jogo: branco de dia, azul quase preto à noite (multiplicador
+    // noturno do `Timelines`), interpolado pelo mesmo fator de luz do céu.
+    this.cloudMaterial?.color.copy(CLOUD_NIGHT_COLOR).lerp(CLOUD_DAY_COLOR, this.daylightFactor);
+    const drift = (((now - this.cloudStartMs) / 1000) * CLOUD_DRIFT_PER_SECOND) % CLOUD_PERIOD_BLOCKS;
+    const anchorX = -drift;
+    const anchorZ = -CLOUD_Z_OFFSET;
+    const nearest = (anchor: number, camera: number) =>
+      anchor + Math.round((camera - anchor) / CLOUD_PERIOD_BLOCKS) * CLOUD_PERIOD_BLOCKS;
+    group.position.set(
+      nearest(anchorX, this.camera.position.x),
+      CLOUD_HEIGHT,
+      nearest(anchorZ, this.camera.position.z)
+    );
+  }
+
   /** Redesenha o gradiente do domo (2×256) e reenvia pra GPU. Só é chamado a
    * cada `SKY_REPAINT_MS` — o ciclo é lento e o domo não precisa de 60fps. */
   private paintSky(zenith: THREE.Color, mid: THREE.Color, horizon: THREE.Color) {
@@ -1109,8 +1335,11 @@ export class Viewer3D {
    * Isso é assíncrono, mas o backfill de reconexão pode mandar dezenas de
    * chunks antes do atlas terminar de carregar; os voxels ficam guardados e
    * só viram malha aqui, com as texturas prontas. */
-  setAtlas(dataUrl: string, textures: Record<string, UvRect>) {
+  setAtlas(dataUrl: string, textures: Record<string, UvRect>, cloudDataUrl: string | null = null) {
     this.atlasLoading = true;
+    // As nuvens vêm do mesmo jar mas são outro PNG — monta em paralelo; sem
+    // ele (jar ausente) simplesmente não há nuvens, nada de inventar padrão.
+    this.buildClouds(cloudDataUrl);
     new THREE.TextureLoader().load(
       dataUrl,
       (texture) => {
@@ -2303,6 +2532,7 @@ export class Viewer3D {
     const phase = (time / TICKS_PER_DAY) * Math.PI * 2;
     const elevation = Math.sin(phase); // -1 = meia-noite, +1 = meio-dia
     const daylight = smoothstep(-0.12, 0.28, elevation);
+    this.daylightFactor = daylight; // as nuvens escurecem junto (updateClouds)
 
     // A luz de céu assada acompanha o dia — sem isso o terreno ficaria claro
     // de noite. O piso é o luar do jogo; a remontagem é orçada
@@ -2915,6 +3145,7 @@ export class Viewer3D {
     }
     this.updateDayNight(now);
     this.updateSky();
+    this.updateClouds(now);
     this.updateFog();
     this.updateAnimation(now);
     this.drainMeshQueue();

@@ -216,6 +216,17 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Nuvens iguais às do jogo**: o viewer tinha céu, mas nenhuma nuvem. Agora o layer de nuvens é um
+  porte do `CloudRenderer` do client: o padrão sai do PNG real do jar
+  (`textures/environment/clouds.png`, 256×256, corte em alpha < 10), cada célula é uma caixa de
+  12×12×4 blocos com topo em **192.33** (a altura padrão do overworld), sombreamento por face como no
+  jogo (base 0.7, topo 1.0, norte/sul 0.8, leste/oeste 0.9) e deriva de **0.6 bloco/s** no eixo X
+  (+3.96 fixo no Z, igual ao código vanilla), repetindo a cada 3072 blocos. A cor acompanha o ciclo
+  dia/noite que o addon reporta: brancas de dia e azul quase preto à noite, como no multiplicador
+  noturno do `Timelines`. A textura sai do jar local (mesma regra do atlas: nunca baixa nada) e, sem
+  ela, o viewer simplesmente não desenha nuvens. Limitações honestas: a altura é sempre a do overworld
+  (o addon não manda a dimensão) e a névoa das nuvens usa a névoa do viewer em vez do fade próprio de
+  2048 blocos do jogo — ver "Known gaps".
 - **Luz de verdade no viewer — bloco emissor ilumina os vizinhos**: o terreno usava luz fixa (ambiente +
   direcional), então tocha, lava e glowstone não iluminavam nada e uma caverna ficava igual à
   superfície. Agora o addon lê o **motor de luz do próprio jogo** (as duas camadas que o cliente já

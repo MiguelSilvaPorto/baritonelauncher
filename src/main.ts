@@ -16,6 +16,8 @@ import {
 interface TextureAtlas {
   image_data_url: string;
   textures: Record<string, UvRect>;
+  /** PNG das nuvens do jar local (ver `texture_atlas.rs`); ausente = sem nuvens. */
+  cloud_data_url?: string | null;
 }
 
 /* ---------- Tipos (espelham as structs em src-tauri/src) ---------- */
@@ -795,7 +797,9 @@ async function refreshState() {
     // novo a cada segundo.
     if (viewer3d.needsAtlas() && (status.connected || world.chunks_explored > 0)) {
       invoke<TextureAtlas>("get_texture_atlas")
-        .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
+        .then((atlas) =>
+          viewer3d?.setAtlas(atlas.image_data_url, atlas.textures, atlas.cloud_data_url ?? null)
+        )
         .catch((err) => {
           console.error("[atlas] falha ao carregar o atlas:", err);
           viewer3d?.setAtlasUnavailable();
