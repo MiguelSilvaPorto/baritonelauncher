@@ -132,16 +132,23 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
   own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
   `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
-  `resize()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real face culling
-  (including against already-loaded neighbors); chunks are added once and never removed (cumulative
-  "explored" semantics, matching `WorldCache`). It also hosts the **schematic editor**: voxel DDA
-  picking (`pickBlock` — meshes are merged per chunk, so a `Raycaster` can't map back to a block), the
-  edit layer (`edits` + `rebuildGhosts`, amber translucent ghost, never mutates `WorldCache`), region
-  selection/hover wire boxes, and `mountTo()` — the viewer and the editor share this one renderer, the
-  canvas is moved to the active view instead of opening a second WebGL context (`main.ts`, `setMode`).
-  This intentionally uses WebGL inside the existing webview instead of a native wgpu surface (which
-  the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in a
-  separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
+- **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
+  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
+  `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
+  `resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real
+  face culling (including against already-loaded neighbors); the mesh work is queued and drained with
+  a per-frame budget (`drainMeshQueue`), and `main.ts` asks for the nearest chunks first
+  (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). Chunks
+  are added once and never removed (cumulative "explored" semantics, matching `WorldCache`). It also
+  hosts the **schematic editor**: voxel DDA picking (`pickBlock` — meshes are merged per chunk, so a
+  `Raycaster` can't map back to a block), the edit layer (`edits` + `rebuildGhosts`, amber
+  translucent ghost, never mutates `WorldCache`), region selection/hover wire boxes, and `mountTo()`
+  — the viewer and the editor share this one renderer, the canvas is moved to the active view instead
+  of opening a second WebGL context (`main.ts`, `setMode`). The click-to-target popup and the editor
+  share one pointer handler: with an editor tool active the click edits, otherwise it picks the queue
+  target. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
+  (which the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in
+  a separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
   redo that tradeoff; if wgpu comes up again, confirm first.
 - **`src/player_model.ts`** (`MinecraftPlayerModel`) — the player the viewer draws: a port of the
   game's `ModelPart.Cube` geometry/UVs (64×64 skin layout, `slim`/`wide` arms, overlay layers) plus
@@ -155,9 +162,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`player_skin`, plus
   `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
-  `connection_status`, `world_summary`, `world_chunks`, `chunk_voxels`, `queue_snapshot`,
-  `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`, `vitals_snapshot`, `bot_pose`,
-  `player_skin`,
+  `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
+  `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
+  `vitals_snapshot`, `bot_pose`, `player_skin`,
   `get_texture_atlas`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`

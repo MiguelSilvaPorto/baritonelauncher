@@ -236,6 +236,18 @@ mod commands {
         state.world.lock().unwrap().chunks.keys().copied().collect()
     }
 
+    /// Os `limit` chunks em cache mais próximos do ponto dado, já ordenados
+    /// por distância (`world_cache::nearest_chunks`). É o que o viewer usa
+    /// pra carregar o terreno ao redor do bot primeiro, em vez de pedir o
+    /// cache inteiro — que cresce sem limite — em ordem arbitrária de
+    /// `HashMap`. `limit` tem teto pra uma chamada malformada não devolver
+    /// o mundo todo.
+    #[tauri::command]
+    fn world_chunks_near(state: State<AppState>, x: i32, z: i32, limit: u32) -> Vec<ChunkPos> {
+        let world = state.world.lock().unwrap();
+        world_cache::nearest_chunks(world.chunks.keys(), x, z, (limit as usize).min(4096))
+    }
+
     /// Voxels de um chunk (seções com paleta + índices, ver
     /// `world_cache.rs`) como bytes crus — o viewer faz o face culling e monta
     /// a geometria. Resposta vazia = chunk não está no cache; é resposta
@@ -455,6 +467,7 @@ mod commands {
             connection_status,
             world_summary,
             world_chunks,
+            world_chunks_near,
             chunk_voxels,
             queue_snapshot,
             queue_push,
