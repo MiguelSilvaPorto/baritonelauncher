@@ -143,7 +143,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   — the viewer and the editor share this one renderer, the canvas is moved to the active view instead
   of opening a second WebGL context (`main.ts`, `setMode`). The click-to-target popup and the editor
   share one pointer handler: with an editor tool active the click edits, otherwise it picks the queue
-  target. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
+  target. It also draws the **sky** (gradient dome, `buildSky`) and the **vanilla cloud layer**
+  (`buildClouds`): the real `clouds.png` from the local jar, one 12×12×4-block box per texel with the
+  game's per-face shading, cloud height 192.33, drift 0.6 block/s on X and the 3072-block repeating
+  pattern — see `CloudRenderer` in the client. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
   (which the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in
   a separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
   redo that tradeoff; if wgpu comes up again, confirm first.
@@ -201,7 +204,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   requirement (Mojang's license doesn't allow redistributing game assets). Animated textures (water,
   lava, fire) contribute every frame as `{stem}_fN` tiles (32×32 frames are downscaled to 16×16), with
   the bare name aliasing frame 0; a synthetic white tile (`WHITE_TILE_NAME`) is the tintable fallback
-  for blocks with no matching texture. Has a real integration test (`cargo test texture_atlas`) that
+  for blocks with no matching texture. It also extracts `textures/environment/clouds.png` as
+  `cloud_data_url` (same local-jar-only rule), which the viewer turns into the cloud layer; the PNG
+  gets its own small cache file (`clouds_<version>.png`) so cached atlases from before this feature
+  don't need a rebuild. Has a real integration test (`cargo test texture_atlas`) that
   runs against whatever local jar exists, skipping itself (not failing) if none is found — keep that
   skip behavior if you touch this file, other environments won't have the jar.
 - `storage_index.rs` — `StorageIndex` (chest position → contents) and `aggregated_totals()`.
@@ -249,6 +255,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   have no executor in the addon yet, and the UI composer only creates the two executable kinds.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
+- **Clouds are fixed overworld/day.** The cloud layer always uses the overworld height (192.33), the
+  daytime color (white, alpha 0.8) and the viewer's scene fog instead of the game's own 2048-block
+  cloud fog — the addon doesn't send the dimension or the world time, so there's nothing real to key
+  them off yet.
 - **Biome tint is a fixed approximation, not the real colormap.** Grass/foliage/water textures are
   gray in the jar and get fixed tints (`GRASS_TINT` and friends in `viewer3d.ts`) instead of a
   per-column biome lookup — visually close, not exact. Blockstates (stair orientation, log axis,
