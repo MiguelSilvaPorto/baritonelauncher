@@ -22,6 +22,19 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   quebra, quando o builder está pausado por falta de material, a instrução passa a aparecer como
   **"pausado"** na fila em vez de um "ativo" que nunca anda. Reportado pelo usuário ("não é possivel
   colocar blocos" / "está no criativo era para colocar").
+
+- **Chão preto: chunks capturados antes de o motor de luz do client calcular a luz**: o addon
+  serializava o chunk no `ChunkEvent.Load` e, nesse instante, o `getDataLayerData` do client ainda
+  devolvia nada — o payload saía com **luz zero em tudo**. Como cada chunk é um snapshot, o terreno
+  ficava preto pra sempre (num mundo real, 143 de 216 chunks estavam assim). Agora o addon só manda o
+  chunk depois que o motor de luz fica ocioso e as camadas de luz existem, com teto de paciência de
+  5 s (passou disso, manda com o fallback de dia em vez de segurar pra sempre); e a leitura no Rust
+  **repara** o que já está salvo com luz toda zero, acendendo como dia — um chunk com zero luz em
+  todas as posições não é escuridão real (nem uma caverna: o ar acima da superfície teria céu 15).
+  Com o addon novo, o mundo ao redor do bot volta a aparecer; com o reparo, o histórico já salvo
+  também deixa de ser buraco preto ao reabrir. Reportado pelo usuário ("depois dessa correção o chao
+  todo ficou preto investigue").
+
 - **Nuvem passando por cima deixava o viewer num breu**: a camada de nuvens fica em y≈192 e, quando a
   câmera subia até essa altura (o voo do viewer vai aonde o usuário quiser), a folha de 80% de
   opacidade ficava **entre a câmera e o terreno** — de dia esbranquiçava a vista, de noite (cor quase
