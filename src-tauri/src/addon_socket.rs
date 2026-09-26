@@ -90,6 +90,13 @@ enum AddonMessage {
         #[serde(default)]
         pitch: f32,
     },
+    /// Hora do mundo em ticks (0..=23999) — 0 = nascer do sol, 6000 =
+    /// meio-dia, 12000 = pôr do sol, 18000 = meia-noite. O viewer usa pro
+    /// ciclo de dia/noite; o addon manda 1x/s (mesma cadência dos vitais) e
+    /// o app interpola entre as mensagens.
+    WorldTime {
+        day_time: u32,
+    },
     /// Skin do próprio jogador (PNG em base64) — ver `player_skin.rs`. O
     /// addon só manda quando a textura muda.
     PlayerSkin {
@@ -277,6 +284,11 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
                 *state.bot_pose.lock().unwrap() = Some(BotPose { x, y, z, yaw, pitch });
             }
+            AddonMessage::WorldTime { day_time } => {
+                // Normaliza por via das dúvidas (um valor fora de 0..24000
+                // viraria um ângulo de sol maluco, não um erro claro).
+                *state.world_time.lock().unwrap() = Some(day_time % 24_000);
+            }
             AddonMessage::PlayerSkin {
                 name,
                 model,
@@ -349,6 +361,9 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
     *state.vitals.lock().unwrap() = None;
     *state.bot_pos.lock().unwrap() = None;
     *state.bot_pose.lock().unwrap() = None;
+    // A hora do mundo também para de ser conhecida sem o jogo; o viewer
+    // congela na última hora real em vez de inventar um ciclo.
+    *state.world_time.lock().unwrap() = None;
     // A skin fica: é um dado real do jogador, e mantê-la evita o modelo
     // piscar de volta pro placeholder a cada reconexão.
 }

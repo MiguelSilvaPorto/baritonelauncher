@@ -220,6 +220,7 @@ public class BaritoneOrchestratorAddonClient {
                     food.getSaturationLevel(),
                     player.getArmorValue()
             ));
+            sendWorldTime();
         }
 
         // Progresso da instrução ativa na mesma cadência da posição (4x/s) —
@@ -229,6 +230,23 @@ public class BaritoneOrchestratorAddonClient {
             ticksSinceLastInstructionStatus = 0;
             tickActiveInstruction(baritone);
         }
+    }
+
+    /**
+     * Hora real do mundo (0..23999 ticks; 0 = nascer do sol, 6000 = meio-dia,
+     * 12000 = pôr do sol, 18000 = meia-noite) — o viewer usa pro ciclo de
+     * dia/noite. Usa o clock do overworld (`getOverworldClockTime`, o antigo
+     * "day time"): é o relógio que cicla de verdade, mesmo se o bot estiver
+     * numa dimensão de céu fixo. Mesma cadência dos vitais (1x/s): o app
+     * interpola entre as mensagens, então não precisa de uma linha por tick.
+     */
+    private static void sendWorldTime() {
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
+            return;
+        }
+        long dayTime = Math.floorMod(level.getOverworldClockTime(), 24000L);
+        send(String.format(Locale.ROOT, "{\"type\":\"world_time\",\"day_time\":%d}", dayTime));
     }
 
     /**
