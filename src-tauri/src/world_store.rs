@@ -25,9 +25,7 @@
 //! nada de um segundo esquema pra dessincronizar. `crossing_hints` (política
 //! aprendida de água/lava) ainda é volátil, e nada o popula hoje.
 
-use crate::world_cache::{
-    decode_voxels, encode_voxels, ChunkPos, ChunkSection, ChunkTints, WorldCache,
-};
+use crate::world_cache::{decode_voxels, ChunkPos, ChunkSection, ChunkTints, WorldCache};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -46,21 +44,32 @@ pub struct StoredWorld {
     /// Versão do Minecraft do último `hello` — `None` se o cache foi salvo
     /// antes de qualquer conexão.
     pub mc_version: Option<String>,
-    pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Option<ChunkTints>)>,
+    /// `(posição, seções, tints, payload)` — o payload é mantido porque é
+    /// exatamente o formato que o `Chunk` guarda em cache; reencodá-lo no
+    /// load (segundos num mundo grande, em debug) seria trabalho jogado fora.
+    pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Option<ChunkTints>, Vec<u8>)>,
 }
 
 impl StoredWorld {
     pub fn apply_to(self, world: &mut WorldCache) {
-        for (pos, sections, tints) in self.chunks {
-            world.apply_voxels(pos, sections, tints);
+        for (pos, sections, tints, payload) in self.chunks {
+            world.apply_voxels_with_payload(pos, sections, tints, payload);
         }
     }
 }
 
-/// Grava o cache inteiro. Chamado de forma periódica e no fechamento do app
-/// (ver `lib.rs`) — não é por chunk, de propósito: um backfill de reconexão
-/// aplica centenas de chunks de uma vez.
+/// Grava o cache inteiro comprimido — wrapper de `encode` + `write` (usado
+/// pelos testes e pelo fechamento do app).
 pub fn save(path: &Path, world: &WorldCache, mc_version: Option<&str>) -> Result<(), String> {
+    write(path, &encode(world, mc_version))
+}
+
+/// Serializa o cache **sem comprimir**: com os payloads já cacheados por
+/// chunk (`Chunk::encoded_payload`), isso é só memcpy/extend — a parte que
+/// precisa do lock do mundo. Comprimir/gravar (~0,5–1,3 s num mundo de
+/// ~20 MB, medido com o cache real) acontece em `write`, fora do lock (ver
+/// `lib.rs`, `encode_world_if_dirty`, e `docs/CHANGELOG.md`).
+pub fn encode(world: &WorldCache, mc_version: Option<&str>) -> Vec<u8> {
     let mut raw = Vec::with_capacity(1 << 20);
     raw.extend_from_slice(MAGIC);
     raw.push(FORMAT_VERSION);
@@ -73,15 +82,26 @@ pub fn save(path: &Path, world: &WorldCache, mc_version: Option<&str>) -> Result
 
     raw.extend_from_slice(&(world.chunks.len() as u32).to_le_bytes());
     for (pos, chunk) in &world.chunks {
-        let payload = encode_voxels(&chunk.sections, chunk.tints.as_ref());
+        let payload = chunk.encoded_payload();
         raw.extend_from_slice(&pos.x.to_le_bytes());
         raw.extend_from_slice(&pos.z.to_le_bytes());
         raw.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         raw.extend_from_slice(&payload);
     }
 
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&raw).map_err(|e| e.to_string())?;
+    raw
+}
+
+/// Comprime e grava de forma atômica (`tmp` + rename). É a parte cara: chamar
+/// **fora** do lock do mundo, de preferência numa thread de blocking.
+///
+/// Nível 1 (`fast`) de propósito: no cache real deste repositório (19,6 MB
+/// crus) o nível padrão levava ~1,3 s e o nível 1 leva ~0,46 s, por ~0,6 MB a
+/// mais no arquivo — num cache que é reescrito inteiro a cada gravação, CPU
+/// ganha de tamanho.
+pub fn write(path: &Path, raw: &[u8]) -> Result<(), String> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(raw).map_err(|e| e.to_string())?;
     let compressed = encoder.finish().map_err(|e| e.to_string())?;
 
     if let Some(parent) = path.parent() {
@@ -137,9 +157,15 @@ pub fn load(path: &Path) -> Result<Option<StoredWorld>, String> {
         if len > MAX_CHUNK_PAYLOAD {
             return Err(format!("payload de chunk grande demais: {len}"));
         }
-        let sections = decode_voxels(reader.take(len as usize)?)
+        let payload = reader.take(len as usize)?;
+        let decoded = decode_voxels(payload)
             .map_err(|err| format!("chunk ({x}, {z}) inválido: {err}"))?;
-        chunks.push((ChunkPos { x, z }, sections.sections, sections.tints));
+        chunks.push((
+            ChunkPos { x, z },
+            decoded.sections,
+            decoded.tints,
+            payload.to_vec(),
+        ));
     }
 
     Ok(Some(StoredWorld { mc_version, chunks }))
@@ -256,6 +282,30 @@ mod tests {
         let path = temp_path("corrupted");
         std::fs::write(&path, b"isso nao e zlib").expect("escrever lixo deveria funcionar");
         assert!(load(&path).is_err(), "lixo deveria ser rejeitado");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_keeps_the_file_payload_instead_of_re_encoding() {
+        // O payload guardado no arquivo é o mesmo que o chunk carrega em
+        // cache — o load não pode re-serializar (era segundos num mundo
+        // grande, ver docs/CHANGELOG.md).
+        let path = temp_path("payload");
+        let world = sample_world();
+        save(&path, &world, Some("26.3")).expect("gravação deveria funcionar");
+
+        let stored = load(&path).expect("leitura deveria funcionar").expect("cache deveria existir");
+        let mut restored = WorldCache::new();
+        stored.apply_to(&mut restored);
+        for (pos, chunk) in &world.chunks {
+            let key = ChunkPos { x: pos.x, z: pos.z };
+            assert_eq!(
+                restored.chunk_voxels_bytes(key),
+                chunk.encoded_payload(),
+                "payload do chunk {key:?} mudou no round-trip"
+            );
+        }
+
         let _ = std::fs::remove_file(&path);
     }
 }
