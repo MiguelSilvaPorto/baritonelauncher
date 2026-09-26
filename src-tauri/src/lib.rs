@@ -538,6 +538,22 @@ mod commands {
         crate::texture_atlas::build_or_load_atlas(&version)
     }
 
+    /// Texturas de entidade (PNG em data URL) que o viewer usa nos modelos de
+    /// mob — ver `texture_atlas.rs` e `entity_models.ts`. Lê só o jar local
+    /// (mesma regra do atlas de blocos); erro claro se o jar não existir.
+    #[tauri::command]
+    fn get_entity_textures(
+        state: State<AppState>,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let version = state
+            .mc_version
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "Ainda não sei a versão do Minecraft — conecte o addon primeiro.".to_string())?;
+        crate::texture_atlas::build_or_load_entity_textures(&version)
+    }
+
     /// Modelos de bloco reais (geometria não-cúbica: tocha, cogumelo,
     /// vitória-régia, escada, cerca...) assados do client jar local — payload
     /// binário, ver `block_models::encode_payload`. Mesma exigência do atlas:
@@ -769,6 +785,7 @@ mod commands {
             player_skin,
             nearby_mobs,
             get_texture_atlas,
+            get_entity_textures,
             get_block_models,
             settings_get,
             settings_set,

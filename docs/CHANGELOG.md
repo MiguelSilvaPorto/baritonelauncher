@@ -263,6 +263,18 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Modelos reais dos mobs no viewer 3D**: o viewer identificava cada mob só com um rótulo; agora ele
+  desenha o modelo de verdade da entidade, com a geometria e as animações portadas das classes de
+  modelo do próprio jogo (mesmas caixas, UVs, pivôs e contas de caminhada/cabeça/asas) e as texturas
+  extraídas do jar local do usuário — nada baixado da Mojang (`get_entity_textures`, mesma regra do
+  atlas de blocos). Cobertura: zumbi (+ afogado/husk e bebê), esqueleto (+ errante/wither/bogged),
+  creeper, aranha (+ aranha da caverna em escala 0.7), vaca (+ bebê e mooshroom), porco (+ bebê),
+  ovelha (com a camada de lã tingida pela cor real do `DyeColor`, e some quando tosquiada) e galinha
+  (+ bebê, modelo próprio do jogo). A pose vem do addon (yaw do corpo, pitch e yaw da cabeça
+  relativo, `is_baby`, cor da lã) e o viewer interpola tudo a cada frame, com ciclo de caminhada a
+  20 Hz calculado da posição — mob sem modelo (tipo fora da lista) continua identificado só pelo
+  rótulo, honestamente. Reportado pelo usuário ("quero que vc adicione a capacidade de renderizar os
+  mobs agora que é oque falta para ficar quase completo").
 - **Aba "Jogar" — o app abre o Minecraft direto, com seleção de mundo**: nova view na rail (ícone de
   play) que detecta a instalação do CurseForge (padrão `~/Documents/curseforge/minecraft`, com a pasta
   configurável na aba Config), lista as **instâncias** (nome, versão e modloader lidos do

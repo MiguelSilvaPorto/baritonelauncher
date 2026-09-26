@@ -150,8 +150,11 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   (`world_chunks_near`, anchored on the bot/last known position and on the camera target, which also
   covers browsing the cached world). The
   day/night cycle (`setWorldTime`/`updateDayNight`) follows the addon's real `world_time`, moving
-  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. The
-  world is cumulative (the `WorldCache` keeps everything on disk), but the viewer only keeps a
+  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. Mobs
+  (`setNearbyMobs`) get a real model from `entity_models.ts` when the kind is supported and the
+  entity textures loaded (`setEntityTextures`, one attempt like the atlas), placed/oriented by the
+  addon's pose and animated with the same 20 Hz walk cycle; the projected label stays on top and is
+  the honest fallback for kinds without a model. The world is cumulative (the `WorldCache` keeps everything on disk), but the viewer only keeps a
   **window** of it mounted: `sweepChunkWindow` runs a few times per second and, around the anchors
   (bot + camera target), hides meshes past `keepRadiusChunks` and drops meshes + decoded voxels past
   that plus `CHUNK_UNLOAD_MARGIN` (unloads remesh the kept neighbors, whose faces against the removed
@@ -191,6 +194,14 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   the game. Blocks with no baked model (plain cubes, missing jar, mods) stay on the cube path.
   `viewer3d.ts`'s `meshModel` emits those quads (atlas UVs, per-face tint, `cullface` culling, biome
   tints from `ChunkTints`).
+- **`src/entity_models.ts`** — the real mob models (`MobModel` + one `MobModelDef` per game model
+  class): `ModelPart.Cube`-style boxes (same UVs/winding/mirror as the game), parts with `PartPose`
+  pivots/rotations (Three rotation order `ZYX`, `(x, -y, -z)` — see the module comment) and the
+  `setupAnim` formulas ported per mob (walk cycle at 20 Hz, head yaw/pitch, spider leg swing, wings
+  at rest). `mobVisualSpec(kind, isBaby, hasWool)` maps a registry name (from `nearby_mobs`) to the
+  model + texture keys the `get_entity_textures` map uses; sheep get the wool layer as an overlay
+  tinted by the mob's real dye color. A kind without a def (or without its texture) has no model —
+  the viewer keeps the label only.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
@@ -202,9 +213,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
   `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
   `vitals_snapshot`, `bot_pose`, `world_time`, `player_skin`, `nearby_mobs`,
-  `get_texture_atlas`, `get_block_models`, `settings_get`, `settings_set`, `settings_reset`,
-  `minecraft_setup`, `minecraft_instances`, `minecraft_worlds`, `minecraft_launch_preview`,
-  `minecraft_launch`, `minecraft_game_status`. Spawns
+  `get_texture_atlas`, `get_entity_textures`, `get_block_models`, `settings_get`, `settings_set`,
+  `settings_reset`, `minecraft_setup`, `minecraft_instances`, `minecraft_worlds`,
+  `minecraft_launch_preview`, `minecraft_launch`, `minecraft_game_status`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also opens the persisted world
@@ -217,7 +228,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `AppState.bot_pose` — feet coordinates plus yaw/pitch), `world_time` (the overworld clock in
   ticks → the viewer's day/night cycle), `player_skin` (the player's own skin as a base64 PNG, sent
   whenever the texture changes → `player_skin.rs`), `entities` (snapshot of the living mobs within
-  32 blocks, ~4x/s, category/name/health/distance per entity → `mobs.rs`),
+  32 blocks, ~4x/s, category/name/health/distance/height plus the pose the viewer needs to draw the
+  real model — body yaw, head pitch/yaw, `is_baby`, and `tint` for the sheep's wool color → `mobs.rs`),
   `chunk_voxels` (full chunk, palette + indices per section, **plus per-column biome tints** —
   grass/foliage/water colors the addon resolves with the client's own `BiomeColors`, payload v5),
   and each palette entry also carries the **blockstate props** (`facing=north,half=top,...`) that
@@ -282,7 +294,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   for blocks with no matching texture. It also extracts `textures/environment/clouds.png` as
   `cloud_data_url` (same local-jar-only rule), which the viewer turns into the cloud layer; the PNG
   gets its own small cache file (`clouds_<version>.png`) so cached atlases from before this feature
-  don't need a rebuild. Has a real integration test (`cargo test texture_atlas`) that
+  don't need a rebuild. Also extracts the entity textures (`textures/entity/<mob>/…`, one cache file
+  per version, `build_or_load_entity_textures`) that `entity_models.ts` draws the mob models with —
+  same local-jar-only rule, never Mojang's CDN. Has a real integration test (`cargo test texture_atlas`) that
   runs against whatever local jar exists, skipping itself (not failing) if none is found — keep that
   skip behavior if you touch this file, other environments won't have the jar.
 - `storage_index.rs` — `StorageIndex` (chest position → contents) and `aggregated_totals()`.
@@ -340,11 +354,17 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   the addon's `IBuilderProcess` executor; `FetchFromChest`/`Craft`/`Smelt` still have no executor in the
   addon, and the UI composer only creates the `travel_to`/`explore` kinds.
 - **No `SurvivalProcess`/threat *reaction* or `ContainerScreen` simulation in the addon** — the mob
-  scan exists (the addon streams `entities` and the viewer identifies each mob with a label), but
-  nothing fights, flees or raises a shield; the rest is still only described in `docs/SPEC.md`.
-- **Mobs are identified, not modeled.** The viewer draws a projected label (real game name, category,
-  distance, health) per mob — there is no entity-model/UV/animation pipeline for mob types (the
-  atlas only covers block textures).
+  scan exists (the addon streams `entities`, the viewer draws the supported models and labels the
+  rest), but nothing fights, flees or raises a shield; the rest is still only described in
+  `docs/SPEC.md`.
+- **Mob models cover the common overworld kinds; the rest stay labels.** The viewer draws real
+  entity models (`entity_models.ts`) for zombie (drowned/husk and baby included), skeleton (stray/
+  wither/bogged), creeper, spider (cave spider at 0.7), cow (baby, mooshroom), pig (baby), sheep
+  (with the wool layer tinted by the real dye color, gone when sheared) and chicken (baby) — geometry
+  and animations ported from the game's own model classes, textures from the local jar. Anything
+  else (villagers, fish, horses, bosses...) keeps the projected label only. There is no equipment/
+  held-item layer, no death/hurt animation, and cold/warm animal variants render as the temperate
+  texture; block entities still don't exist.
 - **Clouds are fixed overworld height, with the viewer's fog.** The pattern, the 192.33 height, the
   12×12×4 cells, the per-face shading, the 0.6 block/s drift and the day/night color multiplier
   (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`) are the game's, but the height is always the
