@@ -226,8 +226,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   already has (its texture cache for downloaded skins, or the installed resource pack/jar for the
   default one) — **never** fetched from Mojang's CDN, same rule as `texture_atlas.rs`.
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
-  + indices per 16×16×16 section, plus per-column biome tints since payload v3 and each entry's
-  **blockstate props** since v4 — see `ChunkTints`/`PaletteEntry::props`).
+  + indices per 16×16×16 section, plus per-column biome tints since payload v3, per-section light
+  since v4 and each entry's **blockstate props** since v5 — see
+  `ChunkTints`/`PaletteEntry::props`).
   Also `CrossingStrategy` for the learned water/lava crossing policy.
 - **`block_models.rs`** — bakes real block geometry from the **local client jar**:
   `blockstates/*.json` + `models/block/*.json` (parent chains, texture variables, element/quadrant
@@ -240,7 +241,7 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   version header and atomic writes (`tmp` + rename). Loaded in `setup()`; saved every 5s only when
   `AppState.world_revision` changed (bumped by `addon_socket` per chunk) and once on
   `RunEvent::Exit`. Reuses `encode_voxels`/`decode_voxels` — one binary format for socket, IPC and
-  disk (`FORMAT_VERSION` 2 = the v4 voxel payload with blockstate props; an older file is rejected at
+  disk (`FORMAT_VERSION` 2 = the v5 voxel payload with blockstate props; an older file is rejected at
   the header and the app just starts with an empty cache). `crossing_hints` are **not** persisted yet.
 - **`settings.rs`** — user preferences (Config tab) as pretty JSON in `settings.json`, in the same
   app data dir as `world.cache`, written atomically (`tmp` + rename) on every change. Plain JSON is
