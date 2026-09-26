@@ -15,11 +15,12 @@ quê, quando e em que ordem. Ver [`docs/SPEC.md`](docs/SPEC.md) para a especific
 arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mudanças.
 
 > **Status: ponta a ponta funcionando, escopo mínimo.** A shell do app, os modelos de dados Rust, a
-> identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app) e um
-> **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, chunks explorados e o bot posicionados
-> por coordenadas reais do jogo) estão implementados e testados manualmente. Blocos texturizados
-> dentro dos chunks, baús e a fila puxando `#build`/`#mine` de verdade ainda não existem — ver "O que
-> falta" abaixo.
+> identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app, nos
+> dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
+> chunks explorados e o **jogador com o modelo e a skin reais do jogo** em coordenadas reais) e a
+> **fila executando `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) estão
+> implementados e testados manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não
+> existem — ver "O que falta" abaixo.
 
 ## Arquitetura
 
@@ -34,7 +35,8 @@ Addon Java (mod-addon/ — NeoForge, real)                    App Rust/Tauri (es
 └─ reporta posição/progresso/vitais ────────────┐            └─ Vitais/ameaças (src-tauri/src/vitals.rs)
                                                  ↓
                          socket TCP local 127.0.0.1:31173 (src-tauri/src/addon_socket.rs)
-                         manda vitais, posição e presença de chunk — baú/fila ainda não trafegam
+                         manda vitais, posição + rotação, skin do jogador e o chunk em voxels;
+                         recebe instruções/cancelamento — baú ainda não trafega
 ```
 
 ## Identidade visual
@@ -72,19 +74,19 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 
 ## O que falta (honesto, sem maquiar)
 
-- **Dados de bloco dentro do chunk, baús e instruções pelo socket** — `addon_socket.rs` já recebe
-  `vitals`/`position`/`chunk_loaded`, mas `chunk_loaded` só marca presença (nenhum bloco dentro) e
-  `StorageIndex`/fila continuam vazios mesmo com o addon conectado.
+- **Baús e instruções além de `travel_to`/`explore`** — o addon já manda o chunk inteiro
+  (`chunk_voxels`) e a fila já executa de verdade pelo canal reverso (o app manda `instruction`/
+  `cancel` e recebe `instruction_status` com status e progresso); `StorageIndex` continua vazio (sem
+  leitura de baú/`ContainerScreen`) e `Mine`/`Build`/`Craft`/`Smelt` ainda não têm executor no addon.
 - **`SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen`** no addon — só descrito em
   `docs/SPEC.md`, sem código ainda.
-- **Terreno de verdade com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
-  (`src/viewer3d.ts`, Three.js/WebGL) já renderiza os chunks explorados e o bot em coordenadas reais
-  numa cena orbitável de verdade, e já texturiza cada placa com uma textura real extraída do jar local
-  (`src-tauri/src/texture_atlas.rs`) — mas hoje é sempre a mesma textura representante
-  (`dirt`), não o bloco real de cada chunk, porque o addon ainda só manda presença de chunk,
-  não conteúdo. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio webview
-  do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela separada sem
-  conseguir validar visualmente.)
+- **Terreno real com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
+  (`src/viewer3d.ts`, Three.js/WebGL) renderiza os voxels reais do `chunk_voxels` em coordenadas
+  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`); o que
+  falta é blockstate (escada/eixo de tora/slab) e tint real por bioma — hoje todo bloco é um cubo com
+  tint fixo aproximado. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio
+  webview do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela
+  separada sem conseguir validar visualmente.)
 - **Ingestão do `minecraft-data`** (itens/blocos/receitas) — os structs Rust (`Item`, `Block`,
   `Recipe`, `IngredientRef`) já existem em `src-tauri/src/items.rs`, incluindo a função
   `fits_inventory_2x2`, mas nada os popula ainda. (Diferente do atlas de texturas, que já lê o jar

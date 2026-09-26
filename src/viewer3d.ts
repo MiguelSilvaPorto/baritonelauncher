@@ -14,22 +14,25 @@ import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
  * skin real do jogador mandada pelo addon — não um marcador genérico. Ver
  * `docs/CHANGELOG.md`, "Renderizador do jogador".
  *
- * Escopo honesto: o addon manda o bloco de *superfície* de cada coluna
- * (primeiro bloco sólido de cima pra baixo — ver `addon_socket.rs`,
- * `chunk_surface`), não o mundo inteiro em voxel. Cada coluna vira um único
- * bloquinho na altura real, com a textura real resolvida do jar local. Não
- * tem o que tem embaixo (cavernas, minérios) nem o pipeline completo de
- * blockstate→model→face (`docs/SPEC.md`, "Blocos 3D") — a textura usada é
- * uma resolução heurística por face (`{bloco}_top` em cima, `{bloco}_side`
- * nos 4 lados, `{bloco}_bottom` embaixo), não o modelo real. Texturas que o
- * jogo colore em runtime (folha, videira, água...) levam um tint fixo
- * aproximado — ver `BLOCK_TINTS`/`TEXTURE_ALIASES`.
+ * Escopo honesto: o addon manda o chunk inteiro em voxels (paleta + índices
+ * 16×16×16, ver `world_cache.rs`), então cada bloco vira só as faces expostas
+ * (face culling de verdade, inclusive entre chunks vizinhos já carregados) —
+ * não o pipeline completo de blockstate→model→face (`docs/SPEC.md`, "Blocos
+ * 3D"): blocos não-cúbicos (escada, cerca, tocha...) ainda aparecem como
+ * cubo cheio, e propriedades de blockstate além do nível de fluido não
+ * trafegam.
+ *
+ * Água e lava são tratadas à parte, como no jogo: a superfície fica na altura
+ * do nível (`(8 − nível) / 9`, fonte/caindo = 8/9), faces entre o mesmo
+ * fluido somem (nada de grade de cubos d'água), o fluido é translúcido e a
+ * textura animada (`water_still`/`water_flow`, frames extraídos do jar em
+ * `texture_atlas.rs`) gira conforme o sentido da correnteza calculado dos
+ * vizinhos.
  */
 
-const BLOCK_TEXTURE_PX = 16; // resolução nativa das texturas de bloco do Minecraft
+const BLOCK_TEXTURE_PX = 16; // resolução dos tiles do atlas (frames 32×32 são reduzidos lá)
 const COLOR_BG = 0x0a0c0f;
 const COLOR_TEAL = 0x5eead4;
-const COLOR_UNKNOWN_BLOCK = 0x3a3f47; // bloco sem textura resolvida no atlas
 
 // Movimento por teclado ("voo" pela cena): o OrbitControls sozinho só responde
 // ao mouse, então qualquer deslocamento exigia arrastar/orbitar — e o alvo da
@@ -95,13 +98,11 @@ const BLOCK_TINTS: Record<string, number> = {
   lily_pad: GRASS_TINT, // o jogo usa a cor de grama no lírio
   spruce_leaves: 0x619961, // cor fixa no jogo, não vem do bioma
   birch_leaves: 0x80a755,
-  water: WATER_TINT,
 };
 
 /** Blocos cujo nome não bate com o nome da textura no jar: água/lava/fogo
- * são animados (`water_still`, `fire_0`) e o atlas usa o primeiro frame como
- * estático — ver `texture_atlas.rs`. Sem isso, esses blocos nem textura
- * tinham (caíam no cinza de fallback). */
+ * são animados (`water_still`, `fire_0`) e o atlas guarda todos os frames,
+ * com o nome puro apontando pro frame 0 — ver `texture_atlas.rs`. */
 const TEXTURE_ALIASES: Record<string, string> = {
   water: "water_still",
   lava: "lava_still",
@@ -122,22 +123,20 @@ const BOTTOM_TEX_OVERRIDE: Record<string, string> = {
   podzol: "dirt",
 };
 
-/** Capacidade inicial de um lote instanciado (dobra quando enche — ver
- * `growBatch`). Começa pequena porque a maioria dos tipos de bloco tem poucas
- * colunas; os tipos comuns crescem sozinhos até o tamanho real. */
-const BATCH_INITIAL_CAPACITY = 256;
+// Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
+const VOXEL_FORMAT_VERSION = 2;
+const VOXEL_FLAG_RENDER = 1;
+const VOXEL_FLAG_OCCLUDES = 2;
+const VOXEL_FLAG_FLUID = 4;
 
-/** Um lote de blocos do mesmo tipo: uma geometria, um material por face e N
- * matrizes de instância, tudo num `InstancedMesh` só. A versão anterior
- * criava um `Mesh` por coluna — com o material por face, isso dava 6 draw
- * calls por bloco e milhares por frame, afundando o render pra 2–5 fps
- * (relatado pelo usuário). Aqui o custo por frame vira ~6 draw calls por
- * tipo de bloco usado no mundo, independente de quantos blocos existem. */
-interface BlockBatch {
-  block: string;
-  mesh: THREE.InstancedMesh;
-  capacity: number;
-}
+/** Duração de cada frame das texturas animadas de fluido, em ms. O jogo lê
+ * isso do `.mcmeta` de cada textura; aqui é fixo (aproximação honesta, ver
+ * "Known gaps" no README). */
+const FLUID_FRAME_MS = 120;
+
+/** Quantos chunks o viewer pede por tick de polling (ver `main.ts`). Meshing
+ * é CPU na thread principal; pedir o backfill inteiro de uma vez travaria. */
+export const CHUNKS_PER_REFRESH = 4;
 
 export interface BotPos {
   x: number;
@@ -154,11 +153,9 @@ export interface BotPose {
   pitch: number;
 }
 
-export interface ColumnBlock {
+export interface ChunkPos {
   x: number;
-  y: number;
   z: number;
-  block: string;
 }
 
 export interface UvRect {
@@ -166,6 +163,166 @@ export interface UvRect {
   v0: number;
   u1: number;
   v1: number;
+}
+
+interface PaletteEntry {
+  block: string;
+  flags: number;
+  /** Nível do fluido (blockstate vanilla): 0 = fonte, 1..7 = fluindo,
+   * >= 8 = caindo. Fora de fluidos é sempre 0. */
+  level: number;
+}
+
+interface DecodedSection {
+  y: number;
+  palette: PaletteEntry[];
+  indices: Uint16Array;
+}
+
+interface DecodedChunk {
+  x: number;
+  z: number;
+  /** Seção Y (mundo / 16) → seção; ausente = ar. */
+  sections: Map<number, DecodedSection>;
+}
+
+/** Uma face do cubo, na ordem dos vértices em sentido anti-horário visto de
+ * fora (winding do Three.js), com os eixos de textura da face: `uDir` é pra
+ * onde o U cresce e `vDir` pra onde o V cresce (textura "desce", v=1 embaixo). */
+interface FaceDef {
+  kind: BlockFace;
+  dir: readonly [number, number, number];
+  corners: readonly (readonly [number, number, number])[];
+  uv: readonly (readonly [number, number])[];
+  uDir: readonly [number, number, number];
+  vDir: readonly [number, number, number];
+}
+
+const FACES: readonly FaceDef[] = [
+  {
+    kind: "side",
+    dir: [1, 0, 0],
+    corners: [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]],
+    uv: [[1, 1], [0, 1], [0, 0], [1, 0]],
+    uDir: [0, 0, 1],
+    vDir: [0, -1, 0],
+  },
+  {
+    kind: "side",
+    dir: [-1, 0, 0],
+    corners: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+    uv: [[1, 1], [0, 1], [0, 0], [1, 0]],
+    uDir: [0, 0, -1],
+    vDir: [0, -1, 0],
+  },
+  {
+    kind: "top",
+    dir: [0, 1, 0],
+    corners: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
+    uv: [[0, 0], [0, 1], [1, 1], [1, 0]],
+    uDir: [1, 0, 0],
+    vDir: [0, 0, 1],
+  },
+  {
+    kind: "bottom",
+    dir: [0, -1, 0],
+    corners: [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+    uv: [[0, 0], [1, 0], [1, 1], [0, 1]],
+    uDir: [1, 0, 0],
+    vDir: [0, 0, 1],
+  },
+  {
+    kind: "side",
+    dir: [0, 0, 1],
+    corners: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+    uv: [[1, 1], [0, 1], [0, 0], [1, 0]],
+    uDir: [-1, 0, 0],
+    vDir: [0, -1, 0],
+  },
+  {
+    kind: "side",
+    dir: [0, 0, -1],
+    corners: [[1, 0, 0], [0, 0, 0], [0, 1, 0], [1, 1, 0]],
+    uv: [[1, 1], [0, 1], [0, 0], [1, 0]],
+    uDir: [1, 0, 0],
+    vDir: [0, -1, 0],
+  },
+];
+
+const HORIZONTAL_NEIGHBORS: readonly (readonly [number, number])[] = [
+  [1, 0],
+  [-1, 0],
+  [0, 1],
+  [0, -1],
+];
+
+const AIR: PaletteEntry = { block: "air", flags: 0, level: 0 };
+const DOWN = new THREE.Vector3(0, -1, 0);
+const ZERO = new THREE.Vector3(0, 0, 0);
+
+/** Altura da superfície do fluido dentro do bloco — a mesma conta do
+ * `PaletteEntry::fluid_height` no Rust e do `WaterFluid#getHeight` do jogo. */
+function fluidHeight(level: number): number {
+  const clamped = Math.min(Math.max(level, 0), 8);
+  const surface = clamped === 0 || clamped === 8 ? 8 : 8 - clamped;
+  return surface / 9;
+}
+
+/** Buffers de um bucket de geometria enquanto o chunk é montado. */
+interface MeshBuffers {
+  positions: number[];
+  normals: number[];
+  uvs: number[];
+  colors: number[];
+  indices: number[];
+}
+
+function byteReader(bytes: Uint8Array) {
+  let pos = 0;
+  const take = (n: number) => {
+    if (pos + n > bytes.length) throw new Error(`payload truncado no byte ${pos}`);
+    const slice = bytes.subarray(pos, pos + n);
+    pos += n;
+    return slice;
+  };
+  return {
+    u8: () => take(1)[0],
+    i8: () => (take(1)[0] << 24) >> 24,
+    u16: () => {
+      const b = take(2);
+      return b[0] | (b[1] << 8);
+    },
+    utf8: (n: number) => new TextDecoder().decode(take(n)),
+    done: () => pos,
+  };
+}
+
+/** Decodifica o payload de `chunk_voxels` (formato 2, ver `world_cache.rs`). */
+function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
+  const reader = byteReader(bytes);
+  const version = reader.u8();
+  if (version !== VOXEL_FORMAT_VERSION) {
+    throw new Error(`versão de payload desconhecida: ${version}`);
+  }
+  const sectionCount = reader.u8();
+  const sections = new Map<number, DecodedSection>();
+  for (let i = 0; i < sectionCount; i++) {
+    const y = reader.i8();
+    const paletteLen = reader.u16();
+    if (paletteLen === 0) throw new Error("paleta vazia");
+    const palette: PaletteEntry[] = [];
+    for (let p = 0; p < paletteLen; p++) {
+      const nameLen = reader.u16();
+      const block = reader.utf8(nameLen);
+      const flags = reader.u8();
+      const level = reader.u8();
+      palette.push({ block, flags, level });
+    }
+    const indices = new Uint16Array(4096);
+    for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
+    sections.set(y, { y, palette, indices });
+  }
+  return { x, z, sections };
 }
 
 export class Viewer3D {
@@ -176,19 +333,10 @@ export class Viewer3D {
   private container: HTMLElement;
   private fog: THREE.Fog;
 
-  /** Lotes instanciados por tipo de bloco — ver `setColumns`/`BlockBatch`. */
-  private batches = new Map<string, BlockBatch>();
-  /** Chaves (x,z) já renderizadas — o polling manda a lista completa toda
-   * vez, então é este dedupe que evita re-adicionar o mundo a cada segundo. */
-  private columnKeys = new Set<number>();
-  /** Matriz reutilizada ao escrever/copiar posições de instância. */
-  private readonly scratchMatrix = new THREE.Matrix4();
-  // 1×1×1 de verdade, não 0.98: com um cubo menor que 1 sobra um vão de 2%
-  // entre blocos vizinhos, e como só existe a camada de superfície (nada
-  // embaixo), esse vão deixava ver o fundo escuro da cena — a grade preta
-  // entre blocos que o usuário reportou. No jogo blocos encostam; a textura
-  // de cada cubo é que dá o limite visual, sem precisar de vão.
-  private blockGeometry = new THREE.BoxGeometry(1, 1, 1); // compartilhada por todo bloco
+  /** Chunks decodificados (voxels crus), chave = `chunkKey`. */
+  private chunks = new Map<number, DecodedChunk>();
+  /** Malhas de um chunk, uma por bucket de material — ver `buildChunkMesh`. */
+  private chunkMeshes = new Map<number, THREE.Mesh[]>();
   private botMarker: THREE.Group;
   /** Modelo do jogador dentro de `botMarker` — ver `player_model.ts`. */
   private playerModel = new MinecraftPlayerModel();
@@ -210,16 +358,24 @@ export class Viewer3D {
 
   private atlasLoading = false;
   private atlasImage: HTMLImageElement | null = null;
+  private atlasTexture: THREE.Texture | null = null;
   private atlasUvByName: Record<string, UvRect> | null = null;
   /** Uma textura recortada (16×16px) por nome exato de textura do atlas (ex:
-   * "grass_block_top", "grass_block_side") — evita recriar canvas/textura pro
-   * mesmo tile a cada coluna nova. `null` = atlas carregado mas sem essa
-   * textura. Enquanto o atlas não carregou nada é cacheado — ver
-   * `getTileTexture`. */
+   * "grass_block_top", "water_still_f3") — evita recriar canvas/textura pro
+   * mesmo tile. `null` = atlas carregado mas sem essa textura. Enquanto o
+   * atlas não carregou nada é cacheado — ver `getTileTexture`. */
   private tileTextureCache = new Map<string, THREE.Texture | null>();
-  /** Materiais prontos por nome de bloco, na ordem dos 6 grupos do
-   * `BoxGeometry` (+X, −X, +Y, −Y, +Z, −Z) — ver `resolveMaterials`. */
-  private materialCache = new Map<string, THREE.Material[]>();
+  /** Material do terreno opaco: um só pra tudo, com UV apontando pro tile
+   * certo do atlas por face e cor por vértice (tint). */
+  private opaqueMaterial: THREE.MeshStandardMaterial | null = null;
+  /** Material por bucket de fluido (`water_still`, `water_flow`,
+   * `lava_still`, `lava_flow`). */
+  private bucketMaterials = new Map<string, THREE.MeshStandardMaterial>();
+  /** Materiais com textura animada + seus frames, pra trocar o `map`. */
+  private animatedMaterials: { material: THREE.MeshStandardMaterial; frames: THREE.Texture[] }[] = [];
+  private animationFrame = 0;
+  private lastAnimationMs = 0;
+  private readonly scratchColor = new THREE.Color();
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement) {
     this.container = container;
@@ -298,9 +454,8 @@ export class Viewer3D {
   }
 
   /** Chave numérica (x,z): o mundo do Minecraft cabe em |x|,|z| < 30M, então
-   * `x * 30M + z` é única — e, diferente do `${x},${z}` de antes, não aloca
-   * uma string por coluna a cada tick do polling. */
-  private columnKey(x: number, z: number): number {
+   * `x * 30M + z` é única e não aloca string por chunk no polling. */
+  private chunkKey(x: number, z: number): number {
     return x * 30_000_000 + z;
   }
 
@@ -312,28 +467,39 @@ export class Viewer3D {
     return this.atlasLoading;
   }
 
+  /** `true` se o chunk já foi recebido (mesmo antes do atlas carregar — os
+   * dados ficam guardados e a malha é montada quando o atlas chega). */
+  hasChunk(x: number, z: number): boolean {
+    return this.chunks.has(this.chunkKey(x, z));
+  }
+
   /** Recebe o atlas já extraído/empacotado pelo lado Rust (data URL + mapa
    * de UV) e guarda a imagem crua + o mapa de UV. Chamado uma vez, quando o
    * comando `get_texture_atlas` resolve — ver `main.ts`.
    *
    * Isso é assíncrono, mas o backfill de reconexão pode mandar dezenas de
-   * `chunk_surface` (centenas de colunas) antes do atlas terminar de
-   * carregar — mesmo problema que já apareceu com a placa por chunk (ver
-   * `docs/CHANGELOG.md`). `resolveMaterials`/`getTileTexture` não cacheiam
-   * nada enquanto o atlas não carregou, então nenhuma coluna fica presa
-   * num material errado — só precisa retrofitar as que já foram criadas. */
+   * chunks antes do atlas terminar de carregar; os voxels ficam guardados e
+   * só viram malha aqui, com as texturas prontas. */
   setAtlas(dataUrl: string, textures: Record<string, UvRect>) {
     this.atlasLoading = true;
     new THREE.TextureLoader().load(
       dataUrl,
-      (atlasImageTexture) => {
-        this.atlasImage = atlasImageTexture.image;
+      (texture) => {
+        // `flipY = false`: os rects de UV do Rust usam a origem no topo da
+        // imagem (igual ao canvas), e é assim que o mapa é montado aqui.
+        texture.flipY = false;
+        texture.magFilter = THREE.NearestFilter;
+        texture.minFilter = THREE.NearestFilter;
+        texture.generateMipmaps = false;
+        texture.colorSpace = THREE.SRGBColorSpace;
+        texture.needsUpdate = true;
+
+        this.atlasImage = texture.image;
+        this.atlasTexture = texture;
         this.atlasUvByName = textures;
         this.atlasLoading = false;
-
-        for (const batch of this.batches.values()) {
-          batch.mesh.material = this.resolveMaterials(batch.block);
-        }
+        this.buildMaterials();
+        this.rebuildAllMeshes();
       },
       undefined,
       (err) => {
@@ -344,10 +510,7 @@ export class Viewer3D {
   }
 
   /** Recorta um único tile (16×16px) do atlas pro nome de textura exato
-   * (ex: "grass_block_top") e devolve uma textura própria, sem repetição —
-   * cada bloco aqui é um cubo de 1×1×1 (um bloco de verdade), não uma placa
-   * de 16 blocos, então não precisa de `RepeatWrapping` como a versão
-   * anterior (essa foi a causa do borrão: 1 tile esticado sobre 16 blocos). */
+   * (ex: "grass_block_top", "water_flow_f7") e devolve uma textura própria. */
   private buildTileTexture(rect: UvRect): THREE.Texture {
     const sourceImage = this.atlasImage!;
     const canvas = document.createElement("canvas");
@@ -368,33 +531,14 @@ export class Viewer3D {
     );
 
     const texture = new THREE.CanvasTexture(canvas);
+    // Mesma convenção do atlas (ver `setAtlas`): V=0 é o topo da imagem, que
+    // é como a tabela de UVs das faces foi montada.
+    texture.flipY = false;
     texture.magFilter = THREE.NearestFilter;
     texture.minFilter = THREE.NearestFilter;
     texture.generateMipmaps = false;
     texture.colorSpace = THREE.SRGBColorSpace;
     return texture;
-  }
-
-  /** Nome da textura no atlas pra uma face do bloco, como no jogo: topo usa
-   * `"{bloco}_top"` (ex: grass_block_top, oak_log_top) e os 4 lados usam
-   * `"{bloco}_side"` (ex: grass_block_side). A maioria dos blocos não tem
-   * essas variantes e cai no `"{bloco}"` puro (stone, dirt, sand...). Isso é
-   * uma heurística, não o pipeline blockstate→model→face do spec ("Blocos
-   * 3D"), mas cobre o caso comum com os nomes reais do jar. */
-  private faceTextureName(blockName: string, face: BlockFace): string | null {
-    const atlas = this.atlasUvByName;
-    if (!atlas) return null; // atlas ainda não carregou
-    // Fluido/animado tem nome de textura próprio — ver TEXTURE_ALIASES.
-    const alias = TEXTURE_ALIASES[blockName];
-    if (alias) return atlas[alias] ? alias : null;
-    const base = face === "bottom" ? BOTTOM_TEX_OVERRIDE[blockName] ?? blockName : blockName;
-    const candidates =
-      face === "top"
-        ? [`${base}_top`, base]
-        : face === "side"
-          ? [`${base}_side`, base]
-          : [`${base}_bottom`, base];
-    return candidates.find((name) => atlas[name]) ?? null;
   }
 
   private getTileTexture(textureName: string): THREE.Texture | null {
@@ -409,110 +553,327 @@ export class Viewer3D {
     return texture;
   }
 
-  private faceMaterial(blockName: string, face: BlockFace): THREE.MeshStandardMaterial {
-    const textureName = this.faceTextureName(blockName, face);
-    const texture = textureName ? this.getTileTexture(textureName) : null;
-    if (!texture) {
-      return new THREE.MeshStandardMaterial({ color: COLOR_UNKNOWN_BLOCK, roughness: 0.95 });
+  /** Rect do atlas pra uma face do bloco, como no jogo: topo usa
+   * `"{bloco}_top"` (ex: grass_block_top, oak_log_top), os 4 lados usam
+   * `"{bloco}_side"` e o fundo `"{bloco}_bottom"` — com fallback pro nome
+   * puro quando a variante não existe (stone, dirt, sand...). Heurística,
+   * não o pipeline blockstate→model→face do spec ("Blocos 3D"). */
+  private faceRect(blockName: string, face: BlockFace): UvRect | null {
+    const atlas = this.atlasUvByName;
+    if (!atlas) return null;
+    const base = face === "bottom" ? BOTTOM_TEX_OVERRIDE[blockName] ?? blockName : blockName;
+    const candidates =
+      face === "top"
+        ? [`${base}_top`, base]
+        : face === "side"
+          ? [`${base}_side`, base]
+          : [`${base}_bottom`, base];
+    for (const name of candidates) {
+      const rect = atlas[name] ?? atlas[TEXTURE_ALIASES[name]];
+      if (rect) return rect;
     }
-    return new THREE.MeshStandardMaterial({ map: texture, roughness: 0.95, color: this.tintFor(blockName, face) });
+    return atlas["dirt"] ?? Object.values(atlas)[0] ?? null;
   }
 
-  /** Cor multiplicada da textura — o "tint" do jogo (ver `BLOCK_TINTS` e
-   * `GRASS_TINT`). Grama tinge só o topo, porque o lado já vem com a franja
-   * verde impressa no jar; folhas/videira/água tingem as 6 faces. */
-  private tintFor(blockName: string, face: BlockFace): number {
+  /** Tint por vértice: só o topo da grama e as folhagens que vêm cinza no
+   * jar; o resto é branco (textura já colorida). */
+  private faceTint(blockName: string, face: BlockFace): number {
     if (blockName === "grass_block") return face === "top" ? GRASS_TINT : 0xffffff;
     return BLOCK_TINTS[blockName] ?? 0xffffff;
   }
 
-  /** Um material por face do cubo, na ordem dos 6 grupos do `BoxGeometry`
-   * (+X, −X, +Y, −Y, +Z, −Z): topo e fundo com textura própria, os 4 lados
-   * compartilhando a mesma — igual ao modelo do jogo. Blocos sem variantes
-   * (`_top`/`_side`/`_bottom`) usam a textura única nos 6 lados. */
-  private resolveMaterials(blockName: string): THREE.Material[] {
-    const cached = this.materialCache.get(blockName);
-    if (cached) return cached;
-
-    const top = this.faceMaterial(blockName, "top");
-    const side = this.faceMaterial(blockName, "side");
-    const bottom = this.faceMaterial(blockName, "bottom");
-    const materials = [side, side, top, bottom, side, side];
-    // Só cacheia depois que o atlas carregou — antes disso o resultado é só
-    // o fallback cinza, e cachear isso deixaria o bloco preso nele pra
-    // sempre mesmo depois do atlas ficar pronto.
-    if (this.atlasUvByName) this.materialCache.set(blockName, materials);
-    return materials;
+  private buildMaterials() {
+    if (!this.atlasTexture) return;
+    this.animatedMaterials = [];
+    this.bucketMaterials.clear();
+    this.opaqueMaterial = new THREE.MeshStandardMaterial({
+      map: this.atlasTexture,
+      vertexColors: true,
+      roughness: 0.95,
+      metalness: 0,
+    });
+    this.bucketMaterials.set("opaque", this.opaqueMaterial);
+    this.bucketMaterials.set("water_still", this.buildFluidMaterial("water", "still"));
+    this.bucketMaterials.set("water_flow", this.buildFluidMaterial("water", "flow"));
+    this.bucketMaterials.set("lava_still", this.buildFluidMaterial("lava", "still"));
+    this.bucketMaterials.set("lava_flow", this.buildFluidMaterial("lava", "flow"));
   }
 
-  /** Colunas só são adicionadas, nunca removidas/atualizadas — mesma
-   * semântica cumulativa de `WorldCache` (ver `addon_socket.rs`): é o
-   * "já visto", não uma janela ao vivo do que existe agora no jogo. Cada
-   * coluna vira um único bloco de 1×1×1 na altura real reportada pelo
-   * addon (superfície — não tem o que tem embaixo, ver `chunk_surface`).
-   *
-   * Renderização: cada coluna só escreve uma matriz de instância no lote do
-   * seu tipo de bloco (um draw call por face e por tipo, não por bloco). */
-  setColumns(columns: ColumnBlock[]) {
-    const touched = new Set<BlockBatch>();
-    for (const col of columns) {
-      const key = this.columnKey(col.x, col.z);
-      if (this.columnKeys.has(key)) continue;
-      this.columnKeys.add(key);
+  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshStandardMaterial {
+    const frames = this.loadFrames(`${kind}_${phase}`);
+    const water = kind === "water";
+    const material = new THREE.MeshStandardMaterial({
+      map: frames[0] ?? null,
+      color: water ? WATER_TINT : 0xffffff,
+      roughness: water ? 0.35 : 0.6,
+      metalness: 0,
+      // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
+      // opaca e emite luz.
+      transparent: water,
+      opacity: water ? 0.72 : 1,
+      depthWrite: !water,
+      side: THREE.DoubleSide,
+      emissive: water ? 0x000000 : 0x8a3b0c,
+      emissiveIntensity: water ? 0 : 0.55,
+    });
+    if (frames.length > 1) this.animatedMaterials.push({ material, frames });
+    return material;
+  }
 
-      const batch = this.batchFor(col.block);
-      if (batch.mesh.count >= batch.capacity) this.growBatch(batch);
-      this.scratchMatrix.makeTranslation(col.x + 0.5, col.y + 0.5, col.z + 0.5);
-      batch.mesh.setMatrixAt(batch.mesh.count, this.scratchMatrix);
-      batch.mesh.count += 1;
-      touched.add(batch);
+  /** Frames `"{stem}_f0"`, `"_f1"`… extraídos pelo `texture_atlas.rs`; o
+   * nome puro (frame 0) é o fallback de atlas antigo/sem frames. */
+  private loadFrames(stem: string): THREE.Texture[] {
+    const atlas = this.atlasUvByName;
+    if (!atlas) return [];
+    const frames: THREE.Texture[] = [];
+    for (let i = 0; i < 512; i++) {
+      if (!atlas[`${stem}_f${i}`]) break;
+      const texture = this.getTileTexture(`${stem}_f${i}`);
+      if (!texture) break;
+      frames.push(texture);
     }
-    // `setMatrixAt` só mexe no buffer na CPU — sobe pra GPU uma vez por lote.
-    for (const batch of touched) batch.mesh.instanceMatrix.needsUpdate = true;
-  }
-
-  private batchFor(block: string): BlockBatch {
-    const existing = this.batches.get(block);
-    if (existing) return existing;
-
-    const batch: BlockBatch = {
-      block,
-      mesh: this.buildBatchMesh(block, BATCH_INITIAL_CAPACITY),
-      capacity: BATCH_INITIAL_CAPACITY,
-    };
-    this.scene.add(batch.mesh);
-    this.batches.set(block, batch);
-    return batch;
-  }
-
-  private buildBatchMesh(block: string, capacity: number): THREE.InstancedMesh {
-    const mesh = new THREE.InstancedMesh(this.blockGeometry, this.resolveMaterials(block), capacity);
-    mesh.count = 0;
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage); // lotes crescem/atualizam com o polling
-    // Culling por bounding sphere não compensa: uma esfera só cobriria todo
-    // o terreno explorado (justamente o que quase sempre está em quadro) e
-    // recalcular a cada coluna nova custaria caro. Desligado de propósito.
-    mesh.frustumCulled = false;
-    return mesh;
-  }
-
-  /** `InstancedMesh` não cresce sozinho: dobra a capacidade num lote novo e
-   * copia as matrizes já escritas (amortizado O(1) por coluna). */
-  private growBatch(batch: BlockBatch) {
-    const old = batch.mesh;
-    const capacity = batch.capacity * 2;
-    const mesh = this.buildBatchMesh(batch.block, capacity);
-    for (let i = 0; i < old.count; i++) {
-      old.getMatrixAt(i, this.scratchMatrix);
-      mesh.setMatrixAt(i, this.scratchMatrix);
+    if (frames.length === 0) {
+      const single = this.getTileTexture(stem);
+      if (single) frames.push(single);
     }
-    mesh.count = old.count;
-    mesh.instanceMatrix.needsUpdate = true;
-    this.scene.remove(old);
-    old.dispose();
-    this.scene.add(mesh);
-    batch.mesh = mesh;
-    batch.capacity = capacity;
+    return frames;
+  }
+
+  /** Recebe um chunk em voxels (payload binário de `chunk_voxels`, ver
+   * `world_cache.rs`) e (re)constrói as malhas dele e dos 4 vizinhos já
+   * carregados — sem isso, as faces na divisa ficariam desenhadas até o
+   * vizinho chegar (e o fluxo da água na borda ficaria sem direção). */
+  addChunkVoxels(x: number, z: number, bytes: Uint8Array) {
+    if (bytes.length === 0) return; // ainda não pronto no Rust — tenta de novo depois
+    let chunk: DecodedChunk;
+    try {
+      chunk = decodeVoxels(x, z, bytes);
+    } catch (err) {
+      console.error(`[viewer3d] chunk (${x}, ${z}) com payload inválido:`, err);
+      return;
+    }
+    this.chunks.set(this.chunkKey(x, z), chunk);
+    for (const [cx, cz] of [[x, z], [x + 1, z], [x - 1, z], [x, z + 1], [x, z - 1]] as const) {
+      const neighbor = this.chunks.get(this.chunkKey(cx, cz));
+      if (neighbor) this.buildChunkMesh(neighbor);
+    }
+  }
+
+  /** Bloco em coordenada de mundo. `null` = desconhecido (chunk ainda não
+   * chegou); seção ausente num chunk carregado = ar, como no jogo. */
+  private entryAt(x: number, y: number, z: number): PaletteEntry | null {
+    const chunk = this.chunks.get(this.chunkKey(x >> 4, z >> 4));
+    if (!chunk) return null;
+    const section = chunk.sections.get(y >> 4);
+    if (!section) return AIR;
+    const index = section.indices[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
+    return section.palette[index] ?? AIR;
+  }
+
+  /** Direção da correnteza de um fluido, calculada dos níveis dos vizinhos
+   * horizontais — a mesma ideia do `FlowingFluid#getFlow` do jogo: soma dos
+   * vetores apontando pra onde o nível é mais baixo. Sem gradiente, cai
+   * (se o bloco de baixo não for o mesmo fluido) ou fica parado. */
+  private fluidFlowVector(x: number, y: number, z: number, entry: PaletteEntry): THREE.Vector3 {
+    if (entry.level >= 8) return DOWN; // caindo: sempre pra baixo
+    const own = fluidHeight(entry.level);
+    let fx = 0;
+    let fz = 0;
+    for (const [dx, dz] of HORIZONTAL_NEIGHBORS) {
+      const neighbor = this.entryAt(x + dx, y, z + dz);
+      if (neighbor === null) continue; // vizinho desconhecido: neutro, não puxa a água
+      let neighborHeight = 0;
+      if ((neighbor.flags & VOXEL_FLAG_FLUID) !== 0 && neighbor.block === entry.block) {
+        neighborHeight = fluidHeight(neighbor.level);
+      }
+      fx += dx * (neighborHeight - own);
+      fz += dz * (neighborHeight - own);
+    }
+    if (Math.abs(fx) < 1e-4 && Math.abs(fz) < 1e-4) {
+      const below = this.entryAt(x, y - 1, z);
+      const belowSameFluid =
+        below !== null && (below.flags & VOXEL_FLAG_FLUID) !== 0 && below.block === entry.block;
+      return below === null || !belowSameFluid ? DOWN : ZERO;
+    }
+    return new THREE.Vector3(fx, 0, fz);
+  }
+
+  /** Qual das 4 rotações de 90° da textura alinha o "desce" da imagem (V+)
+   * com o fluxo projetado na face — [0]=V, [1]=U, [2]=−V, [3]=−U. */
+  private flowRotation(face: FaceDef, flow: THREE.Vector3): number {
+    const candidates = [face.vDir, face.uDir, face.vDir.map((v) => -v) as [number, number, number], face.uDir.map((v) => -v) as [number, number, number]];
+    let best = 0;
+    let bestDot = -Infinity;
+    for (let i = 0; i < candidates.length; i++) {
+      const [cx, cy, cz] = candidates[i];
+      const dot = flow.x * cx + flow.y * cy + flow.z * cz;
+      if (dot > bestDot) {
+        bestDot = dot;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  private buffersFor(buckets: Map<string, MeshBuffers>, bucket: string): MeshBuffers {
+    let buffers = buckets.get(bucket);
+    if (!buffers) {
+      buffers = { positions: [], normals: [], uvs: [], colors: [], indices: [] };
+      buckets.set(bucket, buffers);
+    }
+    return buffers;
+  }
+
+  /** Adiciona um quad (2 triângulos) de uma face. `low`/`high` recortam a
+   * altura local (0..1) — usado pra superfície rebaixada de fluido. */
+  private pushQuad(
+    buffers: MeshBuffers,
+    face: FaceDef,
+    x: number,
+    y: number,
+    z: number,
+    low: number,
+    high: number,
+    uvs: readonly (readonly [number, number])[],
+    color: number
+  ) {
+    const base = buffers.positions.length / 3;
+    this.scratchColor.setHex(color);
+    const { r, g, b } = this.scratchColor;
+    for (let i = 0; i < 4; i++) {
+      const corner = face.corners[i];
+      buffers.positions.push(x + corner[0], y + (corner[1] === 1 ? high : low), z + corner[2]);
+      buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
+      buffers.uvs.push(uvs[i][0], uvs[i][1]);
+      buffers.colors.push(r, g, b);
+    }
+    buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+
+  /** Uma face visível de fluido: mesma culling dos sólidos, mas face entre o
+   * mesmo fluido só aparece quando o vizinho é mais raso (degrau d'água), e
+   * a altura sai do nível em vez de 0..1. */
+  private meshFluidFace(
+    buffers: MeshBuffers,
+    face: FaceDef,
+    x: number,
+    y: number,
+    z: number,
+    entry: PaletteEntry,
+    neighbor: PaletteEntry | null,
+    flow: THREE.Vector3 | null
+  ) {
+    const ownHeight = fluidHeight(entry.level);
+    let low = 0;
+    let high = ownHeight;
+    const sameFluid =
+      neighbor !== null && (neighbor.flags & VOXEL_FLAG_FLUID) !== 0 && neighbor.block === entry.block;
+    if (sameFluid) {
+      const neighborHeight = fluidHeight(neighbor!.level);
+      if (neighborHeight >= ownHeight - 1e-4) return; // mesmo nível: face interna some
+      low = neighborHeight;
+    } else if (neighbor !== null && (neighbor.flags & VOXEL_FLAG_RENDER) !== 0) {
+      if ((neighbor.flags & VOXEL_FLAG_OCCLUDES) !== 0) return;
+    }
+
+    let uvs = face.uv;
+    const rotation = flow ? this.flowRotation(face, flow) : 0;
+    for (let i = 0; i < rotation; i++) {
+      uvs = uvs.map(([u, v]) => [1 - v, u] as [number, number]);
+    }
+    this.pushQuad(buffers, face, x, y, z, low, high, uvs, 0xffffff);
+  }
+
+  /** Monta as malhas de um chunk (um mesh por bucket usado) e substitui as
+   * antigas. Sem atlas carregado não faz nada — `setAtlas` remonta tudo. */
+  private buildChunkMesh(chunk: DecodedChunk) {
+    const key = this.chunkKey(chunk.x, chunk.z);
+    this.disposeChunkMeshes(key);
+    if (!this.atlasUvByName || !this.atlasTexture) return;
+
+    const buckets = new Map<string, MeshBuffers>();
+    for (const section of chunk.sections.values()) {
+      for (let ly = 0; ly < 16; ly++) {
+        for (let lz = 0; lz < 16; lz++) {
+          for (let lx = 0; lx < 16; lx++) {
+            const entry = section.palette[section.indices[(ly << 8) | (lz << 4) | lx]];
+            if (!entry || (entry.flags & VOXEL_FLAG_RENDER) === 0) continue;
+
+            const x = chunk.x * 16 + lx;
+            const y = section.y * 16 + ly;
+            const z = chunk.z * 16 + lz;
+            const isFluid = (entry.flags & VOXEL_FLAG_FLUID) !== 0;
+            const flow = isFluid && entry.level !== 0 ? this.fluidFlowVector(x, y, z, entry) : null;
+
+            for (const face of FACES) {
+              const neighbor = this.entryAt(x + face.dir[0], y + face.dir[1], z + face.dir[2]);
+              if (isFluid) {
+                const buffers = this.buffersFor(buckets, `${entry.block}_${entry.level === 0 ? "still" : "flow"}`);
+                this.meshFluidFace(buffers, face, x, y, z, entry, neighbor, flow);
+                continue;
+              }
+              // Sólido: face some se o vizinho é oclusor (ou se nem é
+              // desenhável); oclusão entre chunks ainda não carregados não
+              // conta — o vizinho é `null` e a face fica desenhada até o
+              // chunk chegar (aí este chunk é remontado).
+              if (neighbor !== null && (neighbor.flags & VOXEL_FLAG_RENDER) !== 0) {
+                if ((neighbor.flags & VOXEL_FLAG_OCCLUDES) !== 0) continue;
+              }
+              const rect = this.faceRect(entry.block, face.kind);
+              if (!rect) continue;
+              const uvs = face.uv.map(
+                ([u, v]) => [rect.u0 + u * (rect.u1 - rect.u0), rect.v0 + v * (rect.v1 - rect.v0)] as [number, number]
+              );
+              this.pushQuad(
+                this.buffersFor(buckets, "opaque"),
+                face,
+                x,
+                y,
+                z,
+                0,
+                1,
+                uvs,
+                this.faceTint(entry.block, face.kind)
+              );
+            }
+          }
+        }
+      }
+    }
+
+    const meshes: THREE.Mesh[] = [];
+    for (const [bucket, buffers] of buckets) {
+      if (buffers.indices.length === 0) continue;
+      const material = this.bucketMaterials.get(bucket);
+      if (!material) continue;
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(buffers.positions, 3));
+      geometry.setAttribute("normal", new THREE.Float32BufferAttribute(buffers.normals, 3));
+      geometry.setAttribute("uv", new THREE.Float32BufferAttribute(buffers.uvs, 2));
+      geometry.setAttribute("color", new THREE.Float32BufferAttribute(buffers.colors, 3));
+      geometry.setIndex(buffers.indices);
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.frustumCulled = true;
+      this.scene.add(mesh);
+      meshes.push(mesh);
+    }
+    this.chunkMeshes.set(key, meshes);
+  }
+
+  private disposeChunkMeshes(key: number) {
+    const meshes = this.chunkMeshes.get(key);
+    if (!meshes) return;
+    for (const mesh of meshes) {
+      this.scene.remove(mesh);
+      mesh.geometry.dispose();
+    }
+    this.chunkMeshes.delete(key);
+  }
+
+  /** Chamado quando o atlas termina de carregar (as UVs/materiais dependem
+   * dele) — remonta todos os chunks já recebidos. */
+  private rebuildAllMeshes() {
+    for (const chunk of this.chunks.values()) this.buildChunkMesh(chunk);
   }
 
   /** Recebe a pose real do jogador (comando `bot_pose`) e usa como alvo: o
@@ -688,15 +1049,25 @@ export class Viewer3D {
     this.fog.far = Math.max(FOG_FAR_BASE, distance * 3);
   }
 
+  /** Troca o frame das texturas animadas de fluido (água/lava). */
+  private updateAnimation(now: number) {
+    if (this.animatedMaterials.length === 0) return;
+    if (now - this.lastAnimationMs < FLUID_FRAME_MS) return;
+    this.lastAnimationMs = now;
+    this.animationFrame++;
+    for (const { material, frames } of this.animatedMaterials) {
+      const frame = frames[this.animationFrame % frames.length];
+      // Trocar entre mapas não-nulos não recompila shader — só atualiza a
+      // textura usada.
+      if (material.map !== frame) material.map = frame;
+    }
+  }
+
   /** Sem chunks nem bot ainda — estado honesto, não mostra uma cena vazia
    * como se fosse "carregada". Chamado quando o addon desconecta. */
   clear() {
-    for (const batch of this.batches.values()) {
-      this.scene.remove(batch.mesh);
-      batch.mesh.dispose();
-    }
-    this.batches.clear();
-    this.columnKeys.clear();
+    for (const key of Array.from(this.chunkMeshes.keys())) this.disposeChunkMeshes(key);
+    this.chunks.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
     this.targetBotPos = null;
@@ -738,6 +1109,7 @@ export class Viewer3D {
     this.updateBotMarker(dt);
     this.controls.update();
     this.updateFog();
+    this.updateAnimation(now);
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
   };

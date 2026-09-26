@@ -46,6 +46,7 @@ import java.util.Base64;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.Locale;
+import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.zip.Deflater;
 
@@ -103,7 +104,7 @@ public class BaritoneOrchestratorAddonClient {
     // drenadas na tick do cliente (a API do Baritone é de thread do cliente —
     // chamar `setGoalAndPath` da thread do socket seria corrida). A fila é
     // concorrente porque produtora e consumidora são threads diferentes.
-    private static final Deque<String> pendingCommands = new ConcurrentLinkedQueue<>();
+    private static final Queue<String> pendingCommands = new ConcurrentLinkedQueue<>();
     private static final int ARRIVAL_RADIUS_BLOCKS = 1;
 
     // Instrução ativa hoje (só uma por vez — a fila do app despacha em

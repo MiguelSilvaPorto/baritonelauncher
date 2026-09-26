@@ -21,11 +21,13 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   texturas que não carregam tipo as folhas que ainda estão zinzas").
 - **Água, lava e fogo nem textura tinham (animadas eram puladas pelo atlas)**: `water_still`,
   `lava_still`, `fire_0`... são PNGs com os frames empilhados na vertical, e o atlas descartava tudo
-  que não fosse 16×16 — esses blocos caíam no cinza de fallback. Agora o primeiro frame 16×16 é usado
-  como estático (não há animação no shader) e o viewer resolve o nome certo por bloco (`water` →
-  `water_still`, `lava` → `lava_still`, `fire` → `fire_0`). Água ainda leva um tint de azul
-  aproximado, como no jogo. O cache do atlas em disco ganhou versão no nome (`atlas_v2_...`), senão o
-  atlas antigo (sem essas texturas) continuaria sendo reaproveitado pra sempre.
+  que não fosse 16×16 — esses blocos caíam no cinza de fallback. Agora todas as texturas animadas
+  entram no atlas **com todos os frames** (`water_still_f0`, `_f1`…; frames 32×32 de
+  `water_flow`/`lava_flow` são reduzidos pra 16×16, porque o atlas é uniforme) e o viewer resolve o
+  nome certo por bloco (`water` → `water_still`, `lava` → `lava_still`, `fire` → `fire_0`). Água
+  ainda leva um tint de azul aproximado, como no jogo. O cache do atlas em disco ganhou versão no
+  nome (`atlas_v3_...`), senão o atlas antigo (sem essas texturas) continuaria sendo reaproveitado
+  pra sempre.
 - **Viewer travado a 2–5 fps depois do material por face**: cada bloco era um `Mesh` próprio e, com
   um material por face, cada um passou a custar 6 draw calls (um por grupo do `BoxGeometry`) — com
   milhares de blocos explorados, isso virava dezenas de milhares de draw calls por frame. Agora os
@@ -116,6 +118,51 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   usuário ("as chunks em volta do meu player não mostra nada").
 
 ### Added
+
+- **Renderizador do jogador de verdade — com a skin do próprio jogador**: o viewer mostrava uma bola
+  teal no lugar do jogador. Agora desenha o modelo do Minecraft (cabeça, tronco, braços e pernas, nas
+  proporções e UVs do `HumanoidModel`/`PlayerModel` do jogo, incluindo as camadas de sobreposição —
+  chapéu, jaqueta, mangas, calças) com a skin real que o jogador usa em jogo, na variante `slim`
+  (Alex, braço de 3px) ou `wide` (Steve, 4px). O addon lê a textura que o client **já tem carregada**
+  (a skin baixada/customizada no cache de texturas ou a padrão do resource pack/jar — nada é baixado
+  da Mojang, mesma regra do atlas de blocos) e manda um `player_skin` (PNG em base64) quando ela
+  muda; o app valida, guarda em memória e expõe o comando `player_skin`. A caminhada usa as contas do
+  `WalkAnimationState` do jogo, e a pose real (a mensagem `position` agora carrega yaw/pitch,
+  expostos pelo comando `bot_pose`) é interpolada entre os updates de 4x/s — o modelo anda em vez de
+  piscar de posição em posição e gira pra onde o jogador olha. Um anel teal raso no chão substitui o
+  glow da esfera antiga, pra posição continuar legível de longe. Enquanto a skin não chega, o modelo
+  aparece sem textura (cinza neutro) — nunca uma skin inventada. Reportado pelo usuário ("quero que
+  vc adicione um renderizador do jogador no meu aplicativo hoje é só um bola azul... adicione um
+  player do minecraft de verdade que pega a textura do próprio jogador").
+
+- **Água e lava renderizadas de verdade — nível, transparência, animação e fluxo direcional** — o
+  viewer tratava (quando renderizava) fluido como cubo opaco de 1×1×1, e `water_flow`/`lava_flow`
+  eram puladas de vez, então não existia "fluxo" visual nenhum. Agora o protocolo `chunk_voxels`
+  carrega, por entrada de paleta, o **nível** do fluido (`0` = fonte, `1–7` = fluindo, `8+` =
+  caindo) e uma flag `FLUID` (formato 2; o addon Java e o Rust andam juntos). O viewer:
+  - desenha a superfície na altura real (`(8 − nível) / 9`; fonte e queda = `8/9`), como o
+    `WaterFluid#getHeight` do jogo — riacho vira degrau, cachoeira fica em pé;
+  - some com as faces entre o **mesmo** fluido (nada de grade de cubos d'água) e mostra só o degrau
+    quando o vizinho é mais raso;
+  - água é **translúcida** (`depthWrite` desligado, como no jogo) e lava é opaca/emissiva;
+  - toca **todos os frames** das texturas animadas (`water_still`, `water_flow`, `lava_still`,
+    `lava_flow`) em sequência — o atlas passou a extrair frame a frame do jar;
+  - calcula a direção da correnteza dos níveis dos vizinhos (mesma ideia do `FlowingFluid#getFlow`)
+    e gira a textura pra acompanhar o fluxo: cachoeira escorre pra baixo, riacho corre pro lado.
+  Reportado pelo usuário ("quero que vc arrume o carregamento de agua do meu app que ele não é capaz
+  de renderizar o agua e o fluxo dela").
+- **Canal reverso: a fila agora executa de verdade no jogo** — o socket só levava dados do jogo pro
+  app; a fila era decorativa. Agora o app manda `instruction` (`travel_to` →
+  `ICustomGoalProcess.setGoalAndPath(new GoalXZ(x, z))`, `explore` → `IExploreProcess.explore(x, z)`)
+  e `cancel` pelo mesmo socket, e o addon devolve `instruction_status` (`active` com progresso,
+  `done`/`failed`). O progresso do `travel_to` é real (fração da distância em linha reta até o alvo,
+  medida da posição do bot) e o `explore`, que é contínuo, não tem progresso — a barra some de
+  propósito em vez de fingir 0%. No app: comandos `queue_push`/`queue_cancel`, fila que anda em
+  sequência (a próxima só é despachada quando a ativa termina, ou quando o addon reconecta) e um
+  composer "Ir para" (x/z) / "Explorar" nos dois painéis de fila, com botão "cancelar" nos cards.
+  Sem conexão a instrução fica `Queued` e sai no próximo `hello`. No addon, a leitura do socket roda
+  numa thread própria que só enfileira as linhas; a execução (API do Baritone) acontece na thread do
+  cliente, via `onClientTick`. Reportado pelo usuário ("o que seria o proximo item da fila para resolver").
 
 - **Movimentação da câmera do viewer 3D — teclado + zoom livre**: antes a câmera só se movia pelo
   mouse (orbitar/arrastar do `OrbitControls`) e o zoom era travado entre 8 e 400 blocos, sem como

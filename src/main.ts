@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, type BotPos, type BotPose, type ColumnBlock, type UvRect } from "./viewer3d";
-
+import { Viewer3D, CHUNKS_PER_REFRESH, type BotPos, type BotPose, type ChunkPos, type UvRect } from "./viewer3d";
 interface TextureAtlas {
   image_data_url: string;
   textures: Record<string, UvRect>;
@@ -26,7 +25,6 @@ interface PlayerSkin {
   model: string;
   image_data_url: string;
 }
-
 type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed" | "Canceled";
 type InstructionKind =
   | "Explore"
@@ -325,12 +323,30 @@ function renderHud(vitals: Vitals | null) {
 let viewer3d: Viewer3D | null = null;
 /** Última posição do bot (do polling) — origem do "Explorar" no composer. */
 let lastBotPos: BotPos | null = null;
+/** Chunks já pedidos e ainda não resolvidos — evita pedir de novo no próximo
+ * refresh antes da resposta do anterior chegar. */
+const pendingChunks = new Set<string>();
+
+function requestChunk(pos: ChunkPos) {
+  const key = `${pos.x},${pos.z}`;
+  if (!viewer3d || viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(key)) return;
+  pendingChunks.add(key);
+  invoke<ArrayBuffer | number[]>("chunk_voxels", { x: pos.x, z: pos.z })
+    .then((raw) => {
+      // `tauri::ipc::Response` chega como ArrayBuffer; o fallback cobre uma
+      // resposta JSON antiga em vez de estourar.
+      const bytes = raw instanceof ArrayBuffer ? new Uint8Array(raw) : new Uint8Array(raw);
+      viewer3d?.addChunkVoxels(pos.x, pos.z, bytes);
+    })
+    .catch((err) => console.error(`[chunk_voxels] (${pos.x}, ${pos.z})`, err))
+    .finally(() => pendingChunks.delete(key));
+}
 
 async function refreshState() {
-  const [status, world, columns, queue, totals, vitals, skin] = await Promise.all([
+  const [status, world, chunks, queue, totals, vitals, skin] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
-    invoke<ColumnBlock[]>("world_columns"),
+    invoke<ChunkPos[]>("world_chunks"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
@@ -348,10 +364,22 @@ async function refreshState() {
         .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
         .catch((err) => console.error("[atlas]", err));
     }
-    viewer3d.setColumns(columns);
     // A skin real (ou `null` enquanto o addon não mandou) — o viewer mostra o
-    // modelo sem textura em vez de inventar uma skin.
+    // modelo sem textura em vez de inventar uma skin. A pose vem do polling
+    // próprio (`bot_pose`, 4x/s), não deste refresh.
     viewer3d.setPlayerSkin(skin ? { model: skin.model, imageDataUrl: skin.image_data_url } : null);
+
+    // Voxels são buscados aos poucos: montar malha é CPU na thread
+    // principal, então um backfill de centenas de chunks numa tacada
+    // travaria o viewer. O resto fica na fila implícita do Rust e chega
+    // nos próximos refreshes.
+    let budget = CHUNKS_PER_REFRESH;
+    for (const pos of chunks) {
+      if (budget <= 0) break;
+      if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
+      requestChunk(pos);
+      budget--;
+    }
   }
   renderHud(vitals);
   renderQueue(queue);

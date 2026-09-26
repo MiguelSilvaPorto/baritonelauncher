@@ -9,14 +9,22 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
 
 - Compila contra `baritone.api` (jar oficial, ver seção abaixo) e roda junto do
   Baritone de verdade no client — testado manualmente em NeoForge `26.3.0.22-beta`.
-- A cada tick do cliente, lê vida/fome/saturação/armadura (1x/s) e posição
-  (`getPlayerContext().playerFeet()`, 4x/s) do jogador via
+- A cada tick do cliente, lê vida/fome/saturação/armadura (1x/s) e posição +
+  rotação (`getPlayerContext().playerFeet()`, `getYRot()`/`getXRot()`, 4x/s) do jogador via
   `BaritoneAPI.getProvider().getPrimaryBaritone()` (prova que a dependência do
   Baritone resolve e funciona em runtime, não só em tempo de compilação) e
   manda pro app Rust por um socket TCP local.
-- Assina `ChunkEvent.Load` (client-side) e manda um `chunk_loaded` por chunk
-  carregado — o app Rust já mostra a contagem real de chunks vistos no chip
-  de progresso do viewer.
+- Manda a skin do próprio jogador (`player_skin`, PNG em base64 + variante
+  `slim`/`wide`) sempre que a textura muda — lida do que o client já tem
+  carregado (cache de texturas pra skin baixada/customizada, resource pack/jar
+  pra padrão), sem baixar nada da Mojang. É o que deixa o viewer desenhar o
+  modelo de verdade do jogador em vez de um marcador genérico.
+- Assina `ChunkEvent.Load` (client-side) e enfileira o chunk pro envio de
+  `chunk_voxels`: cada seção 16×16×16 vira paleta + índices (deflate + base64),
+  com flags de renderização/oclusão/fluido e o nível de cada fluido — é daí
+  que o viewer monta o terreno com face culling de verdade, inclusive água e
+  lava. A fila drena poucos chunks por tick pra um backfill de reconexão não
+  travar o jogo.
 - Reconecta sozinho (a cada 5s) se o app Rust não estiver rodando ainda — não
   trava nem falha o carregamento do mod.
 - `neoforge.mods.toml` declara Baritone (`modId="baritoe"` — não é
@@ -30,16 +38,13 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 
 ## O que ainda não existe
 
-- **Dados de bloco de verdade dentro do chunk** — `chunk_loaded` hoje só marca presença
-  (`WorldCache.chunks[pos]` existe, sem nenhum bloco dentro). Pra virar visualização real, precisa do
-  pipeline de atlas de textura (`docs/SPEC.md`, "Blocos 3D") que ainda não existe.
 - Índice de baús (`StorageIndex`).
-- Recebimento de instruções da fila (hoje o socket só manda dados, não recebe
-  comandos do lado Rust).
 - `SurvivalProcess`/detecção de ameaça, simulação de `ContainerScreen` pra
   crafting/fundição — tudo isso ainda é só o que está descrito em `docs/SPEC.md`.
 - `armor_pieces` (durabilidade por peça) e `active_effects` — o protocolo já
   reserva os campos do lado Rust, o addon só não manda ainda.
+- Instruções além de `travel_to`/`explore` — o canal reverso existe (ver
+  protocolo abaixo), mas `Mine`/`Build`/baú/craft ainda não têm executor aqui.
 
 ## Protocolo do socket (v0)
 
@@ -48,18 +53,44 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
 - TCP, `127.0.0.1:31173`, só loopback.
 - Uma mensagem JSON por linha (`\n`-delimited), sem framing binário — dá pra
   testar até com `nc localhost 31173` digitando JSON na mão.
+
+**Addon → app (telemetria):**
+
 - `{"type":"hello","addon_version":"...","baritone_version":"...","mc_version":"..."}`
   — primeira mensagem, marca `connection_status` como conectado no app.
 - `{"type":"vitals","health":20.0,"max_health":20.0,"hunger":20,"saturation":5.0,"armor_points":0}`
   — a cada ~20 ticks.
-- `{"type":"position","x":123,"y":64,"z":45}` — a cada ~5 ticks.
-- `{"type":"chunk_loaded","x":3,"z":-7}` — um por `ChunkEvent.Load` do lado cliente. Sem `x_unloaded`
-  de propósito (ver comentário em `addon_socket.rs`: isso é footprint cumulativo, não render distance
-  ao vivo).
+- `{"type":"position","x":123,"y":64,"z":45,"yaw":90.0,"pitch":12.5}` — a
+  cada ~5 ticks (yaw/pitch = rotação real do jogador, usada pra orientar o
+  modelo no viewer).
+- `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` —
+  quando a skin muda (inclui a padrão, se o perfil ainda não carregou a
+  real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
+  client ou do resource pack/jar instalado, nunca baixado pela Mojang.
+- `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
+  (paleta + índices por seção, deflate + base64). Por entrada da paleta:
+  `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
+  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) — layout
+  completo em `world_cache.rs`, `decode_voxels` (formato 2).
+- `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
+  estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
+  do `travel_to` — `explore` é contínuo e não tem progresso).
+
+**App → addon (canal reverso):**
+
+- `{"type":"instruction","id":"i1","kind":"travel_to","x":100,"z":-200}` —
+  `ICustomGoalProcess.setGoalAndPath(new GoalXZ(x, z))`.
+- `{"type":"instruction","id":"i2","kind":"explore"}` (com `x`/`z` opcionais) —
+  `IExploreProcess.explore(origemX, origemZ)`; sem coordenadas, usa os pés do bot.
+- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()`.
+
+O recebimento roda numa thread leitora que só enfileira as linhas; a execução
+acontece na thread do cliente (`onClientTick`), onde a API do Baritone é segura.
 
 É a v0 deliberadamente mínima — não é o protocolo final do spec (que também
-cobre baús e instruções, e dados de bloco de verdade dentro de cada chunk), é
-o menor recorte ponta a ponta que prova que a ponte funciona de verdade.
+cobre baús e propriedades de blockstate), é o menor recorte ponta a ponta que
+prova que a ponte funciona de verdade: telemetria, terreno em voxels, água e
+lava com nível e instruções básicas.
 
 ## O jar do Baritone — qual usar e como pegar
 
