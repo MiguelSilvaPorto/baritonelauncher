@@ -191,6 +191,13 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Ciclo de dia e noite no viewer, dirigido pela hora real do mundo**: o addon agora manda a hora do
+  clock do overworld 1x/s (`world_time`, ticks 0..23999) e o viewer interpola a 20 ticks/s (1 dia =
+  20 min reais, como no jogo) movendo sol, lua, luz ambiente e o gradiente do céu — amanhecer e pôr
+  do sol deixam o horizonte quente, e a noite escurece a cena com uma luz de lua azulada. Sem jogo
+  conectado, a cena congela na última hora real (e fica no meio-dia fixo antes da primeira
+  mensagem), em vez de inventar um ciclo — `world_time` devolve `None` nesse caso. Reportado pelo
+  usuário ("quero que vc adicione o ciclo de dia e noite").
 - **Cores de bioma reais no viewer — fim do verde único**: o addon agora manda, junto de cada chunk, as
   cores de bioma **por coluna** (grama, folhagem e água), resolvidas pelo `BiomeColors` do próprio
   client — o mesmo colormap de temperatura/umidade, override de bioma e modificador de

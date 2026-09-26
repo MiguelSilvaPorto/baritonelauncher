@@ -19,11 +19,15 @@ Java); este documento existe pra não precisar caçar mensagem por mensagem no c
 | Versão | O quê | Onde |
 | --- | --- | --- |
 | **protocolo v0** | transporte, framing e o conjunto de mensagens — deliberadamente mínimo | este documento, `addon_socket.rs` |
-| **payload (formato 2)** | só o binário dentro de `chunk_voxels` | `world_cache.rs`, `decode_voxels` |
+| **payload (formato 3; a 2 continua aceita)** | só o binário dentro de `chunk_voxels` | `world_cache.rs`, `decode_voxels` |
 
 São números independentes: uma mensagem nova não muda o payload do chunk, e um campo novo no payload
 não muda o protocolo. O decoder recusa versão de payload desconhecida com erro claro em vez de tentar
 adivinhar (`decode_voxels`), então app e addon precisam estar de acordo nesse número.
+
+O formato 3 acrescentou as **cores de bioma por coluna** (grama/folhagem/água) no fim do payload. O
+formato 2 continua sendo aceito — um `world.cache` gravado antes da mudança abre normalmente, só sem
+tints, e um jar do addon antigo segue funcionando (o app avisa no console).
 
 ## Addon → app
 
@@ -35,12 +39,15 @@ adivinhar (`decode_voxels`), então app e addon precisam estar de acordo nesse n
 - `{"type":"position","x":123,"y":64,"z":45,"yaw":90.0,"pitch":12.5}` — ~4x/s; pés do jogador +
   rotação real do corpo/cabeça (o viewer usa pra orientar o modelo). `yaw`/`pitch` são opcionais pra
   addon antigo.
+- `{"type":"world_time","day_time":6000}` — hora do clock do overworld em ticks (0..23999), ~1x/s;
+  o viewer usa pro ciclo de dia/noite (1 dia = 20 min reais, como no jogo) e congela na última hora
+  conhecida sem o jogo.
 - `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` — quando a skin muda;
   `model` é `slim` ou `wide`. O PNG é lido do cache de texturas/resource pack do client, nunca
   baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"<base64>"}` — um por chunk carregado
   (`ChunkEvent.Load`) mais o backfill de reconexão (2 chunks por tick). `data` é o payload binário
-  descrito abaixo, comprimido com zlib.
+  descrito abaixo (com as cores de bioma do formato 3), comprimido com zlib.
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` — estado da instrução
   ativa (`active`/`done`/`failed`; `progress` só quando existe, ex: `travel_to`; `explore` é contínuo
   e não manda progresso).
@@ -59,10 +66,10 @@ adivinhar (`decode_voxels`), então app e addon precisam estar de acordo nesse n
 A leitura roda numa thread dedicada que só enfileira as linhas; a execução acontece na thread do
 client (`onClientTick`), onde a API do Baritone é segura.
 
-## Payload do chunk (`chunk_voxels`, formato 2)
+## Payload do chunk (`chunk_voxels`, formato 3)
 
 ```
-u8  versão (2)
+u8  versão (3; 2 = formato antigo, sem tints)
 u8  nº de seções não-vazias
 por seção:
   i8  Y da seção (Y do mundo / 16; pode ser negativo)
@@ -73,6 +80,11 @@ por seção:
     u8  flags           (1 = renderizável, 2 = oclusor, 4 = fluido)
     u8  nível do fluido (0 = fonte, 1..7 = fluindo, 8+ = caindo; 0 fora de fluido)
   u16[4096] índices      (ordem x + z*16 + y*256, igual ao PalettedContainer do jogo)
+u8  tem_tints (só na v3; 0 = sem tints)
+se tem_tints:
+  256 × (u8 r, u8 g, u8 b)  grama    — coluna x + z*16
+  256 × (u8 r, u8 g, u8 b)  folhagem — coluna x + z*16
+  256 × (u8 r, u8 g, u8 b)  água     — coluna x + z*16
 ```
 
 - O payload inteiro é comprimido com **zlib** (header incluso) e codificado em **base64** no campo
@@ -80,5 +92,8 @@ por seção:
 - Seção ausente = ar; só seções com pelo menos um bloco não-ar são enviadas.
 - Os flags de oclusão são calculados no addon (`isSolidRender`/fluido) e evitam que o viewer precise
   de uma lista de nomes de bloco pra fazer face culling.
+- Os **tints** são resolvidos pelo addon com o `BiomeColors` do próprio client, amostrados no bloco
+  do topo de cada coluna (bloco subterrâneo usa o bioma da superfície). São opcionais: sem eles o
+  viewer cai nas cores fixas aproximadas — ver `GRASS_TINT` em `viewer3d.ts`.
 - O mesmo formato é reusado pelo cache em disco (`world.cache`, ver `world_store.rs`), então o
   `encode_voxels`/`decode_voxels` é um só pra socket, IPC e disco.
