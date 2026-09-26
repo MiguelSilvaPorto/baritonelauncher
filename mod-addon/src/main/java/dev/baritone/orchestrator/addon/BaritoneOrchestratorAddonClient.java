@@ -5,6 +5,7 @@ import baritone.api.IBaritone;
 import baritone.api.pathing.goals.Goal;
 import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.utils.BetterBlockPos;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.NativeImage;
@@ -18,6 +19,14 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.MobCategory;
+import net.minecraft.world.entity.NeutralMob;
+import net.minecraft.world.entity.animal.Animal;
+import net.minecraft.world.entity.animal.golem.AbstractGolem;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.npc.villager.AbstractVillager;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
@@ -50,8 +59,10 @@ import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -82,6 +93,11 @@ public class BaritoneOrchestratorAddonClient {
 
     private static final int VITALS_INTERVAL_TICKS = 20; // once a second
     private static final int POSITION_INTERVAL_TICKS = 5; // 4x a second
+    private static final int MOB_SCAN_INTERVAL_TICKS = 5; // 4x a second, same as position
+    /** Raio da varredura de mobs em blocos e teto de entidades por mensagem —
+     *  um mob farm não pode transformar o snapshot num payload gigante. */
+    private static final double MOB_SCAN_RADIUS = 32.0;
+    private static final int MAX_MOBS = 64;
     private static final int RECONNECT_BACKOFF_MS = 5000;
     private static final String HELLO_MESSAGE =
             "{\"type\":\"hello\",\"addon_version\":\"0.1.0\",\"baritone_version\":\"1.20.0\",\"mc_version\":\"26.3\"}";
@@ -113,6 +129,7 @@ public class BaritoneOrchestratorAddonClient {
     private static String lastSkinSignature;
     private static int ticksSinceLastVitals;
     private static int ticksSinceLastPosition;
+    private static int ticksSinceLastMobScan;
     private static long nextReconnectAttemptMs;
 
     // Canal reverso (app → addon): linhas recebidas pela thread leitora e
@@ -221,6 +238,14 @@ public class BaritoneOrchestratorAddonClient {
                     player.getArmorValue()
             ));
             sendWorldTime();
+        }
+
+        // Mobs ao redor do jogador (nome/categoria/posição) pro viewer
+        // identificar o que está perto — ver `sendNearbyMobs`.
+        ticksSinceLastMobScan++;
+        if (ticksSinceLastMobScan >= MOB_SCAN_INTERVAL_TICKS) {
+            ticksSinceLastMobScan = 0;
+            sendNearbyMobs(player);
         }
 
         // Progresso da instrução ativa na mesma cadência da posição (4x/s) —
@@ -363,6 +388,86 @@ public class BaritoneOrchestratorAddonClient {
         } finally {
             Files.deleteIfExists(tmp);
         }
+    }
+
+    /**
+     * Snapshot das criaturas vivas num raio ao redor do jogador. É o insumo do
+     * viewer pra identificar mobs (nome/categoria/distância/vida) e a detecção
+     * que o `SurvivalProcess` do spec vai usar — hoje ninguém reage a isso
+     * ainda. Jogadores ficam de fora (não são mobs) e a lista é o estado
+     * atual, não um delta: quem saiu do raio desaparece do app sozinho.
+     *
+     * <p>A categoria é classificada aqui pelo tipo real do jogo. `NeutralMob`
+     * vem antes de `Enemy` porque lobo, abelha, enderman e piglin zumbificado
+     * são de categoria `monster` no registro mas não atacam sem provocação.
+     */
+    private static void sendNearbyMobs(LocalPlayer player) {
+        List<LivingEntity> found = player.level().getEntitiesOfClass(
+                LivingEntity.class,
+                player.getBoundingBox().inflate(MOB_SCAN_RADIUS),
+                entity -> entity != player && entity.isAlive() && !(entity instanceof Player));
+        found.sort(Comparator.comparingDouble(entity -> entity.distanceToSqr(player)));
+
+        JsonArray entities = new JsonArray();
+        for (LivingEntity entity : found) {
+            if (entities.size() >= MAX_MOBS) {
+                break;
+            }
+            entities.add(mobJson(entity, player));
+        }
+
+        JsonObject message = new JsonObject();
+        message.addProperty("type", "entities");
+        message.addProperty("radius", MOB_SCAN_RADIUS);
+        message.add("entities", entities);
+        send(message.toString());
+    }
+
+    /** Uma entidade viva no formato de `mobs.rs` (lado Rust). */
+    private static JsonObject mobJson(LivingEntity entity, LocalPlayer player) {
+        JsonObject mob = new JsonObject();
+        mob.addProperty("id", entity.getId());
+        mob.addProperty("kind", BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType()).getPath());
+        mob.addProperty("name", entity.getDisplayName().getString());
+        mob.addProperty("category", mobCategory(entity));
+        mob.addProperty("x", round2(entity.getX()));
+        mob.addProperty("y", round2(entity.getY()));
+        mob.addProperty("z", round2(entity.getZ()));
+        mob.addProperty("health", round2(entity.getHealth()));
+        mob.addProperty("max_health", round2(entity.getMaxHealth()));
+        mob.addProperty("distance", round2(Math.sqrt(entity.distanceToSqr(player))));
+        mob.addProperty("height", round2(entity.getBbHeight()));
+        return mob;
+    }
+
+    /** hostil = ataca; neutro = só reage se provocado; passivo = bicho de
+     *  fazenda/ambiente; outro = o que sobra (villager, golem de neve...). */
+    private static String mobCategory(LivingEntity entity) {
+        if (entity instanceof NeutralMob) {
+            return "neutral";
+        }
+        if (entity instanceof Enemy) {
+            return "hostile";
+        }
+        MobCategory category = entity.getType().getCategory();
+        if (entity instanceof Animal
+                || entity instanceof AbstractVillager
+                || entity instanceof AbstractGolem
+                || category == MobCategory.CREATURE
+                || category == MobCategory.AMBIENT
+                || category == MobCategory.AXOLOTLS
+                || category == MobCategory.UNDERGROUND_WATER_CREATURE
+                || category == MobCategory.WATER_CREATURE
+                || category == MobCategory.WATER_AMBIENT) {
+            return "passive";
+        }
+        return "other";
+    }
+
+    /** Duas casas bastam pro viewer (ele interpola a posição) e mantêm o
+     *  payload pequeno com dezenas de mobs. */
+    private static double round2(double value) {
+        return Math.round(value * 100.0) / 100.0;
     }
 
     /** Drena a fila do canal reverso e executa na thread do cliente. */
@@ -930,6 +1035,12 @@ public class BaritoneOrchestratorAddonClient {
     }
 
     private static boolean send(String json) {
+        if (out == null) {
+            // Conexão caiu no meio do tick (o envio anterior falhou): sem o
+            // guard, o próximo `out.write` estoura NPE na thread do cliente —
+            // a reconexão acontece no próximo tick, em `ensureConnected`.
+            return false;
+        }
         try {
             out.write((json + "\n").getBytes(StandardCharsets.UTF_8));
             out.flush();

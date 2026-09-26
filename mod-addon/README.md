@@ -28,6 +28,14 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   modificador de bioma que o jogo usa no render, então cada bioma aparece com
   a cor real. A fila drena poucos chunks por tick pra um backfill de reconexão
   não travar o jogo.
+- Varre as criaturas vivas num raio de 32 blocos (~4x/s, mesma cadência da
+  posição) e manda um snapshot `entities`: id de rede, tipo de registro
+  (`zombie`, `cow`...), nome já localizado pelo client, categoria
+  (`hostile`/`neutral`/`passive`/`other`, classificada por `NeutralMob`/
+  `Enemy`/`MobCategory`), posição, distância, vida e altura da hitbox. É o que
+  deixa o viewer identificar cada mob ao redor; jogadores ficam de fora e a
+  lista é o estado atual, não um delta. Nenhuma *reação* a isso ainda (o
+  `SurvivalProcess` do spec continua pendente).
 - Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
   "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
   hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
@@ -52,8 +60,9 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
 - **Propriedades de blockstate** — o payload manda só o nome do bloco (`oak_stairs`), não o estado
   (`oak_stairs[facing=north,half=bottom]`); escada, laje e cerca aparecem como cubo cheio no viewer.
 - Índice de baús (`StorageIndex`).
-- `SurvivalProcess`/detecção de ameaça, simulação de `ContainerScreen` pra
-  crafting/fundição — tudo isso ainda é só o que está descrito em `docs/SPEC.md`.
+- `SurvivalProcess` (reagir às ameaças — a varredura de mobs já existe, ver
+  acima — e a simulação de `ContainerScreen` pra crafting/fundição) — tudo
+  isso ainda é só o que está descrito em `docs/SPEC.md`.
 - `armor_pieces` (durabilidade por peça) e `active_effects` — o protocolo já
   reserva os campos do lado Rust, o addon só não manda ainda.
 - Instruções além de `travel_to`/`explore` — o canal reverso existe (ver
@@ -101,6 +110,12 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   do jogo — amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o viewer cai nas
   cores fixas). Layout completo em `world_cache.rs`, `decode_voxels` (formato 4; **formatos 3 e 2,
   sem luz, ainda são aceitos na leitura** pro `world.cache` antigo e pra addon desatualizado).
+- `{"type":"entities","radius":32.0,"entities":[{"id":42,"kind":"zombie","name":"Zumbi",
+  "category":"hostile","x":1.5,"y":64.0,"z":-3.25,"health":20.0,"max_health":20.0,"distance":6.2,
+  "height":1.95}, ...]}` — snapshot (~4x/s) das criaturas vivas no raio `radius` ao redor do
+  jogador, ordenadas por distância (teto de 64). `category` ∈ `hostile`/`neutral`/`passive`/`other`;
+  `name` já vem localizado pelo client e `distance`/`height` são medidos no jogo. É o estado atual,
+  não um delta — mob que saiu do raio simplesmente não aparece mais.
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
   estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
   do `travel_to` — `explore` é contínuo e não tem progresso).
