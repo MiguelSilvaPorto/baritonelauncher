@@ -11,8 +11,10 @@ import com.mojang.blaze3d.platform.NativeImage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.client.renderer.texture.DynamicTexture;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.entity.player.PlayerSkin;
@@ -60,7 +62,9 @@ import java.util.zip.Deflater;
  *
  * <p>Besides vitals/position it also streams the <b>whole chunk</b> when the
  * client loads one ({@code chunk_voxels}): every non-empty 16×16×16 section
- * serialized as palette + indices, deflated, base64. See
+ * serialized as palette + indices, plus the per-column biome tints (grass,
+ * foliage and water colors resolved with the client's own
+ * {@link BiomeColors}), deflated and base64. See
  * {@code src-tauri/src/world_cache.rs} for the exact binary layout. This is
  * still intentionally small — block updates after load, chest contents and
  * threat detection are not sent yet (see {@code docs/CHANGELOG.md}).
@@ -78,16 +82,20 @@ public class BaritoneOrchestratorAddonClient {
             "{\"type\":\"hello\",\"addon_version\":\"0.1.0\",\"baritone_version\":\"1.20.0\",\"mc_version\":\"26.3\"}";
 
     // Layout do payload binário de `chunk_voxels` — precisa bater com
-    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 2):
+    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 3):
     //   u8 versão | u8 nº de seções
     //   por seção: i8 Y da seção | u16 tamanho da paleta
     //              por entrada: u16 tamanho do nome | bytes UTF-8 | u8 flags | u8 nível
     //              u16[4096] índices (x + z*16 + y*256)
-    private static final byte VOXEL_FORMAT_VERSION = 2;
+    //   u8 tem_tints | 256×3 bytes de grama, 256×3 de folhagem e 256×3 de água
+    //              (colunas x + z*16; v2 = sem esse bloco, ainda aceito na leitura)
+    private static final byte VOXEL_FORMAT_VERSION = 3;
     private static final int VOXEL_FLAG_RENDER = 1;
     private static final int VOXEL_FLAG_OCCLUDES = 2;
     private static final int VOXEL_FLAG_FLUID = 4;
     private static final int SECTION_VOLUME = 4096; // 16×16×16
+    /** Colunas de um chunk no payload de tints (16×16, ordem x + z*16). */
+    private static final int TINT_COLUMNS = 256;
 
     private static Socket socket;
     private static OutputStream out;
@@ -237,6 +245,9 @@ public class BaritoneOrchestratorAddonClient {
     private static boolean loggedSkinGetFailure;
     private static boolean loggedSkinPngFailure;
     private static boolean loggedSkinSent;
+    /** Falha ao resolver os tints de bioma (uma vez por sessão; ver
+     *  {@code resolveColumnTints}). */
+    private static boolean loggedTintFailure;
 
     private static void sendPlayerSkinIfChanged(LocalPlayer player) {
         PlayerSkin skin;
@@ -573,6 +584,14 @@ public class BaritoneOrchestratorAddonClient {
             }
         }
 
+        // Y do bloco mais alto de cada coluna (x + z*16) — é o Y em que os
+        // tints de bioma são amostrados: o jogo resolve a cor na posição do
+        // bloco desenhado, e o que aparece é o bioma da superfície.
+        int[] topY = new int[TINT_COLUMNS];
+        for (int i = 0; i < TINT_COLUMNS; i++) {
+            topY[i] = Integer.MIN_VALUE;
+        }
+
         ByteArrayOutputStream raw = new ByteArrayOutputStream(64 * 1024);
         raw.write(VOXEL_FORMAT_VERSION);
         raw.write(nonEmptySections);
@@ -583,6 +602,7 @@ public class BaritoneOrchestratorAddonClient {
                 continue; // seção ausente = ar (ver decode_voxels no Rust)
             }
 
+            int sectionY = chunk.getSectionYFromSectionIndex(i);
             sectionPalette.clear();
             sectionPaletteIndex.clear();
 
@@ -599,11 +619,18 @@ public class BaritoneOrchestratorAddonClient {
                             sectionPaletteIndex.put(state, index);
                         }
                         sectionIndices[(y << 8) | (z << 4) | x] = (short) (int) index;
+                        if (!state.isAir()) {
+                            int column = (z << 4) | x;
+                            int worldY = sectionY * 16 + y;
+                            if (worldY > topY[column]) {
+                                topY[column] = worldY;
+                            }
+                        }
                     }
                 }
             }
 
-            writeI8(raw, chunk.getSectionYFromSectionIndex(i));
+            writeI8(raw, sectionY);
             writeU16(raw, sectionPalette.size());
             for (BlockState state : sectionPalette) {
                 byte[] name = BuiltInRegistries.BLOCK
@@ -620,7 +647,67 @@ public class BaritoneOrchestratorAddonClient {
             }
         }
 
+        byte[] tints = resolveColumnTints(chunk, topY);
+        raw.write(tints != null ? 1 : 0);
+        if (tints != null) {
+            raw.write(tints, 0, tints.length);
+        }
+
         return deflate(raw.toByteArray());
+    }
+
+    /**
+     * Cores de bioma por coluna (grama, folhagem e água; 256 colunas cada, no
+     * formato {@code r, g, b}) — as mesmas que o jogo usa pra tingir o terreno
+     * em runtime: {@link BiomeColors} resolve o colormap de
+     * temperatura/umidade, o override do bioma e o modificador de
+     * pântano/floresta escura exatamente como no render. Sem isso o viewer só
+     * consegue um verde fixo, e nenhum bioma "parece" um bioma.
+     *
+     * <p>O Y amostrado é o do bloco mais alto da coluna ({@code topY}), que é
+     * onde o jogador enxerga o bioma. Sem level (ou chunk de outro level) e em
+     * qualquer falha, devolve {@code null} — o payload sai com
+     * {@code tem_tints = 0} e o viewer cai nas aproximações antigas em vez de
+     * receber cor inventada.
+     */
+    private static byte[] resolveColumnTints(LevelChunk chunk, int[] topY) {
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null || chunk.getLevel() != level) {
+            return null;
+        }
+        try {
+            byte[] out = new byte[TINT_COLUMNS * 9]; // 3 mapas × 256 colunas × 3 canais
+            BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+            int minY = level.getMinY();
+            int originX = chunk.getPos().getMinBlockX();
+            int originZ = chunk.getPos().getMinBlockZ();
+            for (int z = 0; z < 16; z++) {
+                for (int x = 0; x < 16; x++) {
+                    int column = (z << 4) | x;
+                    int y = topY[column] == Integer.MIN_VALUE ? minY : topY[column];
+                    pos.set(originX + x, y, originZ + z);
+                    writeRgb(out, column, BiomeColors.getAverageGrassColor(level, pos));
+                    writeRgb(out, TINT_COLUMNS + column, BiomeColors.getAverageFoliageColor(level, pos));
+                    writeRgb(out, 2 * TINT_COLUMNS + column, BiomeColors.getAverageWaterColor(level, pos));
+                }
+            }
+            return out;
+        } catch (RuntimeException e) {
+            if (!loggedTintFailure) {
+                loggedTintFailure = true;
+                BaritoneOrchestratorAddon.LOGGER.warn("[tint] falha ao resolver cores de bioma: {}", e.toString());
+            }
+            return null;
+        }
+    }
+
+    /** Grava `r, g, b` de uma cor ARGB (formato do {@link BiomeColors}) na
+     *  posição da coluna do payload de tints. */
+    private static void writeRgb(byte[] out, int column, int argb) {
+        int base = column * 3;
+        out[base] = (byte) ((argb >> 16) & 0xFF);
+        out[base + 1] = (byte) ((argb >> 8) & 0xFF);
+        out[base + 2] = (byte) (argb & 0xFF);
     }
 
     /**
