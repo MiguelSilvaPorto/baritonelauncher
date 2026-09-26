@@ -31,7 +31,16 @@ import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
  */
 
 const BLOCK_TEXTURE_PX = 16; // resolução dos tiles do atlas (frames 32×32 são reduzidos lá)
-const COLOR_BG = 0x0a0c0f;
+// Céu: o addon ainda não manda a hora do mundo, então o viewer não cicla
+// dia/noite (ver "Known gaps" no README) — este gradiente é uma aproximação
+// fixa de dia claro. O horizonte é também a cor do fog e do canvas: é nele
+// que o terreno distante se dissolve.
+const SKY_ZENITH = "#2f6ba8";
+const SKY_MID = "#6f9cc9";
+const SKY_HORIZON = "#c2d6e8";
+/** Raio do domo de céu: dentro do `far` da câmera (5000) e maior que o
+ * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
+const SKY_RADIUS = 3000;
 const COLOR_TEAL = 0x5eead4;
 
 // Movimento por teclado ("voo" pela cena): o OrbitControls sozinho só responde
@@ -406,13 +415,15 @@ export class Viewer3D {
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
+  /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
+  private sky: THREE.Mesh;
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement) {
     this.container = container;
     this.labelEl = labelEl;
 
     this.scene = new THREE.Scene();
-    this.fog = new THREE.Fog(COLOR_BG, FOG_NEAR_BASE, FOG_FAR_BASE);
+    this.fog = new THREE.Fog(SKY_HORIZON, FOG_NEAR_BASE, FOG_FAR_BASE);
     this.scene.fog = this.fog;
 
     // `far` acompanha o `maxDistance` do OrbitControls: com o zoom livre
@@ -421,7 +432,9 @@ export class Viewer3D {
     this.camera.position.set(40, 45, 40);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-    this.renderer.setClearColor(COLOR_BG, 1);
+    // O domo cobre a tela; isto é o fundo de segurança (o que aparece antes do
+    // primeiro frame), por isso a cor do horizonte.
+    this.renderer.setClearColor(SKY_HORIZON, 1);
     container.appendChild(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
@@ -452,6 +465,9 @@ export class Viewer3D {
     sun.position.set(80, 120, 40);
     this.scene.add(sun);
 
+    this.sky = this.buildSky();
+    this.scene.add(this.sky);
+
     this.botMarker = this.buildBotMarker();
     this.botMarker.visible = false;
     this.scene.add(this.botMarker);
@@ -481,6 +497,40 @@ export class Viewer3D {
     ring.position.y = 0.02;
     group.add(ring);
     return group;
+  }
+
+  /** Domo de céu com gradiente vertical (zênite → horizonte) numa textura de
+   * canvas — mais simples que um shader próprio e sem conversão manual de
+   * color space. `BackSide` = visto por dentro; `fog: false` = a neblina não
+   * engole o céu; `depthWrite: false` = nunca esconde o terreno, seja qual for
+   * a distância da câmera. */
+  private buildSky(): THREE.Mesh {
+    const canvas = document.createElement("canvas");
+    canvas.width = 2;
+    canvas.height = 256;
+    const ctx = canvas.getContext("2d")!;
+    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    gradient.addColorStop(0, SKY_ZENITH);
+    gradient.addColorStop(0.55, SKY_MID);
+    gradient.addColorStop(1, SKY_HORIZON);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    const sky = new THREE.Mesh(
+      new THREE.SphereGeometry(SKY_RADIUS, 32, 16),
+      new THREE.MeshBasicMaterial({
+        map: texture,
+        side: THREE.BackSide,
+        fog: false,
+        depthWrite: false,
+        toneMapped: false,
+      })
+    );
+    sky.frustumCulled = false; // está sempre na câmera — nunca cullar
+    return sky;
   }
 
   /** Chave numérica (x,z): o mundo do Minecraft cabe em |x|,|z| < 30M, então
@@ -1141,6 +1191,13 @@ export class Viewer3D {
     this.controls.target.add(move);
   }
 
+  /** O domo é centrado na câmera (não no alvo): o horizonte do gradiente fica
+   * sempre na linha do olhar, e o domo nunca "fica pra trás" quando a câmera
+   * se afasta do bot. */
+  private updateSky() {
+    this.sky.position.copy(this.camera.position);
+  }
+
   /** O fog acompanha a distância câmera→alvo: mantém o gradiente de
    * profundidade no enquadramento normal, mas não deixa o terreno distante
    * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). */
@@ -1212,6 +1269,7 @@ export class Viewer3D {
     this.applyMovement(dt);
     this.updateBotMarker(dt);
     this.controls.update();
+    this.updateSky();
     this.updateFog();
     this.updateAnimation(now);
     this.renderer.render(this.scene, this.camera);

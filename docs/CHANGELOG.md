@@ -148,6 +148,12 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Céu no viewer 3D**: o fundo era uma cor chapada quase preta, então o horizonte e a profundidade do
+  terreno sumiam — com o zoom afastado o mundo parecia flutuar no vazio. Agora há um domo de céu com
+  gradiente (zênite azul → horizonte claro) numa textura de canvas, sempre centrado na câmera, e o
+  *fog* passou a usar a cor do horizonte: o terreno distante se dissolve no céu em vez de virar um
+  borrão escuro. É um céu fixo de dia claro — o addon ainda não manda a hora do mundo, então ele não
+  cicla com o dia/noite do jogo (ver "Known gaps").
 - **Mundo de verdade no viewer — cada chunk vem inteiro, não mais uma placa lisa**: quando o cliente
   carrega um chunk, o addon serializa todas as seções 16×16×16 não-vazias (paleta de blocos com o
   level de fluido + 4096 índices por seção, a mesma divisão e a mesma ordem do `PalettedContainer` do
