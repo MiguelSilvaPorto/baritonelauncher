@@ -29,7 +29,14 @@ const COLOR_TEAL = 0x5eead4;
 // representante fixo só pra provar que o atlas extraído do jar local
 // funciona ponta a ponta — vira textura real por chunk assim que o addon
 // mandar o bloco de superfície de verdade.
-const PLACEHOLDER_TEXTURE = "grass_block_top";
+//
+// Não usa "grass_block_top": essa textura vem cinza no jar por design —
+// RGB médio (147,147,147), R=G=B — porque o verde real é aplicado em
+// runtime pelo jogo via "biome tint" (multiplicação de cor por bioma,
+// textures/colormap/grass.png, ver docs/SPEC.md "Blocos 3D"), não
+// implementado ainda. "dirt" já vem com cor real no arquivo (134,96,67),
+// sem depender de tint nenhum.
+const PLACEHOLDER_TEXTURE = "dirt";
 
 export interface ChunkPos {
   x: number;

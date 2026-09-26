@@ -183,7 +183,9 @@ There is no test suite yet.
   described in `docs/SPEC.md`.
 - **No real terrain, only a placeholder texture.** The texture atlas pipeline (`texture_atlas.rs`)
   works and is wired into `viewer3d.ts`, but every chunk plate gets the same hardcoded
-  `PLACEHOLDER_TEXTURE` ("grass_block_top") because `chunk_loaded` is still presence-only — no actual
+  `PLACEHOLDER_TEXTURE` ("dirt" — not a tinted texture like grass, which is stored gray in the jar and
+  needs runtime biome-tint multiplication we don't do; see the constant's comment in `viewer3d.ts`)
+  because `chunk_loaded` is still presence-only — no actual
   block content or height-per-column comes from the addon. Fixing this needs a protocol change
   (addon sends real block/height data), not more atlas work.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.

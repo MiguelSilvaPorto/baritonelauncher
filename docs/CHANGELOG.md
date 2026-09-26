@@ -12,6 +12,13 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Placa texturizada saía sem cor nenhuma (cinza)**: o representante fixo usado enquanto o addon não
+  manda o bloco real de cada chunk era `grass_block_top` — e essa textura, dentro do jar, é
+  literalmente cinza (RGB médio 147,147,147, R=G=B); a cor verde real só existe em runtime, via
+  "biome tint" (`textures/colormap/grass.png`, multiplicação de cor por bioma — ver `docs/SPEC.md`,
+  "Blocos 3D"), não implementado. Confirmado lendo os pixels crus do jar (`dirt` = RGB 134,96,67 real,
+  sem depender de tint nenhum). Trocado o representante pra `dirt`, que mostra cor de verdade sem
+  precisar de tint. Reportado pelo usuário ("sem cores").
 - **Chunks que chegavam antes do atlas terminar de carregar ficavam sem textura pra sempre**: o atlas
   é buscado de forma assíncrona (`get_texture_atlas`), mas o backfill de reconexão manda dezenas de
   `chunk_loaded` de uma vez (49 num caso real) — praticamente sempre antes do atlas resolver.

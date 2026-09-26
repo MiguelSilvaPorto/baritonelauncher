@@ -81,7 +81,7 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   (`src/viewer3d.ts`, Three.js/WebGL) já renderiza os chunks explorados e o bot em coordenadas reais
   numa cena orbitável de verdade, e já texturiza cada placa com uma textura real extraída do jar local
   (`src-tauri/src/texture_atlas.rs`) — mas hoje é sempre a mesma textura representante
-  (`grass_block_top`), não o bloco real de cada chunk, porque o addon ainda só manda presença de chunk,
+  (`dirt`), não o bloco real de cada chunk, porque o addon ainda só manda presença de chunk,
   não conteúdo. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio webview
   do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela separada sem
   conseguir validar visualmente.)
