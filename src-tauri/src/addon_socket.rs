@@ -37,6 +37,7 @@ use base64::Engine;
 use flate2::read::ZlibDecoder;
 use serde::Deserialize;
 use std::io::Read;
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -192,11 +193,16 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 *state.bot_pos.lock().unwrap() = Some(BlockPos { x, y, z });
             }
             AddonMessage::ChunkVoxels { x, z, data } => match decode_chunk_payload(&data) {
-                Ok(sections) => state
-                    .world
-                    .lock()
-                    .unwrap()
-                    .apply_voxels(ChunkPos { x, z }, sections),
+                Ok(sections) => {
+                    state
+                        .world
+                        .lock()
+                        .unwrap()
+                        .apply_voxels(ChunkPos { x, z }, sections);
+                    // Avisa o gravador periódico (`lib.rs`, `world_store`)
+                    // que há coisa nova pra persistir.
+                    state.world_revision.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(err) => eprintln!("[addon_socket] chunk_voxels inválido em ({x}, {z}): {err}"),
             },
             AddonMessage::InstructionStatus { id, status, progress } => {

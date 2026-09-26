@@ -69,11 +69,12 @@ There is no test suite yet.
 ## 5. Non-negotiable rules
 
 1. **No fabricated data in shipped UI.** Every Tauri command in `src-tauri/src/lib.rs` returns real
-   state — `connection_status`/`vitals_snapshot` now reflect the addon's actual socket messages when
-   connected; `queue_snapshot`/`storage_totals` still return empty vectors because nothing populates
-   them yet. If you're tempted to hardcode a sample queue or chest so the UI "looks alive," don't —
-   render the honest empty state instead (see `renderQueueInto`/`renderStorage` in `src/main.ts` for
-   the pattern) and say in your reply that the feature has no backend yet.
+   state — `connection_status`/`vitals_snapshot` reflect the addon's actual socket messages when
+   connected, `queue_snapshot` reflects the real instruction queue (`queue_push`/`queue_cancel` +
+   `instruction_status` from the addon), and `storage_totals` still returns an empty vector because
+   nothing populates it yet. If you're tempted to hardcode a sample queue or chest so the UI "looks
+   alive," don't — render the honest empty state instead (see `renderQueueInto`/`renderStorage` in
+   `src/main.ts` for the pattern) and say in your reply that the feature has no backend yet.
 2. **Never hardcode colors in CSS/inline styles.** Use the custom properties in `:root` in
    `src/styles.css` (`--bg-*`, `--amber`, `--teal`, `--success`, `--text-*`, `--border*`). They are the
    literal tokens from `docs/SPEC.md`'s "Identidade visual" table — don't introduce new colors without
@@ -132,23 +133,35 @@ There is no test suite yet.
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, all behind `Mutex`) + the seven
-  commands currently exposed: `connection_status`, `world_summary`, `world_chunks`, `queue_snapshot`,
-  `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns `addon_socket::listen` in `setup()`.
-- `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line. Handles `hello`
-  (marks `AppState.connection` as connected), `vitals` (fills `AppState.vitals`), `position` (fills
-  `AppState.bot_pos`), and `chunk_loaded` (marks presence in `AppState.world` via `apply_delta` with
-  an empty block map — deliberately cumulative, not removed on unload; see the module doc-comment for
-  why) and stores the version from `hello` in `AppState.mc_version` (used by `texture_atlas.rs` to
-  find the matching local jar — never hardcode a version here, read it from this field). The matching
-  Java client is
+  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, plus `addon_tx` — the outbound
+  write channel to the addon, all behind `Mutex`) + the commands currently exposed:
+  `connection_status`, `world_summary`, `world_chunks`, `chunk_voxels`, `queue_snapshot`,
+  `queue_push`, `queue_cancel`, `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns
+  `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
+  are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
+  handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world
+  (`world_store::load`) and spawns `world_store_task`, which saves when `world_revision` changes;
+  `RunEvent::Exit` does a final save.
+- `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line, **both
+  directions**. Addon → app: `hello` (marks `AppState.connection` as connected + dispatches queued
+  instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos`),
+  `chunk_voxels` (full chunk, palette + indices per section, deflate+base64 → `world_cache.rs`) and
+  `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
+  the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
+  a task consuming `AppState.addon_tx`, registered per connection. Stores the version from `hello`
+  in `AppState.mc_version` (used by `texture_atlas.rs` to find the matching local jar — never
+  hardcode a version here, read it from this field). The matching Java client is
   `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
-  Extending the protocol further (e.g. real block data, chest contents) means updating the
-  `AddonMessage` enum here **and** the Java sender in lockstep — they're not generated from a shared
-  schema.
-- `world_cache.rs` — sparse per-chunk block cache (`WorldCache`). Chunk presence is real
-  (`chunk_loaded` messages), but no chunk has actual block data yet — the addon doesn't send any.
-  Also `CrossingStrategy` for the learned water/lava crossing policy.
+  Extending the protocol further (e.g. chest contents) means updating the `AddonMessage` enum here
+  **and** the Java sender/receiver in lockstep — they're not generated from a shared schema.
+- `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
+  + indices per 16×16×16 section). Also `CrossingStrategy` for the learned water/lava crossing policy.
+- **`world_store.rs`** — persists `WorldCache` + the last `mc_version` to `world.cache` in the app
+  data dir (`~/.local/share/dev.baritone.orchestrator/` on Linux), zlib-compressed with a magic +
+  version header and atomic writes (`tmp` + rename). Loaded in `setup()`; saved every 5s only when
+  `AppState.world_revision` changed (bumped by `addon_socket` per chunk) and once on
+  `RunEvent::Exit`. Reuses `encode_voxels`/`decode_voxels` — one binary format for socket, IPC and
+  disk. `crossing_hints` are **not** persisted yet.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
   `src-tauri/.cache/` (gitignored). **Never download or bundle Mojang assets** — this reads only what
@@ -181,21 +194,23 @@ There is no test suite yet.
 
 ## 7. Known gaps (be honest about these, don't paper over them)
 
-- **`chunk_loaded` only marks presence, no block data.** `WorldCache.chunks[pos].blocks` stays empty —
-  no chest/inventory data, no instructions sent from the Rust side to the addon yet either;
-  `StorageIndex`/`InstructionQueue` stay empty even with the addon connected.
+- **No chest/inventory data.** `StorageIndex` stays empty — `chunk_voxels` carries terrain, but no
+  block entities, and there's no `ContainerScreen` simulation to read chests (see `docs/SPEC.md`,
+  "Índice de armazenamento").
+- **Instructions only cover `travel_to`/`explore`.** The reverse channel works end to end
+  (`queue_push` → addon → `instruction_status`), but `Mine`/`Build`/`FetchFromChest`/`Craft`/`Smelt`
+  have no executor in the addon yet, and the UI composer only creates the two executable kinds.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **No real terrain, only a placeholder texture.** The texture atlas pipeline (`texture_atlas.rs`)
-  works and is wired into `viewer3d.ts`, but every chunk plate gets the same hardcoded
-  `PLACEHOLDER_TEXTURE` ("dirt" — not a tinted texture like grass, which is stored gray in the jar and
-  needs runtime biome-tint multiplication we don't do; see the constant's comment in `viewer3d.ts`)
-  because `chunk_loaded` is still presence-only — no actual
-  block content or height-per-column comes from the addon. Fixing this needs a protocol change
-  (addon sends real block/height data), not more atlas work.
+- **Biome tint is a fixed approximation, not the real colormap.** Grass/foliage/water textures are
+  gray in the jar and get fixed tints (`GRASS_TINT` and friends in `viewer3d.ts`) instead of a
+  per-column biome lookup — visually close, not exact. Blockstates (stair orientation, log axis,
+  slabs) also aren't modeled yet: every block renders as a full cube.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
-- **`StorageIndex` is in-memory only** — no persistence across restarts.
+- **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*
+  persisted now — one global `world.cache` per app, so switching between servers/worlds mixes their
+  chunks in the same cache; there's no per-world separation yet.)
 - **Schematic editor is a placeholder panel**, not an implementation.
 
 ## 8. Language and comment rules

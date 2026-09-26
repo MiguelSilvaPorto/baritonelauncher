@@ -90,14 +90,16 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `fits_inventory_2x2`, mas nada os popula ainda. (Diferente do atlas de texturas, que já lê o jar
   local de verdade — isso aqui ainda não foi implementado.)
 - **Editor de schematic** — placeholder na UI explicando a dependência do atlas de texturas.
-- **Persistência** do `StorageIndex` (hoje só em memória).
+- **Persistência** do `StorageIndex` (hoje só em memória) — o **mundo explorado** já é salvo em
+  disco e reaparece com o jogo fechado (ver `src-tauri/src/world_store.rs`).
 
 ## Estrutura do repositório
 
 - `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `viewer3d.ts` (o renderer 3D,
   Three.js/WebGL) + `styles.css`.
-- `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon) e
-  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada).
+- `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon),
+  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada) e
+  `world_store.rs` (grava/carrega o mundo explorado em disco).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.
