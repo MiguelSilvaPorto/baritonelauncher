@@ -19,7 +19,8 @@ arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mud
 > dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
 > chunks explorados e o **jogador com o modelo e a skin reais do jogo** em coordenadas reais) e a
 > **fila executando `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) estão
-> implementados e testados manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não
+> implementados e testados manualmente, além de uma **aba Config** com preferências reais salvas em
+> disco (viewer 3D e cadência do polling). Baús e instruções de `#build`/`#mine`/craft ainda não
 > existem — ver "O que falta" abaixo.
 
 ## Arquitetura
@@ -82,9 +83,11 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `docs/SPEC.md`, sem código ainda.
 - **Terreno real com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
   (`src/viewer3d.ts`, Three.js/WebGL) renderiza os voxels reais do `chunk_voxels` em coordenadas
-  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`); o que
-  falta é blockstate (escada/eixo de tora/slab) e tint real por bioma — hoje todo bloco é um cubo com
-  tint fixo aproximado. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio
+  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`) e tint de
+  bioma real por coluna (grama/folhagem/água, resolvido pelo `BiomeColors` do client no addon); o que
+  falta é blockstate (escada/eixo de tora/slab) — hoje todo bloco é um cubo cheio, e o bioma é
+  amostrado no topo da coluna (bloco subterrâneo usa o bioma da superfície). (O spec descreve esse
+  renderer como wgpu nativo; aqui é WebGL dentro do próprio
   webview do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela
   separada sem conseguir validar visualmente.)
 - **Ingestão do `minecraft-data`** (itens/blocos/receitas) — os structs Rust (`Item`, `Block`,
@@ -104,8 +107,9 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 - `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `viewer3d.ts` (o renderer 3D,
   Three.js/WebGL) + `styles.css`.
 - `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon),
-  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada) e
-  `world_store.rs` (grava/carrega o mundo explorado em disco).
+  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada),
+  `world_store.rs` (grava/carrega o mundo explorado em disco) e `settings.rs` (preferências da aba
+  Config, em `settings.json` no diretório de dados do app).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.

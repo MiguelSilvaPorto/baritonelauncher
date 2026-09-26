@@ -25,8 +25,8 @@ At the repository root — the app directory. It contains:
 - `src/` — frontend: `main.ts` (all UI logic, no framework) + `styles.css`.
 - `src-tauri/` — Rust/Tauri backend, single crate (`src/lib.rs` + one module per domain concept:
   `world_cache.rs`, `storage_index.rs`, `items.rs`, `vitals.rs`, `time_estimate.rs`,
-  `instructions.rs`, `addon_socket.rs`).
-- `index.html` — the entire UI markup (titlebar, rail, the four views: viewer/editor/fila/armazém).
+  `instructions.rs`, `addon_socket.rs`, `settings.rs`).
+- `index.html` — the entire UI markup (titlebar, rail, the five views: viewer/editor/fila/armazém/config).
 - `mod-addon/` — **real NeoForge project** (from the official MDK), bridges Baritone to the socket
   above. See its `README.md` for what's implemented vs. still missing.
 - `docs/SPEC.md` — the full product/architecture spec. Treat it as the source of truth for behavior
@@ -119,13 +119,21 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 
 **Frontend (`src/main.ts`)**
 - View router: `setMode(name)` toggles `.view.active` / `.rail-btn.active`; views are `viewer`,
-  `editor`, `fila`, `armazem`.
-- `refreshState()` polls the Tauri commands every `REFRESH_INTERVAL_MS` (1s, matching the addon's
-  vitals cadence) — there is no push from the Rust side, so this is polling, not a stream. It used to
-  run once on load only; that was a real bug (UI froze on whatever was true at page load) fixed once
-  the addon bridge existed and made it observable — don't reintroduce a one-shot call. Player pose is
-  polled separately (`refreshPose`, 250ms = the addon's `position` cadence) so the model walks
-  smoothly instead of jumping once a second.
+  `editor`, `fila`, `armazem`, `config`.
+- `refreshState()` polls the Tauri commands every `settings.state_interval_ms` (default 1s, matching
+  the addon's vitals cadence) — there is no push from the Rust side, so this is polling, not a
+  stream. It used to run once on load only; that was a real bug (UI froze on whatever was true at
+  page load) fixed once the addon bridge existed and made it observable — don't reintroduce a
+  one-shot call. Player pose is polled separately (`refreshPose`, default 250ms = the addon's
+  `position` cadence) so the model walks smoothly instead of jumping once a second. Both intervals
+  come from the Config tab and are applied by recreating the timers (`restartPolling`) — a preference
+  change must not require an app restart.
+- **Config tab** (`view-config` in `index.html`) — the controls are markup in `index.html` but their
+  values always come from the backend (`settings_get`; commands `settings_set`/`settings_reset`), and
+  they stay disabled until it answers: no defaults duplicated in the frontend. `applySettings` fans a
+  change out to the viewer (`Viewer3D.applySettings`), the polling timers and `renderConfig`; saves
+  are debounced (a range drag fires `input` per frame) and the effective value the backend returns
+  wins — it may differ if a range clamped it. See `settings.rs`.
 - `renderViewer`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest empty state when
   the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
   rows.
@@ -135,7 +143,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real
   face culling (including against already-loaded neighbors); the mesh work is queued and drained with
   a per-frame budget (`drainMeshQueue`), and `main.ts` asks for the nearest chunks first
-  (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). Chunks
+  (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). The
+  day/night cycle (`setWorldTime`/`updateDayNight`) follows the addon's real `world_time`, moving
+  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. Chunks
   are added once and never removed (cumulative "explored" semantics, matching `WorldCache`). It also
   hosts the **schematic editor**: voxel DDA picking (`pickBlock` — meshes are merged per chunk, so a
   `Raycaster` can't map back to a block), the edit layer (`edits` + `rebuildGhosts`, amber
@@ -159,13 +169,14 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`player_skin`, plus
+  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`world_time`/
+  `player_skin`, `settings` (Config tab), plus
   `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
   `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
-  `vitals_snapshot`, `bot_pose`, `player_skin`,
-  `get_texture_atlas`. Spawns
+  `vitals_snapshot`, `bot_pose`, `world_time`, `player_skin`,
+  `get_texture_atlas`, `settings_get`, `settings_set`, `settings_reset`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world
@@ -174,9 +185,13 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - `addon_socket.rs` — TCP server on `127.0.0.1:31173`, one JSON message per line, **both
   directions**. Addon → app: `hello` (marks `AppState.connection` as connected + dispatches queued
   instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos` and
-  `AppState.bot_pose` — feet coordinates plus yaw/pitch), `player_skin` (the player's own skin as a
+  `AppState.bot_pose` — feet coordinates plus yaw/pitch), `world_time` (the overworld clock in
+  ticks → the viewer's day/night cycle), `player_skin` (the player's own skin as a
   base64 PNG, sent whenever the texture changes → `player_skin.rs`),
-  `chunk_voxels` (full chunk, palette + indices per section, deflate+base64 → `world_cache.rs`) and
+  `chunk_voxels` (full chunk, palette + indices per section, **plus per-column biome tints** —
+  grass/foliage/water colors the addon resolves with the client's own `BiomeColors`, payload v3;
+  v2 is still accepted for old caches/addon jars, without tints — deflate+base64 →
+  `world_cache.rs`) and
   `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
   the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
   a task consuming `AppState.addon_tx`, registered per connection. Stores the version from `hello`
@@ -190,13 +205,22 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   already has (its texture cache for downloaded skins, or the installed resource pack/jar for the
   default one) — **never** fetched from Mojang's CDN, same rule as `texture_atlas.rs`.
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
-  + indices per 16×16×16 section). Also `CrossingStrategy` for the learned water/lava crossing policy.
+  + indices per 16×16×16 section, plus per-column biome tints since payload v3 — see `ChunkTints`).
+  Also `CrossingStrategy` for the learned water/lava crossing policy.
 - **`world_store.rs`** — persists `WorldCache` + the last `mc_version` to `world.cache` in the app
   data dir (`~/.local/share/dev.baritone.orchestrator/` on Linux), zlib-compressed with a magic +
   version header and atomic writes (`tmp` + rename). Loaded in `setup()`; saved every 5s only when
   `AppState.world_revision` changed (bumped by `addon_socket` per chunk) and once on
   `RunEvent::Exit`. Reuses `encode_voxels`/`decode_voxels` — one binary format for socket, IPC and
   disk. `crossing_hints` are **not** persisted yet.
+- **`settings.rs`** — user preferences (Config tab) as pretty JSON in `settings.json`, in the same
+  app data dir as `world.cache`, written atomically (`tmp` + rename) on every change. Plain JSON is
+  deliberate here: the file is tiny and `#[serde(default)]` tolerates model evolution — a new field
+  falls back to its default instead of invalidating the user's file. Defaults mirror the constants
+  the frontend used before the tab existed; `Settings::sanitized` clamps every field to the accepted
+  range (the backend is the source of truth — a hand-edited file can't set fog to 5 blocks or polling
+  to 1 ms) and the commands return the **effective** value, so the UI never shows a value the backend
+  refused. Unit tests cover round-trip, missing/corrupt file, clamping and partial JSON.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
   `src-tauri/.cache/` (gitignored; the cache name carries `ATLAS_CACHE_VERSION`). **Never download or
@@ -237,8 +261,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   at runtime, not just compiles) and streams vitals (1x/s) and position + yaw/pitch (4x/s,
   `playerFeet()`) to the socket, with a 5s reconnect backoff if the Rust app isn't up. Also sends the
   player's own skin (`player_skin`, only when the texture changes — read from the client's own
-  texture cache/resource pack) and subscribes to `ChunkEvent.Load` (filtered to `ClientLevel`) to
-  send one `chunk_voxels` per chunk — separate from the tick loop.
+  texture cache/resource pack), the world clock (`world_time`, 1x/s, from
+  `getOverworldClockTime()`), and subscribes to `ChunkEvent.Load` (filtered to `ClientLevel`) to
+  send one `chunk_voxels` per chunk (sections + per-column biome tints resolved with the client's own
+  `BiomeColors`, sampled at the top block of each column) — separate from the tick loop.
 - `neoforge.mods.toml` (templated from `gradle.properties`) declares Baritone as a required dependency
   — modid is `baritoe`, confirmed from the real jar, not `baritone`.
 
@@ -255,14 +281,19 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   have no executor in the addon yet, and the UI composer only creates the two executable kinds.
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
-- **Clouds are fixed overworld/day.** The cloud layer always uses the overworld height (192.33), the
-  daytime color (white, alpha 0.8) and the viewer's scene fog instead of the game's own 2048-block
-  cloud fog — the addon doesn't send the dimension or the world time, so there's nothing real to key
-  them off yet.
-- **Biome tint is a fixed approximation, not the real colormap.** Grass/foliage/water textures are
-  gray in the jar and get fixed tints (`GRASS_TINT` and friends in `viewer3d.ts`) instead of a
-  per-column biome lookup — visually close, not exact. Blockstates (stair orientation, log axis,
-  slabs) also aren't modeled yet: every block renders as a full cube.
+- **Clouds are fixed overworld height, with the viewer's fog.** The pattern, the 192.33 height, the
+  12×12×4 cells, the per-face shading, the 0.6 block/s drift and the day/night color multiplier
+  (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`) are the game's, but the height is always the
+  overworld's (the addon doesn't send the dimension) and the fade uses the viewer's scene fog instead
+  of the game's own 2048-block cloud fog.
+- **Biome tint is real, but per column (surface) and only for what the viewer draws.** The addon
+  samples the top block of each chunk column and sends grass/foliage/water colors resolved by the
+  client's own `BiomeColors` — the same colormap + biome modifier the game renders with — so each
+  biome now has its real color (`viewer3d.ts` applies them per block; `GRASS_TINT` and friends are
+  only the fallback for chunks from an old `world.cache` or an old addon jar). Cave/underground
+  blocks still use the surface biome of their column, there's no per-biome sky/fog color, and
+  blockstates (stair orientation, log axis, slabs) still aren't modeled: every block renders as a
+  full cube.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
 - **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*

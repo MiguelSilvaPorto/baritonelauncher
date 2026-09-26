@@ -10,8 +10,66 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ## [Não lançado]
 
+### Added
+
+- **Cores de bioma reais no viewer — fim do verde único**: o addon agora manda, junto de cada chunk, as
+  cores de bioma **por coluna** (grama, folhagem e água), resolvidas pelo `BiomeColors` do próprio
+  client — o mesmo colormap de temperatura/umidade, override de bioma e modificador de
+  pântano/floresta escura que o jogo aplica ao renderizar. O viewer usa essa cor por bloco: topo do
+  `grass_block`, folhas (carvalho, jungle, acácia, dark oak, mangrove), videira, lírio-d'água,
+  cana-de-açúcar e água (que agora é tingida por vértice, não por material único). Cada bioma passa a
+  ter a cor que tem no jogo — savana amarelada, pântano escuro com água marrom, taiga azulada,
+  badlands alaranjado etc. — em vez de um "verde floresta" fixo. O payload binário dos chunks sobe
+  pro formato 3 (bloco de tints no fim; o `world.cache` gravado antes continua abrindo, só sem tints,
+  caindo nas cores fixas aproximadas) e **o jar do addon precisa ser rebuildado** — com o jar antigo o
+  app avisa no console e mantém o comportamento antigo.
+- **Lado do bloco de grama com a camada de overlay do jogo**: o lado do `grass_block` só tinha a
+  textura base (terra + franja fixa, que não muda de bioma); o modelo vanilla desenha uma segunda
+  camada cinza (`grass_block_side_overlay`) por cima, tingida com a cor de grama do bioma. Agora o
+  viewer desenha essa camada também, então o lado da grama acompanha o bioma tanto quanto o topo.
+- **Aba "Config" com preferências reais, salvas em disco**: quinta view na rail (engrenagem) pra
+  ajustar o **viewer 3D** e o **comportamento do app**, sem mudar nada até o usuário mexer — os
+  padrões são exatamente as constantes que o app já usava. No viewer: distância do horizonte (fog),
+  orçamento de montagem de malha por frame, teto de pixel ratio (1× / 1,5× / 2×, útil em tela HiDPI) e
+  teto de FPS (sem limite por padrão). No comportamento: intervalos do polling de estado e de pose
+  (padrão 1 s / 250 ms, as cadências do addon) e quantos chunks o viewer pede por atualização (16). O
+  backend é a fonte da verdade: as preferências ficam em `settings.json` no diretório de dados do app
+  (JSON pequeno e legível, gravado de forma atômica), valores fora da faixa são presos no backend e a
+  UI mostra o valor **efetivo**, e "Restaurar padrões" volta tudo pro comportamento original. Pedido
+  pelo usuário ("quero que vc adicione um configuração no meu app").
+
 ### Fixed
 
+- **Controles da câmera: WASD invertia olhando pra baixo, órbita continuava girando e o boneco
+  deslizava depois que o bot parava**: três ajustes independentes. (1) Com a câmera quase vertical, a
+  projeção da direção de visão no chão degenera — e o fallback usava o eixo local `-Y` (o "para
+  baixo" da tela) como frente, o que invertia W/S justo quando se olha pra baixo; agora usa o `+Y` (o
+  "para cima" da tela), com limiar maior pra não oscilar perto da vertical. (2) A inércia da órbita
+  era longa (`dampingFactor` 0.08 — continuava girando por segundos depois de soltar o mouse); agora
+  é 0.22 (para em ~0,4 s) e a rotação por arrasto ficou 20% menos sensível. (3) O boneco seguia a pose
+  com suavização exponencial, que nunca fechava a conta — continuava deslizando por cima do alvo
+  depois que o bot parava, com a câmera indo junto; agora o follow cobre a distância no intervalo real
+  entre poses (250 ms) em velocidade constante e chega exato, e a caminhada zera de verdade quando o
+  deslocamento é só ruído de interpolação. Reportado pelo usuário ("os comando se inverte o wasd se
+  eu olho para baixo... a camera fica girando muito... vai deslizando sem parar").
+- **"Separação"/grade visível entre os blocos de longe**: o atlas não tinha folga entre os tiles nem
+  mipmaps, então de longe cada face de bloco amostrava um texel diferente do vizinho — blocos do mesmo
+  terreno ganhavam tons ligeiramente distintos e o chão virava uma grade de quadrados ("separação") em
+  vez de uma superfície contínua, além de cintilar com a distância (aliasing de minificação). Agora o
+  atlas é empacotado com uma folga de 8px em volta de cada tile, preenchida replicando a borda do
+  próprio tile — o mesmo truque do atlas do próprio Minecraft — e o viewer usa mipmaps
+  (`NearestMipmapLinearFilter`: nítido de perto, média entre níveis de longe) com anisotropia. Cada
+  nível de mip mistura só conteúdo do mesmo bloco, então some a grade e a cintilação. Reportado pelo
+  usuário ("essa separação que fica quando eu enxergo de longe").
+- **Videira (e líquen brilhante / veia de sculk) não apareciam no viewer**: o addon decide o que
+  desenhar olhando `canBeReplaced()` do bloco — e no registro vanilla a videira é `.replaceable()`,
+  então saía do payload com flags zero. Resultado: um bioma de selva cheio de videira aparecia sem
+  nenhuma, mesmo o bloco existindo no chunk carregado. Agora videira e os blocos de face
+  (`MultifaceBlock`) entram como renderizáveis de propósito — são geometria visível colada nas
+  paredes, não decoração em cruz; grama alta, flor e muda continuam fora do desenho (virariam cubo
+  cheio e poluiriam a cena). A textura `vine` e o tint de folhagem já existiam no viewer; o que
+  faltava era o bloco chegar marcado. Reportado pelo usuário ("quero que vc arrume as videiras que
+  não são carregadas o bioma que estou não mostra videira nenhuma").
 - **Carregamento de chunks em ordem arbitrária, sem priorizar o que está ao redor do bot**: o viewer
   pedia `world_chunks` (o cache inteiro, que cresce sem limite) e usava os primeiros quatro na ordem
   em que o `HashMap` devolvia — o terreno ao redor do bot podia ser o último a chegar. Agora o
@@ -166,13 +224,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 - **Nuvens iguais às do jogo**: o viewer tinha céu, mas nenhuma nuvem. Agora o layer de nuvens é um
   porte do `CloudRenderer` do client: o padrão sai do PNG real do jar
   (`textures/environment/clouds.png`, 256×256, corte em alpha < 10), cada célula é uma caixa de
-  12×12×4 blocos com topo em **192.33** (a altura padrão do overworld), cor branca com alpha 0.8,
-  sombreamento por face como no jogo (base 0.7, topo 1.0, norte/sul 0.8, leste/oeste 0.9) e deriva de
-  **0.6 bloco/s** no eixo X (+3.96 fixo no Z, igual ao código vanilla), repetindo a cada 3072 blocos.
-  A textura sai do jar local (mesma regra do atlas: nunca baixa nada) e, sem ela, o viewer
-  simplesmente não desenha nuvens. Limitações honestas: é sempre o overworld de dia (o addon não manda
-  dimensão nem hora do mundo) e a névoa das nuvens usa a névoa do viewer em vez do fade próprio de
+  12×12×4 blocos com topo em **192.33** (a altura padrão do overworld), sombreamento por face como no
+  jogo (base 0.7, topo 1.0, norte/sul 0.8, leste/oeste 0.9) e deriva de **0.6 bloco/s** no eixo X
+  (+3.96 fixo no Z, igual ao código vanilla), repetindo a cada 3072 blocos. A cor acompanha o ciclo
+  dia/noite que o addon reporta: brancas de dia e azul quase preto à noite, como no multiplicador
+  noturno do `Timelines`. A textura sai do jar local (mesma regra do atlas: nunca baixa nada) e, sem
+  ela, o viewer simplesmente não desenha nuvens. Limitações honestas: a altura é sempre a do overworld
+  (o addon não manda a dimensão) e a névoa das nuvens usa a névoa do viewer em vez do fade próprio de
   2048 blocos do jogo — ver "Known gaps".
+- **Ciclo de dia e noite no viewer, dirigido pela hora real do mundo**: o addon agora manda a hora do
+  clock do overworld 1x/s (`world_time`, ticks 0..23999) e o viewer interpola a 20 ticks/s (1 dia =
+  20 min reais, como no jogo) movendo sol, lua, luz ambiente e o gradiente do céu — amanhecer e pôr
+  do sol deixam o horizonte quente, e a noite escurece a cena com uma luz de lua azulada. Sem jogo
+  conectado, a cena congela na última hora real (e fica no meio-dia fixo antes da primeira
+  mensagem), em vez de inventar um ciclo — `world_time` devolve `None` nesse caso. Reportado pelo
+  usuário ("quero que vc adicione o ciclo de dia e noite").
 - **Céu no viewer 3D**: o fundo era uma cor chapada quase preta, então o horizonte e a profundidade do
   terreno sumiam — com o zoom afastado o mundo parecia flutuar no vazio. Agora há um domo de céu com
   gradiente (zênite azul → horizonte claro) numa textura de canvas, sempre centrado na câmera, e o

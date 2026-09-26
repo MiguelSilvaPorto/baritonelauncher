@@ -23,8 +23,11 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   `chunk_voxels`: cada seção 16×16×16 vira paleta + índices (deflate + base64),
   com flags de renderização/oclusão/fluido e o nível de cada fluido — é daí
   que o viewer monta o terreno com face culling de verdade, inclusive água e
-  lava. A fila drena poucos chunks por tick pra um backfill de reconexão não
-  travar o jogo.
+  lava. Junto vai o bloco de **tints de bioma por coluna** (grama, folhagem e
+  água), resolvido pelo `BiomeColors` do próprio client — o mesmo colormap e
+  modificador de bioma que o jogo usa no render, então cada bioma aparece com
+  a cor real. A fila drena poucos chunks por tick pra um backfill de reconexão
+  não travar o jogo.
 - Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
   "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
   hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
@@ -73,15 +76,27 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
 - `{"type":"position","x":123,"y":64,"z":45,"yaw":90.0,"pitch":12.5}` — a
   cada ~5 ticks (yaw/pitch = rotação real do jogador, usada pra orientar o
   modelo no viewer).
+- `{"type":"world_time","day_time":6000}` — hora do clock do overworld em
+  ticks (0 = nascer do sol, 6000 = meio-dia, 12000 = pôr do sol, 18000 =
+  meia-noite), a cada ~20 ticks, junto dos vitais. O app interpola a 20
+  ticks/s pro ciclo de dia/noite do viewer; sem jogo conectado, ele congela na
+  última hora real.
 - `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` —
   quando a skin muda (inclui a padrão, se o perfil ainda não carregou a
   real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
   client ou do resource pack/jar instalado, nunca baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
-  (paleta + índices por seção, deflate + base64). Por entrada da paleta:
-  `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
-  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) — layout
-  completo em `world_cache.rs`, `decode_voxels` (formato 2).
+  (paleta + índices por seção, **mais os tints de bioma por coluna**, deflate +
+  base64). Por entrada da paleta: `u8` flags (`1` renderizável, `2` oclusor,
+  `4` fluido) + `u8` nível do fluido (blockstate vanilla: `0` fonte, `1..7`
+  fluindo, `8+` caindo). Depois das seções: `u8` tem_tints e, se `1`,
+  `256×3` bytes de grama + `256×3` de folhagem + `256×3` de água (colunas
+  `x + z*16`, cor RGB). Os tints saem do `BiomeColors` do client — colormap,
+  override e modificador de bioma já aplicados, igual ao render do jogo —
+  amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o
+  viewer cai nas cores fixas). Layout completo em `world_cache.rs`,
+  `decode_voxels` (formato 3; **formato 2, sem tints, ainda é aceito na
+  leitura** pro `world.cache` antigo).
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
   estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
   do `travel_to` — `explore` é contínuo e não tem progresso).

@@ -19,6 +19,13 @@
 //! puladas. Um tile branco sintético (`__white`) entra no fim do atlas como
 //! fallback tingível pra bloco sem textura resolvida — o viewer pinta o bloco
 //! com cor sólida por cima dele em vez de fingir que é outro bloco.
+//!
+//! Cada tile tem uma **folga (gutter)** de `TILE_PADDING` pixels em volta,
+//! preenchida replicando a borda do próprio tile. O viewer usa mipmaps no
+//! atlas (como o próprio jogo): sem folga, os níveis menores misturam texels
+//! do tile vizinho e o terreno ganha uma "grade"/separação visível de longe;
+//! com a folga, cada mip mistura só conteúdo daquele bloco. As UVs apontam
+//! pro miolo de 16×16, nunca pra folga.
 
 use base64::Engine;
 use image::{DynamicImage, Rgba, RgbaImage};
@@ -33,10 +40,21 @@ const TILE_SIZE: u32 = 16;
 /// partir dela (ver `viewer3d.ts`, `buildClouds`).
 const CLOUDS_JAR_ENTRY: &str = "assets/minecraft/textures/environment/clouds.png";
 
+/// Folga em volta de cada tile no atlas, preenchida replicando a borda do
+/// próprio tile. Com mipmaps ligados no viewer (ver `viewer3d.ts`), os níveis
+/// menores misturam texels vizinhos — sem folga, eles misturam o tile do
+/// lado e o terreno ganha uma grade visível de longe. 8px cobrem até o nível
+/// em que o bloco inteiro vira um texel, mantendo o mip centrado no tile.
+const TILE_PADDING: u32 = 8;
+
+/// Lado do bloco do tile no atlas (conteúdo + folga dos dois lados). Mantido
+/// potência de dois (32) pro mipmap alinhar com o bloco.
+const TILE_BLOCK: u32 = TILE_SIZE + 2 * TILE_PADDING;
+
 /// Sobe isto sempre que a extração/empacotamento mudar de formato: o cache
 /// em disco é reaproveitado sem checar conteúdo (`build_or_load_atlas`),
 /// então sem a versão no nome um atlas antigo continuaria valendo pra sempre.
-const ATLAS_CACHE_VERSION: u32 = 4;
+const ATLAS_CACHE_VERSION: u32 = 5;
 
 /// Nome do tile sintético (não existe no jar) usado como fallback de textura
 /// — o viewer pinta o bloco só com vertex color por cima dele.
@@ -233,8 +251,8 @@ fn build_atlas(jar_path: &Path, mc_version: &str) -> Result<TextureAtlas, String
 
     let cols = (raw.len() as f64).sqrt().ceil() as u32;
     let rows = (raw.len() as u32).div_ceil(cols);
-    let atlas_w = cols * TILE_SIZE;
-    let atlas_h = rows * TILE_SIZE;
+    let atlas_w = cols * TILE_BLOCK;
+    let atlas_h = rows * TILE_BLOCK;
 
     let mut atlas = RgbaImage::new(atlas_w, atlas_h);
     let mut textures = HashMap::with_capacity(raw.len());
@@ -242,16 +260,27 @@ fn build_atlas(jar_path: &Path, mc_version: &str) -> Result<TextureAtlas, String
     for (idx, (name, tile)) in raw.iter().enumerate() {
         let col = idx as u32 % cols;
         let row = idx as u32 / cols;
-        let x = col * TILE_SIZE;
-        let y = row * TILE_SIZE;
-        image::imageops::overlay(&mut atlas, tile, x as i64, y as i64);
+        let block_x = col * TILE_BLOCK;
+        let block_y = row * TILE_BLOCK;
+
+        // Miolo do bloco = o tile; todo pixel fora dele copia o pixel de
+        // borda mais próximo (clamp), então nenhum mip chega a misturar o
+        // tile vizinho — ver `TILE_PADDING`.
+        for gy in 0..TILE_BLOCK {
+            for gx in 0..TILE_BLOCK {
+                let sx = gx.saturating_sub(TILE_PADDING).min(TILE_SIZE - 1);
+                let sy = gy.saturating_sub(TILE_PADDING).min(TILE_SIZE - 1);
+                atlas.put_pixel(block_x + gx, block_y + gy, *tile.get_pixel(sx, sy));
+            }
+        }
+
         textures.insert(
             name.clone(),
             UvRect {
-                u0: x as f32 / atlas_w as f32,
-                v0: y as f32 / atlas_h as f32,
-                u1: (x + TILE_SIZE) as f32 / atlas_w as f32,
-                v1: (y + TILE_SIZE) as f32 / atlas_h as f32,
+                u0: (block_x + TILE_PADDING) as f32 / atlas_w as f32,
+                v0: (block_y + TILE_PADDING) as f32 / atlas_h as f32,
+                u1: (block_x + TILE_PADDING + TILE_SIZE) as f32 / atlas_w as f32,
+                v1: (block_y + TILE_PADDING + TILE_SIZE) as f32 / atlas_h as f32,
             },
         );
     }
