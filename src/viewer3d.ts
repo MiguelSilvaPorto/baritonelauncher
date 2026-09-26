@@ -236,14 +236,43 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
  * `map`, então o valor não importa — só precisa existir. */
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
-// Flags/versão do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-// v3 = seções + tints de bioma por coluna; v2 (sem tints) ainda é aceito na
-// leitura pro `world.cache` gravado antes, e cai no fallback fixo.
-const VOXEL_FORMAT_VERSION = 3;
+// Versão/flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
+// v4 = seções (paleta + índices + luz) + tints de bioma por coluna; v3 (sem
+// luz) e v2 (sem nada disso) ainda são aceitos na leitura pros `world.cache`
+// gravados antes, caindo no dia cheio e nos tints fixos.
+const VOXEL_FORMAT_VERSION = 4;
+const VOXEL_FORMAT_VERSION_TINTS = 3;
 const VOXEL_FORMAT_VERSION_LEGACY = 2;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
+
+/** Luz: cada byte do payload carrega dois níveis 0–15 — nibble baixo = luz de
+ * bloco (tocha, lava, glowstone...), nibble alto = luz de céu, já propagados
+ * pelo motor de luz do próprio jogo (`LightLayer.BLOCK`/`SKY`). O viewer
+ * reamostra por canto de face (smooth lighting, como o jogo) e assa o
+ * resultado na cor do vértice — o terreno usa material sem luz dinâmica. */
+/** Fator do céu usado ao assar a luz do terreno: o material do terreno não
+ * tem luz dinâmica, então a luz de céu é multiplicada na hora da malha. Ele
+ * acompanha o ciclo dia/noite (`updateDayNight`) — de noite só tocha/lava
+ * seguem iluminando; o piso é o "luar" do jogo. */
+const SKY_LIGHT_NIGHT_FLOOR = 0.12;
+
+/** Curva de brilho do jogo (`LightTexture`): nível 15 = 1.0, queda suave
+ * até 0 (caverna sem tocha fica escura). */
+function lightCurve(level: number): number {
+  const f = level / 15;
+  return f / (4 - 3 * f);
+}
+
+/** Shading por direção da face, como no jogo: topo 1.0, norte/sul 0.8,
+ * leste/oeste 0.6, fundo 0.5. */
+function faceShade(face: FaceDef): number {
+  if (face.dir[1] > 0) return 1;
+  if (face.dir[1] < 0) return 0.5;
+  return face.dir[2] !== 0 ? 0.8 : 0.6;
+}
+
 
 /** Duração de cada frame das texturas animadas de fluido, em ms. O jogo lê
  * isso do `.mcmeta` de cada textura; aqui é fixo (aproximação honesta, ver
@@ -369,6 +398,9 @@ interface DecodedSection {
   y: number;
   palette: PaletteEntry[];
   indices: Uint16Array;
+  /** 4096 bytes, índice `x + z*16 + y*256`: nibble baixo = luz de bloco,
+   * nibble alto = luz de céu (0–15 cada) — ver `world_cache.rs`. */
+  light: Uint8Array;
 }
 
 /** Tints de bioma por coluna (payload v3): cor `0xRRGGBB` por coluna
@@ -391,6 +423,9 @@ interface DecodedChunk {
   sections: Map<number, DecodedSection>;
   /** Tints de bioma por coluna; `null` = chunk sem essa informação. */
   tints: ChunkTints | null;
+  /** Maior seção Y que veio no payload — acima dela o ar é céu cheio (ver
+   * `lightAt`). */
+  maxSectionY: number;
 }
 
 /** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido e
@@ -559,12 +594,16 @@ function byteReader(bytes: Uint8Array) {
   };
 }
 
-/** Decodifica o payload de `chunk_voxels` (formato 3, ver `world_cache.rs` —
- * v2, sem tints, ainda é aceito pro cache antigo). */
+/** Decodifica o payload de `chunk_voxels` (formato 4, ver `world_cache.rs` —
+ * v3, sem luz, e v2, sem luz nem tints, ainda são aceitos pro cache antigo). */
 function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
   const reader = byteReader(bytes);
   const version = reader.u8();
-  if (version !== VOXEL_FORMAT_VERSION && version !== VOXEL_FORMAT_VERSION_LEGACY) {
+  if (
+    version !== VOXEL_FORMAT_VERSION &&
+    version !== VOXEL_FORMAT_VERSION_TINTS &&
+    version !== VOXEL_FORMAT_VERSION_LEGACY
+  ) {
     throw new Error(`versão de payload desconhecida: ${version}`);
   }
   const sectionCount = reader.u8();
@@ -583,11 +622,19 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
     }
     const indices = new Uint16Array(4096);
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
-    sections.set(y, { y, palette, indices });
+    const light = new Uint8Array(4096);
+    if (version >= VOXEL_FORMAT_VERSION) {
+      for (let idx = 0; idx < 4096; idx++) light[idx] = reader.u8();
+    } else {
+      // Payload antigo (v2/v3) não tem luz: dia cheio, como o viewer
+      // desenhava antes de existir luz de verdade.
+      light.fill(0xf0);
+    }
+    sections.set(y, { y, palette, indices, light });
   }
 
   let tints: ChunkTints | null = null;
-  if (version === VOXEL_FORMAT_VERSION) {
+  if (version >= VOXEL_FORMAT_VERSION_TINTS) {
     const hasTints = reader.u8();
     if (hasTints === 1) {
       const readColumns = () => {
@@ -605,7 +652,15 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
       throw new Error(`flag de tints inválida: ${hasTints}`);
     }
   }
-  return { x, z, sections, tints };
+
+  const sectionYs = Array.from(sections.keys());
+  return {
+    x,
+    z,
+    sections,
+    tints,
+    maxSectionY: sectionYs.length > 0 ? Math.max(...sectionYs) : 0,
+  };
 }
 
 export class Viewer3D {
@@ -760,12 +815,12 @@ export class Viewer3D {
   private faceRenderCache = new Map<string, FaceRender | null>();
   /** Material do terreno opaco: um só pra tudo, com UV apontando pro tile
    * certo do atlas por face e cor por vértice (tint). */
-  private opaqueMaterial: THREE.MeshStandardMaterial | null = null;
+  private opaqueMaterial: THREE.MeshBasicMaterial | null = null;
   /** Material por bucket de fluido (`water_still`, `water_flow`,
    * `lava_still`, `lava_flow`). */
-  private bucketMaterials = new Map<string, THREE.MeshStandardMaterial>();
+  private bucketMaterials = new Map<string, THREE.MeshBasicMaterial>();
   /** Materiais com textura animada + seus frames, pra trocar o `map`. */
-  private animatedMaterials: { material: THREE.MeshStandardMaterial; frames: THREE.Texture[] }[] = [];
+  private animatedMaterials: { material: THREE.MeshBasicMaterial; frames: THREE.Texture[] }[] = [];
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
@@ -788,6 +843,9 @@ export class Viewer3D {
   private readonly dayNightA = new THREE.Color();
   private readonly dayNightB = new THREE.Color();
   private readonly dayNightC = new THREE.Color();
+  /** Fator de luz de céu já assado na malha atual — acompanha o dia/noite
+   * (ver `updateDayNight`). */
+  private bakedSkyFactor = 1;
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
@@ -1239,15 +1297,15 @@ export class Viewer3D {
     this.bucketMaterials.clear();
     this.faceRenderCache.clear();
     this.faceRectCache.clear();
-    // `alphaTest` recorta as texturas com transparência (folhas, plantas,
-    // tochas): sem ele o alpha é ignorado e os pixels vazios saem pretos.
-    // Sem atlas (`map: null`, modo degradado) não muda nada — o alpha do
-    // vértice é 1.
-    this.opaqueMaterial = new THREE.MeshStandardMaterial({
+    // Material do terreno é **sem luz dinâmica** (`MeshBasicMaterial`): a luz
+    // vem assada na cor do vértice, reamostrada da luz real do jogo (tocha,
+    // céu, lava...) em `pushQuadFlat` — é o que faz o bloco emissor iluminar
+    // os vizinhos e a caverna ficar escura. `alphaTest` recorta as texturas
+    // com transparência (folhas, plantas, tochas); no modo degradado
+    // (`map: null`) o alpha do vértice é 1 e nada muda.
+    this.opaqueMaterial = new THREE.MeshBasicMaterial({
       map: this.atlasTexture,
       vertexColors: true,
-      roughness: 0.95,
-      metalness: 0,
       alphaTest: 0.5,
     });
     this.bucketMaterials.set("opaque", this.opaqueMaterial);
@@ -1257,25 +1315,22 @@ export class Viewer3D {
     this.bucketMaterials.set("lava_flow", this.buildFluidMaterial("lava", "flow"));
   }
 
-  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshStandardMaterial {
+  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshBasicMaterial {
     const frames = this.loadFrames(`${kind}_${phase}`);
     const water = kind === "water";
-    const material = new THREE.MeshStandardMaterial({
+    const material = new THREE.MeshBasicMaterial({
       map: frames[0] ?? null,
       // O tint da água é por coluna (bioma, ver `meshFluidFace`) e chega por
-      // vértice; lava não tem tint (branco).
+      // vértice junto da luz; lava não tem tint (branco).
       color: 0xffffff,
       vertexColors: true,
-      roughness: water ? 0.35 : 0.6,
-      metalness: 0,
       // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
-      // opaca e emite luz.
+      // opaca. A luz da lava vem do próprio dado do jogo (bloco 15 propagado
+      // nas posições vizinhas), então ela não precisa de emissive.
       transparent: water,
       opacity: water ? 0.72 : 1,
       depthWrite: !water,
       side: THREE.DoubleSide,
-      emissive: water ? 0x000000 : 0x8a3b0c,
-      emissiveIntensity: water ? 0 : 0.55,
     });
     if (frames.length > 1) this.animatedMaterials.push({ material, frames });
     return material;
@@ -1415,8 +1470,81 @@ export class Viewer3D {
 
   /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
    * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
-   * usado pra superfície rebaixada de fluido. `color` é `0xRRGGBB` e `offset`
-   * desloca o quad ao longo da normal da face (camada de overlay). */
+   * usado pra superfície rebaixada de fluido. `offset` desloca o quad ao
+   * longo da normal da face (camada de overlay) e `light` traz o brilho 0–1
+   * já suavizado por canto (ver `faceCornerBrightness`). */
+  /** Byte de luz de uma posição (nibble baixo = bloco, alto = céu); 0 se o
+   * chunk/seção não está no cache. Acima do topo do mundo é céu cheio. */
+  private lightAt(x: number, y: number, z: number): number {
+    if (y > 319) return 0xf0;
+    if (y < -64) return 0;
+    const chunk = this.chunks.get(this.chunkKey(x >> 4, z >> 4));
+    if (!chunk) return 0;
+    const sectionY = y >> 4;
+    const section = chunk.sections.get(sectionY);
+    if (!section) {
+      // Seção de ar não vem no payload (só as que têm bloco): acima da maior
+      // seção do chunk é ar aberto (céu cheio); abaixo/entre, escuridão.
+      return sectionY > chunk.maxSectionY ? 0xf0 : 0;
+    }
+    return section.light[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] ?? 0;
+  }
+
+  /** Brilho 0–1 de um canto de face, no estilo do jogo: média das 4 posições
+   * de ar em volta do canto (a da frente da face + as duas arestas + a quina),
+   * nos dois canais, e `max(céu, bloco)` no fim. É isso que dá o degradê
+   * suave em volta de uma tocha em vez de blocos com brilho chapado. */
+  private cornerBrightness(
+    lightAt: (x: number, y: number, z: number) => number,
+    face: FaceDef,
+    corner: readonly [number, number, number],
+    x: number,
+    y: number,
+    z: number
+  ): number {
+    const axes: number[] = [];
+    for (let axis = 0; axis < 3; axis++) if (face.dir[axis] === 0) axes.push(axis);
+    const signs = axes.map((axis) => (corner[axis] === 1 ? 1 : -1));
+    const offset = (axis: number, sign: number) => {
+      const out = [0, 0, 0];
+      out[axis] = sign;
+      return out;
+    };
+    const o1 = offset(axes[0], signs[0]);
+    const o2 = offset(axes[1], signs[1]);
+    const bx = x + face.dir[0];
+    const by = y + face.dir[1];
+    const bz = z + face.dir[2];
+    const samples = [
+      [bx, by, bz],
+      [bx + o1[0], by + o1[1], bz + o1[2]],
+      [bx + o2[0], by + o2[1], bz + o2[2]],
+      [bx + o1[0] + o2[0], by + o1[1] + o2[1], bz + o1[2] + o2[2]],
+    ];
+
+    let block = 0;
+    let sky = 0;
+    for (const [sx, sy, sz] of samples) {
+      const value = lightAt(sx, sy, sz);
+      block += value & 15;
+      sky += value >> 4;
+    }
+    return lightCurve(Math.max(block >> 2, (sky >> 2) * this.bakedSkyFactor));
+  }
+
+  /** Brilho dos 4 cantos de uma face (0–1), já sem o shading direcional —
+   * `pushQuadFlat` aplica `faceShade` por cima. */
+  private faceCornerBrightness(
+    lightAt: (x: number, y: number, z: number) => number,
+    faceIndex: number,
+    x: number,
+    y: number,
+    z: number
+  ): number[] {
+    const face = FACES[faceIndex];
+    return face.corners.map((corner) => this.cornerBrightness(lightAt, face, corner, x, y, z));
+  }
+
   private pushQuadFlat(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1426,11 +1554,14 @@ export class Viewer3D {
     low: number,
     high: number,
     uv: readonly number[],
-    color: number,
+    r: number,
+    g: number,
+    b: number,
+    light: readonly number[],
     offset = 0
   ) {
     const face = FACES[faceIndex];
-    const [r, g, b] = this.linearColor(color);
+    const shade = faceShade(face);
     const offsetX = face.dir[0] * offset;
     const offsetY = face.dir[1] * offset;
     const offsetZ = face.dir[2] * offset;
@@ -1444,7 +1575,10 @@ export class Viewer3D {
       );
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
       buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
-      buffers.colors.push(r, g, b);
+      // A luz do jogo já vem pronta (tocha, céu, lava...): aqui ela só é
+      // multiplicada no tint do vértice junto do shading da direção da face.
+      const brightness = light[i] * shade;
+      buffers.colors.push(r * brightness, g * brightness, b * brightness);
     }
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
@@ -1515,7 +1649,8 @@ export class Viewer3D {
     entry: PaletteEntry,
     neighbor: PaletteEntry | null,
     flow: THREE.Vector3 | null,
-    color: number
+    color: number,
+    lightAt: (x: number, y: number, z: number) => number
   ) {
     const ownHeight = fluidHeight(entry.level);
     let low = 0;
@@ -1531,6 +1666,7 @@ export class Viewer3D {
     }
 
     const rotation = flow ? this.flowRotation(faceIndex, flow) : 0;
+    const [r, g, b] = this.linearColor(color);
     this.pushQuadFlat(
       buffers,
       faceIndex,
@@ -1540,7 +1676,10 @@ export class Viewer3D {
       low,
       high,
       FLUID_ROTATED_UV[faceIndex][rotation],
-      color
+      r,
+      g,
+      b,
+      this.faceCornerBrightness(lightAt, faceIndex, x, y, z)
     );
   }
 
@@ -1577,6 +1716,15 @@ export class Viewer3D {
         }
         return this.entryAt(x, y, z);
       };
+      // Luz local: quase toda amostra do smooth lighting cai na seção
+      // corrente, então evita o `Map.get` global na maioria dos casos.
+      const lightAt = (x: number, y: number, z: number): number => {
+        if ((x >> 4) === chunk.x && (z >> 4) === chunk.z) {
+          const source = (y >> 4) === sectionY ? section : chunk.sections.get(y >> 4);
+          if (source) return source.light[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
+        }
+        return this.lightAt(x, y, z);
+      };
 
       for (let ly = 0; ly < 16; ly++) {
         for (let lz = 0; lz < 16; lz++) {
@@ -1606,7 +1754,7 @@ export class Viewer3D {
                   flowNeeded = false;
                 }
                 const fluidColor = entry.block === "water" ? this.waterTintAt(column, chunk.tints) : 0xffffff;
-                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor);
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor, lightAt);
                 continue;
               }
               // Sólido: face some se o vizinho é oclusor; oclusão entre
@@ -1623,12 +1771,17 @@ export class Viewer3D {
               const color = render.known
                 ? this.faceTint(entry.block, face.kind, column, chunk.tints)
                 : COLOR_UNKNOWN_BLOCK;
-              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, color);
+              const [r, g, b] = this.linearColor(color);
+              const faceLight = this.faceCornerBrightness(lightAt, f, x, y, z);
+              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, r, g, b, faceLight);
               // Segunda camada do lado do grass_block no modelo vanilla:
               // cinza no arquivo, tingida com a cor de grama do bioma.
               if (entry.block === "grass_block" && face.kind === "side") {
                 const overlay = this.grassOverlayRender(f);
                 if (overlay) {
+                  const [overlayR, overlayG, overlayB] = this.linearColor(
+                    this.grassTintAt(column, chunk.tints)
+                  );
                   this.pushQuadFlat(
                     buffered("opaque"),
                     f,
@@ -1638,7 +1791,10 @@ export class Viewer3D {
                     0,
                     1,
                     overlay.uv,
-                    this.grassTintAt(column, chunk.tints),
+                    overlayR,
+                    overlayG,
+                    overlayB,
+                    faceLight,
                     GRASS_SIDE_OVERLAY_OFFSET
                   );
                 }
@@ -2147,6 +2303,16 @@ export class Viewer3D {
     const phase = (time / TICKS_PER_DAY) * Math.PI * 2;
     const elevation = Math.sin(phase); // -1 = meia-noite, +1 = meio-dia
     const daylight = smoothstep(-0.12, 0.28, elevation);
+
+    // A luz de céu assada acompanha o dia — sem isso o terreno ficaria claro
+    // de noite. O piso é o luar do jogo; a remontagem é orçada
+    // (`rebuildAllMeshes` só enfileira) e acontece em saltos grandes, não a
+    // cada frame.
+    const skyFactor = Math.max(SKY_LIGHT_NIGHT_FLOOR, daylight);
+    if (Math.abs(skyFactor - this.bakedSkyFactor) >= 0.2) {
+      this.bakedSkyFactor = skyFactor;
+      this.rebuildAllMeshes();
+    }
 
     // Sol nasce no leste (+X) e se põe no oeste, como no jogo.
     this.sunLight.position.set(

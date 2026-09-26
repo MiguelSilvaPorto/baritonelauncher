@@ -232,6 +232,7 @@ mod tests {
                 })
                 .collect(),
             indices: (0..4096).map(|i| (i % blocks.len()) as u16).collect(),
+            light: vec![0xf0; 4096],
         }
     }
 

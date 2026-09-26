@@ -216,6 +216,22 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Luz de verdade no viewer — bloco emissor ilumina os vizinhos**: o terreno usava luz fixa (ambiente +
+  direcional), então tocha, lava e glowstone não iluminavam nada e uma caverna ficava igual à
+  superfície. Agora o addon lê o **motor de luz do próprio jogo** (as duas camadas que o cliente já
+  mantém: luz de bloco — tocha, lava, glowstone... — e luz de céu) e manda os níveis por posição no
+  `chunk_voxels` (formato 4: um byte por posição, um nibble por camada, lido direto da `DataLayer` da
+  seção — sem 4096 consultas ao motor por camada). O viewer faz *smooth lighting* como o jogo: para cada
+  canto de face, média das 4 posições de ar em volta nos dois canais, `max(céu, bloco)` e a curva de
+  brilho do jogo, multiplicada pelo tint (bioma) e pelo sombreamento da direção (topo 1.0, norte/sul 0.8,
+  leste/oeste 0.6, fundo 0.5) — e o material do terreno passou a ser sem luz dinâmica, porque a luz já
+  vem assada no vértice. A luz de céu assada acompanha o **ciclo dia/noite** (de noite ela cai até o
+  luar e só tocha/lava continuam iluminando; a malha é remontada em saltos grandes, pela fila orçada).
+  Resultado: degradê em volta da tocha, caverna escura, lava brilhando no escuro. Ar acima da última
+  seção carregada do chunk é céu cheio; o `world.cache` antigo (v2/v3, sem luz) continua abrindo no dia
+  cheio. **O jar do addon precisa ser rebuildado** — com o jar antigo o app avisa no console e mantém o
+  comportamento antigo. Reportado pelo usuário ("quero que vc adicione luz que nem no minecraft onde
+  alguns blocos emitem luz e afetam outros no meu render").
 - **Mobs ao redor do bot no viewer (nome, categoria, distância e vida)**: o addon agora varre as
   criaturas vivas num raio de 32 blocos (~4x/s, mesma cadência da posição) e manda um snapshot
   `entities` pelo socket; o app expõe `nearby_mobs` e o viewer desenha um rótulo por mob — nome real
