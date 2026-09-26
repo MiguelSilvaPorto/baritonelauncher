@@ -229,11 +229,24 @@ public class BaritoneOrchestratorAddonClient {
      * a skin padrão, que é a resposta honesta — é o que o jogo mostra), então
      * mandar uma vez só no hello perderia a skin real.
      */
+    // Diagnóstico temporário: a skin ficava sempre no placeholder cinza e não
+    // dava pra saber, sem log, se o problema era `getSkin()`/`skinPngBytes()`
+    // nunca resolvendo, o PNG sendo rejeitado do lado Rust, ou outra coisa.
+    // Loga só a primeira falha de cada tipo (não every tick) — remover depois
+    // de confirmado o que estava acontecendo.
+    private static boolean loggedSkinGetFailure;
+    private static boolean loggedSkinPngFailure;
+    private static boolean loggedSkinSent;
+
     private static void sendPlayerSkinIfChanged(LocalPlayer player) {
         PlayerSkin skin;
         try {
             skin = player.getSkin();
         } catch (RuntimeException e) {
+            if (!loggedSkinGetFailure) {
+                loggedSkinGetFailure = true;
+                BaritoneOrchestratorAddon.LOGGER.warn("[skin] player.getSkin() falhou: {}", e.toString());
+            }
             return; // player info/skin ainda não disponível — tenta no próximo tick
         }
 
@@ -244,10 +257,26 @@ public class BaritoneOrchestratorAddonClient {
 
         byte[] png = skinPngBytes(skin);
         if (png == null) {
+            if (!loggedSkinPngFailure) {
+                loggedSkinPngFailure = true;
+                BaritoneOrchestratorAddon.LOGGER.warn(
+                        "[skin] skinPngBytes() não achou a textura ainda (texturePath={})",
+                        skin.body().texturePath()
+                );
+            }
             return; // textura ainda não registrada/legível — tenta no próximo tick
         }
 
         lastSkinSignature = signature;
+        if (!loggedSkinSent) {
+            loggedSkinSent = true;
+            BaritoneOrchestratorAddon.LOGGER.info(
+                    "[skin] enviando player_skin: {} bytes de PNG, model={}, texturePath={}",
+                    png.length,
+                    skin.model().getSerializedName(),
+                    skin.body().texturePath()
+            );
+        }
         send(String.format(
                 Locale.ROOT,
                 "{\"type\":\"player_skin\",\"name\":\"%s\",\"model\":\"%s\",\"png_base64\":\"%s\"}",
