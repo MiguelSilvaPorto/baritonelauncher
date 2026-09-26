@@ -25,8 +25,8 @@ At the repository root — the app directory. It contains:
 - `src/` — frontend: `main.ts` (all UI logic, no framework) + `styles.css`.
 - `src-tauri/` — Rust/Tauri backend, single crate (`src/lib.rs` + one module per domain concept:
   `world_cache.rs`, `storage_index.rs`, `items.rs`, `vitals.rs`, `time_estimate.rs`,
-  `instructions.rs`, `addon_socket.rs`).
-- `index.html` — the entire UI markup (titlebar, rail, the four views: viewer/editor/fila/armazém).
+  `instructions.rs`, `addon_socket.rs`, `settings.rs`).
+- `index.html` — the entire UI markup (titlebar, rail, the five views: viewer/editor/fila/armazém/config).
 - `mod-addon/` — **real NeoForge project** (from the official MDK), bridges Baritone to the socket
   above. See its `README.md` for what's implemented vs. still missing.
 - `docs/SPEC.md` — the full product/architecture spec. Treat it as the source of truth for behavior
@@ -119,13 +119,21 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 
 **Frontend (`src/main.ts`)**
 - View router: `setMode(name)` toggles `.view.active` / `.rail-btn.active`; views are `viewer`,
-  `editor`, `fila`, `armazem`.
-- `refreshState()` polls the Tauri commands every `REFRESH_INTERVAL_MS` (1s, matching the addon's
-  vitals cadence) — there is no push from the Rust side, so this is polling, not a stream. It used to
-  run once on load only; that was a real bug (UI froze on whatever was true at page load) fixed once
-  the addon bridge existed and made it observable — don't reintroduce a one-shot call. Player pose is
-  polled separately (`refreshPose`, 250ms = the addon's `position` cadence) so the model walks
-  smoothly instead of jumping once a second.
+  `editor`, `fila`, `armazem`, `config`.
+- `refreshState()` polls the Tauri commands every `settings.state_interval_ms` (default 1s, matching
+  the addon's vitals cadence) — there is no push from the Rust side, so this is polling, not a
+  stream. It used to run once on load only; that was a real bug (UI froze on whatever was true at
+  page load) fixed once the addon bridge existed and made it observable — don't reintroduce a
+  one-shot call. Player pose is polled separately (`refreshPose`, default 250ms = the addon's
+  `position` cadence) so the model walks smoothly instead of jumping once a second. Both intervals
+  come from the Config tab and are applied by recreating the timers (`restartPolling`) — a preference
+  change must not require an app restart.
+- **Config tab** (`view-config` in `index.html`) — the controls are markup in `index.html` but their
+  values always come from the backend (`settings_get`; commands `settings_set`/`settings_reset`), and
+  they stay disabled until it answers: no defaults duplicated in the frontend. `applySettings` fans a
+  change out to the viewer (`Viewer3D.applySettings`), the polling timers and `renderConfig`; saves
+  are debounced (a range drag fires `input` per frame) and the effective value the backend returns
+  wins — it may differ if a range clamped it. See `settings.rs`.
 - `renderViewer`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest empty state when
   the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
   rows.
@@ -156,13 +164,14 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
-  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`player_skin`, plus
+  `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, `bot_pose`/`player_skin`,
+  `settings` (Config tab), plus
   `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
   `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
   `vitals_snapshot`, `bot_pose`, `player_skin`,
-  `get_texture_atlas`. Spawns
+  `get_texture_atlas`, `settings_get`, `settings_set`, `settings_reset`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world
@@ -198,6 +207,14 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `AppState.world_revision` changed (bumped by `addon_socket` per chunk) and once on
   `RunEvent::Exit`. Reuses `encode_voxels`/`decode_voxels` — one binary format for socket, IPC and
   disk. `crossing_hints` are **not** persisted yet.
+- **`settings.rs`** — user preferences (Config tab) as pretty JSON in `settings.json`, in the same
+  app data dir as `world.cache`, written atomically (`tmp` + rename) on every change. Plain JSON is
+  deliberate here: the file is tiny and `#[serde(default)]` tolerates model evolution — a new field
+  falls back to its default instead of invalidating the user's file. Defaults mirror the constants
+  the frontend used before the tab existed; `Settings::sanitized` clamps every field to the accepted
+  range (the backend is the source of truth — a hand-edited file can't set fog to 5 blocks or polling
+  to 1 ms) and the commands return the **effective** value, so the UI never shows a value the backend
+  refused. Unit tests cover round-trip, missing/corrupt file, clamping and partial JSON.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
   `src-tauri/.cache/` (gitignored; the cache name carries `ATLAS_CACHE_VERSION`). **Never download or
