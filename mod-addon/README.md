@@ -73,6 +73,11 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
 - `{"type":"position","x":123,"y":64,"z":45,"yaw":90.0,"pitch":12.5}` — a
   cada ~5 ticks (yaw/pitch = rotação real do jogador, usada pra orientar o
   modelo no viewer).
+- `{"type":"world_time","day_time":6000}` — hora do clock do overworld em
+  ticks (0 = nascer do sol, 6000 = meio-dia, 12000 = pôr do sol, 18000 =
+  meia-noite), a cada ~20 ticks, junto dos vitais. O app interpola a 20
+  ticks/s pro ciclo de dia/noite do viewer; sem jogo conectado, ele congela na
+  última hora real.
 - `{"type":"player_skin","name":"Steve","model":"wide","png_base64":"..."}` —
   quando a skin muda (inclui a padrão, se o perfil ainda não carregou a
   real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do

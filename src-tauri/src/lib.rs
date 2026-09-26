@@ -49,6 +49,9 @@ pub(crate) struct AppState {
     /// Mesma posição de `bot_pos` + yaw/pitch do jogador — o viewer usa os
     /// ângulos pra orientar o modelo (ver `addon_socket::BotPose`).
     pub(crate) bot_pose: Mutex<Option<addon_socket::BotPose>>,
+    /// Hora real do mundo em ticks (0..=23999), reportada 1x/s pelo addon —
+    /// o viewer usa pro ciclo de dia/noite (ver `addon_socket::WorldTime`).
+    pub(crate) world_time: Mutex<Option<u32>>,
     /// Skin real do jogador (PNG), mandada pelo addon quando muda — ver
     /// `player_skin.rs`.
     pub(crate) player_skin: Mutex<Option<player_skin::PlayerSkin>>,
@@ -439,6 +442,15 @@ mod commands {
         *state.bot_pose.lock().unwrap()
     }
 
+    /// Hora real do mundo em ticks (0..=23999; 0 = nascer do sol, 6000 =
+    /// meio-dia, 12000 = pôr do sol, 18000 = meia-noite) — ver
+    /// `addon_socket.rs`. `None` enquanto o jogo não conectou (ou desconectou):
+    /// o viewer congela na última hora conhecida em vez de inventar um ciclo.
+    #[tauri::command]
+    fn world_time(state: State<AppState>) -> Option<u32> {
+        *state.world_time.lock().unwrap()
+    }
+
     /// Skin real do jogador (PNG em data URL + variante do modelo), mandada
     /// pelo addon — ver `player_skin.rs`. `None` enquanto o addon não mandou
     /// (o viewer mostra o modelo sem textura, não uma skin inventada).
@@ -476,6 +488,7 @@ mod commands {
             storage_totals,
             vitals_snapshot,
             bot_pose,
+            world_time,
             player_skin,
             get_texture_atlas,
         ])
