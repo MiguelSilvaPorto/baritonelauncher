@@ -14,8 +14,10 @@ use std::collections::HashMap;
 /// Versão do payload binário de `chunk_voxels`. O addon Java e este módulo
 /// precisam estar de acordo — mudar o layout sem mudar isto corrompe a
 /// decodificação em vez de dar erro claro. v2 adicionou o byte de nível de
-/// fluido em cada entrada de paleta (água/lava).
-pub const VOXEL_FORMAT_VERSION: u8 = 2;
+/// fluido em cada entrada de paleta (água/lava); v3 adicionou as propriedades
+/// do blockstate (`facing=north,half=top,...`), que o viewer usa pra escolher
+/// a variante certa do modelo (tocha de parede, escada, cerca...).
+pub const VOXEL_FORMAT_VERSION: u8 = 3;
 
 /// Bit 0: o bloco é desenhável como cubo cheio (não é ar nem decoração
 /// substituível, tipo grama alta). Bit 1: o bloco esconde as faces dos
@@ -49,9 +51,9 @@ pub enum CrossingStrategy {
 }
 
 /// Entrada da paleta de uma seção: o nome do bloco (path do registry, ex:
-/// `"stone"`) + os flags de renderização + o nível do fluido. Propriedades de
-/// blockstate (escada virada pra norte etc.) ainda não trafegam — ver "Known
-/// gaps" no README.
+/// `"stone"`), os flags de renderização, o nível do fluido e as propriedades
+/// do blockstate (v3 — ex: `"facing=north,waterlogged=false"`), que o viewer
+/// usa pra escolher a variante do modelo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteEntry {
     pub block: String,
@@ -61,6 +63,10 @@ pub struct PaletteEntry {
     /// também é o valor de todo bloco que não é fluido — só interpretar
     /// quando `VOXEL_FLAG_FLUID` estiver setado.
     pub level: u8,
+    /// Propriedades do blockstate, `nome=valor` separadas por vírgula e
+    /// ordenadas por nome (mesma ordem estável do lado Java). Vazio pra
+    /// blocos sem propriedades (a maioria).
+    pub props: String,
 }
 
 impl PaletteEntry {
@@ -223,7 +229,7 @@ impl<'a> VoxelReader<'a> {
     }
 }
 
-/// Decodifica o payload de `chunk_voxels` (formato 2 — ver
+/// Decodifica o payload de `chunk_voxels` (formato 3 — ver
 /// `VOXEL_FORMAT_VERSION` e `mod-addon/README.md`):
 ///
 /// ```text
@@ -232,7 +238,8 @@ impl<'a> VoxelReader<'a> {
 /// por seção:
 ///   i8  Y da seção
 ///   u16 tamanho da paleta
-///   por entrada: u16 tamanho do nome, bytes UTF-8, u8 flags, u8 nível de fluido
+///   por entrada: u16 tamanho do nome, bytes UTF-8, u8 flags, u8 nível de
+///                fluido, u16 tamanho das props, bytes UTF-8
 ///   u16[4096] índices (ordem x + z*16 + y*256)
 /// ```
 pub fn decode_voxels(bytes: &[u8]) -> Result<Vec<ChunkSection>, String> {
@@ -268,7 +275,19 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<Vec<ChunkSection>, String> {
                 .to_string();
             let flags = reader.u8()?;
             let level = reader.u8()?;
-            palette.push(PaletteEntry { block, flags, level });
+            let props_len = reader.u16()? as usize;
+            if props_len > 512 {
+                return Err(format!("props de blockstate grandes demais: {props_len} bytes"));
+            }
+            let props = std::str::from_utf8(reader.take(props_len)?)
+                .map_err(|err| format!("props não é UTF-8: {err}"))?
+                .to_string();
+            palette.push(PaletteEntry {
+                block,
+                flags,
+                level,
+                props,
+            });
         }
 
         let mut indices = Vec::with_capacity(4096);
@@ -302,6 +321,9 @@ pub fn encode_voxels(sections: &[ChunkSection]) -> Vec<u8> {
             out.extend_from_slice(name);
             out.push(entry.flags);
             out.push(entry.level);
+            let props = entry.props.as_bytes();
+            out.extend_from_slice(&(props.len() as u16).to_le_bytes());
+            out.extend_from_slice(props);
         }
         for index in &section.indices {
             out.extend_from_slice(&index.to_le_bytes());
@@ -331,11 +353,13 @@ mod tests {
                         block: "air".to_string(),
                         flags: 0,
                         level: 0,
+                        props: String::new(),
                     },
                     PaletteEntry {
                         block: "stone".to_string(),
                         flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
                         level: 0,
+                        props: String::new(),
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 2) as u16).collect(),
@@ -347,24 +371,34 @@ mod tests {
                         block: "grass_block".to_string(),
                         flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
                         level: 0,
+                        props: "snowy=false".to_string(),
                     },
                     PaletteEntry {
                         block: "water".to_string(),
                         flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_FLUID,
                         level: 0, // fonte
+                        props: "level=0".to_string(),
                     },
                     PaletteEntry {
                         block: "water".to_string(),
                         flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_FLUID,
                         level: 5, // fluindo raso
+                        props: "level=5".to_string(),
                     },
                     PaletteEntry {
                         block: "short_grass".to_string(),
                         flags: 0,
                         level: 0,
+                        props: String::new(),
+                    },
+                    PaletteEntry {
+                        block: "oak_stairs".to_string(),
+                        flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
+                        level: 0,
+                        props: "facing=east,half=bottom,shape=straight,waterlogged=false".to_string(),
                     },
                 ],
-                indices: (0..4096).map(|i| (i % 4) as u16).collect(),
+                indices: (0..4096).map(|i| (i % 5) as u16).collect(),
             },
         ]
     }
@@ -401,6 +435,7 @@ mod tests {
             block: "water".to_string(),
             flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_FLUID,
             level,
+            props: format!("level={level}"),
         };
         assert!((water(0).fluid_height() - 8.0 / 9.0).abs() < f32::EPSILON); // fonte
         assert!((water(1).fluid_height() - 7.0 / 9.0).abs() < f32::EPSILON);

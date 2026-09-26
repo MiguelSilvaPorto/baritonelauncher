@@ -109,16 +109,19 @@ mod tests {
                 block: "air".to_string(),
                 flags: 0,
                 level: 0,
+                props: String::new(),
             },
             PaletteEntry {
                 block: "stone".to_string(),
                 flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
                 level: 0,
+                props: String::new(),
             },
             PaletteEntry {
                 block: "grass_block".to_string(),
                 flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
                 level: 0,
+                props: String::new(),
             },
         ];
         let mut world = WorldCache::new();

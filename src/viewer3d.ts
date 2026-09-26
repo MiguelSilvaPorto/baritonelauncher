@@ -1,6 +1,12 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { MinecraftPlayerModel, type PlayerSkinInput } from "./player_model";
+import {
+  decodeBlockModels,
+  parseProps,
+  resolveModelGeometries,
+  type DecodedBlockModels,
+} from "./block_models";
 
 /**
  * Renderer 3D real do viewer — ver `docs/SPEC.md`, "Visualização 3D própria".
@@ -117,6 +123,9 @@ const BLOCK_TINTS: Record<string, number> = {
   lily_pad: GRASS_TINT, // o jogo usa a cor de grama no lírio
   spruce_leaves: 0x619961, // cor fixa no jogo, não vem do bioma
   birch_leaves: 0x80a755,
+  // Modelo de fio de redstone tem `tintindex` e a cor real depende da
+  // energia; usa o vermelho de potência máxima como aproximação.
+  redstone_wire: 0xff0000,
 };
 
 /** Blocos cujo nome não bate com o nome da textura no jar: água/lava/fogo
@@ -155,7 +164,7 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
 // Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-const VOXEL_FORMAT_VERSION = 2;
+const VOXEL_FORMAT_VERSION = 3;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
@@ -242,6 +251,9 @@ interface PaletteEntry {
   /** Nível do fluido (blockstate vanilla): 0 = fonte, 1..7 = fluindo,
    * >= 8 = caindo. Fora de fluidos é sempre 0. */
   level: number;
+  /** Propriedades do blockstate (`facing=east,half=bottom`), v3 do payload —
+   * o viewer usa pra escolher a variante do modelo (`block_models.ts`). */
+  props: string;
 }
 
 interface DecodedSection {
@@ -348,7 +360,7 @@ const FLUID_ROTATED_UV: number[][][] = FACE_UV_FLAT.map((flat) => {
   return rotations;
 });
 
-const AIR: PaletteEntry = { block: "air", flags: 0, level: 0 };
+const AIR: PaletteEntry = { block: "air", flags: 0, level: 0, props: "" };
 const DOWN = new THREE.Vector3(0, -1, 0);
 const ZERO = new THREE.Vector3(0, 0, 0);
 
@@ -429,7 +441,9 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
       const block = reader.utf8(nameLen);
       const flags = reader.u8();
       const level = reader.u8();
-      palette.push({ block, flags, level });
+      const propsLen = reader.u16();
+      const props = propsLen > 0 ? reader.utf8(propsLen) : "";
+      palette.push({ block, flags, level, props });
     }
     const indices = new Uint16Array(4096);
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
@@ -505,6 +519,17 @@ export class Viewer3D {
   private atlasImage: HTMLImageElement | null = null;
   private atlasTexture: THREE.Texture | null = null;
   private atlasUvByName: Record<string, UvRect> | null = null;
+  /** Modelos de bloco reais assados do jar (`get_block_models`) — ver
+   * `block_models.ts`. `null` = ainda não chegaram (o viewer usa o cubo). */
+  private blockModels: DecodedBlockModels | null = null;
+  private blockModelsLoading = false;
+  /** Geometrias resolvidas por (bloco, props) — o matching de variante roda
+   * uma vez por blockstate, não por bloco do mundo. `null` = sem modelo. */
+  private modelGeoCache = new Map<string, number[] | null>();
+  /** Modelos indisponíveis (bake falhou) — não tenta de novo. */
+  private blockModelsUnavailable = false;
+  /** Vértices de um quad de modelo (4×xyz) reutilizados no meshing. */
+  private readonly scratchQuad = new Float32Array(12);
 
   // ---- Editor de schematic (ver `docs/SPEC.md`, "Como isso vira o editor
   // estilo WorldEdit") ----
@@ -764,6 +789,53 @@ export class Viewer3D {
     this.atlasUnavailable = true;
     this.buildMaterials();
     this.rebuildAllMeshes();
+  }
+
+  /** `true` = ainda vale tentar `get_block_models` (nem chegou, nem falhou,
+   * nem está em voo). Mesmo padrão de `needsAtlas`. */
+  needsBlockModels(): boolean {
+    return (
+      this.blockModels === null && !this.blockModelsLoading && !this.blockModelsUnavailable
+    );
+  }
+
+  get isLoadingBlockModels(): boolean {
+    return this.blockModelsLoading;
+  }
+
+  /** Marca a busca dos modelos como em andamento (evita duas chamadas no
+   * mesmo refresh) — ver `setBlockModels`. */
+  markBlockModelsLoading() {
+    this.blockModelsLoading = true;
+  }
+
+  /** Jar sem `block_models.rs` disponível (sem jar local, bake quebrado):
+   * para de tentar e fica no cubo cheio, que é o comportamento antigo. */
+  setBlockModelsUnavailable() {
+    this.blockModelsLoading = false;
+    this.blockModelsUnavailable = true;
+  }
+
+  /** Recebe o payload binário do `get_block_models` (ver `block_models.rs`) e
+   * passa a desenhar as geometrias reais de quem não é cubo (tocha, cogumelo,
+   * vitória-régia, escada, cerca...). Sem payload, tudo continua no cubo. */
+  setBlockModels(payload: ArrayBuffer | Uint8Array | number[]) {
+    this.blockModelsLoading = false;
+    try {
+      const bytes =
+        payload instanceof Uint8Array
+          ? payload
+          : payload instanceof ArrayBuffer
+            ? new Uint8Array(payload)
+            : new Uint8Array(payload);
+      this.blockModels = decodeBlockModels(bytes);
+      this.modelGeoCache.clear();
+      // Chunks já montados usaram o caminho de cubo; remonta pra aplicar.
+      for (const key of this.chunks.keys()) this.enqueueMesh(key);
+    } catch (err) {
+      console.error("[viewer3d] payload de modelos inválido:", err);
+      this.setBlockModelsUnavailable();
+    }
   }
 
   /** `true` se o chunk já foi recebido (mesmo antes do atlas carregar — os
@@ -1216,6 +1288,116 @@ export class Viewer3D {
     );
   }
 
+  /** Geometrias a desenhar pra um `PaletteEntry` (bloco + props), com cache
+   * por blockstate. `null` = sem modelo assado (bloco de mod, cubo cheio ou
+   * variante pulada) — aí o caminho de cubo continua valendo. */
+  private modelGeosFor(entry: PaletteEntry): number[] | null {
+    const models = this.blockModels;
+    if (!models) return null;
+    const key = `${entry.block}|${entry.props}`;
+    const cached = this.modelGeoCache.get(key);
+    if (cached !== undefined) return cached;
+    const geos = resolveModelGeometries(models, entry.block, parseProps(entry.props));
+    this.modelGeoCache.set(key, geos);
+    return geos;
+  }
+
+  /** Tint das faces com `tintindex >= 0` de um modelo real — mesma
+   * aproximação fixa do caminho de cubo (ver `BLOCK_TINTS`); planta sem
+   * entrada cai na cor de grama, que é o que o jogo faz por biome. */
+  private modelTint(block: string): number {
+    return BLOCK_TINTS[block] ?? GRASS_TINT;
+  }
+
+  /** Emite as faces de um modelo real (posições já vêm em 1/16 de pixel e
+   * rotacionadas pelo bake). Só aplica o offset do bloco, resolve a textura
+   * no atlas, calcula a normal pelo winding e faz o culling das faces com
+   * `cullface` — as demais sempre aparecem (planta encostada em bloco não
+   * some, como no jogo). */
+  private meshModel(
+    buffers: MeshBuffers,
+    x: number,
+    y: number,
+    z: number,
+    entry: PaletteEntry,
+    geos: number[],
+    blockAt: (x: number, y: number, z: number) => PaletteEntry | null
+  ) {
+    const models = this.blockModels!;
+    const atlas = this.atlasUvByName;
+    if (!atlas) return;
+
+    const tintHex = this.modelTint(entry.block);
+    this.scratchColor.setHex(tintHex);
+    const tintedR = this.scratchColor.r;
+    const tintedG = this.scratchColor.g;
+    const tintedB = this.scratchColor.b;
+
+    for (const geo of geos) {
+      const range = models.geos[geo];
+      for (let q = range.start; q < range.start + range.count; q++) {
+        const cull = models.quads.cull[q];
+        if (cull >= 0) {
+          const dir = FACES[cull].dir;
+          const neighbor = blockAt(x + dir[0], y + dir[1], z + dir[2]);
+          if (
+            neighbor !== null &&
+            (neighbor.flags & VOXEL_FLAG_RENDER) !== 0 &&
+            (neighbor.flags & VOXEL_FLAG_OCCLUDES) !== 0
+          ) {
+            continue;
+          }
+        }
+
+        const textureName = models.textures[models.quads.tex[q]];
+        const rect = atlas[textureName] ?? atlas[WHITE_TILE];
+        if (!rect) continue;
+
+        // Posições/UVs do payload estão em 1/256 (1/16 de pixel): divide por
+        // 256 pra chegar em bloco e em fração de textura.
+        const v = this.scratchQuad;
+        const p = models.quads.p;
+        const uv = models.quads.uv;
+        for (let i = 0; i < 4; i++) {
+          v[i * 3] = x + p[q * 12 + i * 3] / 256;
+          v[i * 3 + 1] = y + p[q * 12 + i * 3 + 1] / 256;
+          v[i * 3 + 2] = z + p[q * 12 + i * 3 + 2] / 256;
+        }
+        // Normal do winding (geometria rotacionada não tem direção fixa).
+        const ux = v[3] - v[0];
+        const uy = v[4] - v[1];
+        const uz = v[5] - v[2];
+        const wx = v[6] - v[0];
+        const wy = v[7] - v[1];
+        const wz = v[8] - v[2];
+        let nx = uy * wz - uz * wy;
+        let ny = uz * wx - ux * wz;
+        let nz = ux * wy - uy * wx;
+        const length = Math.hypot(nx, ny, nz) || 1;
+        nx /= length;
+        ny /= length;
+        nz /= length;
+
+        const useTint = models.quads.tint[q] >= 0;
+        const r = useTint ? tintedR : 1;
+        const g = useTint ? tintedG : 1;
+        const b = useTint ? tintedB : 1;
+
+        const base = buffers.positions.length / 3;
+        for (let i = 0; i < 4; i++) {
+          buffers.positions.push(v[i * 3], v[i * 3 + 1], v[i * 3 + 2]);
+          buffers.normals.push(nx, ny, nz);
+          buffers.uvs.push(
+            rect.u0 + (uv[q * 8 + i * 2] / 256) * (rect.u1 - rect.u0),
+            rect.v0 + (uv[q * 8 + i * 2 + 1] / 256) * (rect.v1 - rect.v0)
+          );
+          buffers.colors.push(r, g, b);
+        }
+        buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+      }
+    }
+  }
+
   /** Monta as malhas de um chunk (um mesh por bucket usado) e substitui as
    * antigas. Sem atlas carregado não faz nada até o atlas resolver (ou até o
    * modo degradado ligar) — `setAtlas`/`setAtlasUnavailable` remontam tudo.
@@ -1260,6 +1442,15 @@ export class Viewer3D {
             const y = sectionY * 16 + ly;
             const z = chunk.z * 16 + lz;
             const isFluid = (entry.flags & VOXEL_FLAG_FLUID) !== 0;
+            if (!isFluid) {
+              // Bloco com modelo real assado (tocha, cogumelo, escada...)
+              // desenha as faces de verdade em vez do cubo cheio.
+              const modelGeos = this.modelGeosFor(entry);
+              if (modelGeos) {
+                this.meshModel(buffered("opaque"), x, y, z, entry, modelGeos, blockAt);
+                continue;
+              }
+            }
             const fluidBucket = isFluid ? `${entry.block}_${entry.level === 0 ? "still" : "flow"}` : "opaque";
             // Direção da correnteza só é calculada se alguma face de fluido
             // realmente precisar — evita varrer 4 vizinhos de água enterrada.

@@ -33,7 +33,10 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 const MAGIC: &[u8; 4] = b"BOWC";
-const FORMAT_VERSION: u8 = 1;
+/// v2: as seções internas passaram a usar o formato de voxels v3 (com as
+/// props do blockstate) — arquivo antigo é rejeitado no cabeçalho em vez de
+/// falhar no meio da decodificação.
+const FORMAT_VERSION: u8 = 2;
 /// Tetos de sanidade: um arquivo corrompido (ou de outra origem) deve falhar
 /// com erro claro em vez de tentar alocar gigabytes.
 const MAX_CHUNKS: u32 = 4_000_000;
@@ -201,6 +204,7 @@ mod tests {
                     block: block.to_string(),
                     flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
                     level: 0,
+                    props: String::new(),
                 })
                 .collect(),
             indices: (0..4096).map(|i| (i % blocks.len()) as u16).collect(),

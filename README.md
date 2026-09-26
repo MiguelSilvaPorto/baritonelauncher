@@ -82,9 +82,11 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   `docs/SPEC.md`, sem código ainda.
 - **Terreno real com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
   (`src/viewer3d.ts`, Three.js/WebGL) renderiza os voxels reais do `chunk_voxels` em coordenadas
-  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`); o que
-  falta é blockstate (escada/eixo de tora/slab) e tint real por bioma — hoje todo bloco é um cubo com
-  tint fixo aproximado. (O spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio
+  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`) e os
+  **modelos de verdade** dos blocos não-cúbicos assados do jar (`src-tauri/src/block_models.rs`:
+  tocha, cogumelo, vitória-régia, flor, escada, cerca, grade...). O que falta é tint real por bioma
+  (é fixo aproximado), blocos de **mods** (caem no cubo) e block entities (baú, texto de placa). (O
+  spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio
   webview do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela
   separada sem conseguir validar visualmente.)
 - **Ingestão do `minecraft-data`** (itens/blocos/receitas) — os structs Rust (`Item`, `Block`,
@@ -93,7 +95,8 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   local de verdade — isso aqui ainda não foi implementado.)
 - **Editor de schematic** — a base funciona (paleta visual com texturas reais, seleção de região,
   colocar/quebrar em ghost, diff contra o mundo real → instrução na fila), mas faltam: inspetor de
-  **blockstate** (escada/eixo de tora/laje — hoje todo bloco é cubo cheio), import de `.litematic`,
+  **blockstate** (escolher a variante de escada/eixo de tora/laje — o editor ainda trabalha só com o
+  nome do bloco), import de `.litematic`,
   paleta vinda de um registro real de blocos (hoje é derivada dos nomes de textura do atlas) e
   executor de `Mine`/`Build` no addon (a instrução fica na fila) — ver `docs/CHANGELOG.md`.
 - **Persistência** do `StorageIndex` (hoje só em memória) — o **mundo explorado** já é salvo em

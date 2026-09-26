@@ -21,10 +21,12 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   modelo de verdade do jogador em vez de um marcador genérico.
 - Assina `ChunkEvent.Load` (client-side) e enfileira o chunk pro envio de
   `chunk_voxels`: cada seção 16×16×16 vira paleta + índices (deflate + base64),
-  com flags de renderização/oclusão/fluido e o nível de cada fluido — é daí
-  que o viewer monta o terreno com face culling de verdade, inclusive água e
-  lava. A fila drena poucos chunks por tick pra um backfill de reconexão não
-  travar o jogo.
+  com flags de renderização/oclusão/fluido, o nível de cada fluido e as
+  **propriedades do blockstate** de cada entrada (`facing=north,half=top,...`,
+  formato 3) — é daí que o viewer monta o terreno com face culling de verdade,
+  água/lava com nível e a **variante certa do modelo** de cada bloco (tocha de
+  parede, escada invertida, cerca). A fila drena poucos chunks por tick pra um
+  backfill de reconexão não travar o jogo.
 - Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
   "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
   hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
@@ -80,8 +82,10 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
   (paleta + índices por seção, deflate + base64). Por entrada da paleta:
   `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
-  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) — layout
-  completo em `world_cache.rs`, `decode_voxels` (formato 2).
+  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) + `u16` tamanho
+  das props + bytes UTF-8 das props do blockstate (`facing=north,half=bottom`,
+  ordenadas por nome) — layout completo em `world_cache.rs`, `decode_voxels`
+  (formato 3).
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
   estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
   do `travel_to` — `explore` é contínuo e não tem progresso).

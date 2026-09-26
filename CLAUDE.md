@@ -131,9 +131,11 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   rows.
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
   own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
-  `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
-  `resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes per-bucket meshes with real
-  face culling (including against already-loaded neighbors); the mesh work is queued and drained with
+  `main.ts` only calls `setAtlas()`/`setBlockModels()`/`addChunkVoxels()`/`setPlayerSkin()`/
+  `setBotPose()`/`clear()`/`resize()`/`getFocusChunk()` on it. Each `chunk_voxels` payload becomes
+  per-bucket meshes with real face culling (including against already-loaded neighbors); blocks with
+  a baked model (`block_models.ts`) draw their real geometry instead of the cube; the mesh work is
+  queued and drained with
   a per-frame budget (`drainMeshQueue`), and `main.ts` asks for the nearest chunks first
   (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). Chunks
   are added once and never removed (cumulative "explored" semantics, matching `WorldCache`). It also
@@ -153,6 +155,12 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `player_skin.rs`); with no skin yet the model renders untextured (neutral gray) instead of an
   invented skin. `viewer3d.ts` feeds it the interpolated `bot_pose` at 4x/s, and a flat teal ring on
   the ground keeps the position readable now that the old glowing sphere is gone.
+- **`src/block_models.ts`** — decoder + variant matching for the real block models baked by
+  `block_models.rs` (see `get_block_models`). `decodeBlockModels` reads the binary payload into flat
+  `TypedArray`s; `resolveModelGeometries` picks the geometry for a `(block, blockstate props)` pair —
+  `variants` = first matching part, `multipart` = all matching parts, conditions with `|`/`!` like
+  the game. Blocks with no baked model (plain cubes, missing jar, mods) stay on the cube path.
+  `viewer3d.ts`'s `meshModel` emits those quads (atlas UVs, per-face tint, `cullface` culling).
 
 **Backend (`src-tauri/src/`)**
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
@@ -162,7 +170,7 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
   `queue_snapshot`, `queue_push`, `queue_cancel`, `schematic_apply`, `storage_totals`,
   `vitals_snapshot`, `bot_pose`, `player_skin`,
-  `get_texture_atlas`. Spawns
+  `get_texture_atlas`, `get_block_models`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world
@@ -173,7 +181,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   instructions), `vitals` (fills `AppState.vitals`), `position` (fills `AppState.bot_pos` and
   `AppState.bot_pose` — feet coordinates plus yaw/pitch), `player_skin` (the player's own skin as a
   base64 PNG, sent whenever the texture changes → `player_skin.rs`),
-  `chunk_voxels` (full chunk, palette + indices per section, deflate+base64 → `world_cache.rs`) and
+  `chunk_voxels` (full chunk, palette + indices per section + each entry's blockstate props,
+  deflate+base64 → `world_cache.rs`) and
   `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
   the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
   a task consuming `AppState.addon_tx`, registered per connection. Stores the version from `hello`
@@ -187,13 +196,22 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   already has (its texture cache for downloaded skins, or the installed resource pack/jar for the
   default one) — **never** fetched from Mojang's CDN, same rule as `texture_atlas.rs`.
 - `world_cache.rs` — sparse per-chunk voxel cache (`WorldCache`), filled by `chunk_voxels` (palette
-  + indices per 16×16×16 section). Also `CrossingStrategy` for the learned water/lava crossing policy.
+  + indices per 16×16×16 section, plus each entry's **blockstate props** — format 3; the viewer uses
+  them to pick the right model variant). Also `CrossingStrategy` for the learned water/lava crossing
+  policy.
+- **`block_models.rs`** — bakes real block geometry from the **local client jar**:
+  `blockstates/*.json` + `models/block/*.json` (parent chains, texture variables, element/quadrant
+  rotations, `uvlock`) into a compact binary payload for `get_block_models`, cached in
+  `src-tauri/.cache/` (gitignored). Faithful port of `FaceBakery`/`CuboidRotation`/`BlockMath`; plain
+  cubes without rotation are skipped (the cube path already draws them). Never downloads/bundles
+  Mojang assets — same rule as `texture_atlas.rs`.
 - **`world_store.rs`** — persists `WorldCache` + the last `mc_version` to `world.cache` in the app
   data dir (`~/.local/share/dev.baritone.orchestrator/` on Linux), zlib-compressed with a magic +
   version header and atomic writes (`tmp` + rename). Loaded in `setup()`; saved every 5s only when
   `AppState.world_revision` changed (bumped by `addon_socket` per chunk) and once on
   `RunEvent::Exit`. Reuses `encode_voxels`/`decode_voxels` — one binary format for socket, IPC and
-  disk. `crossing_hints` are **not** persisted yet.
+  disk (`FORMAT_VERSION` 2 = the v3 voxel payload with blockstate props; an older file is rejected at
+  the header and the app just starts with an empty cache). `crossing_hints` are **not** persisted yet.
 - **`texture_atlas.rs`** — extracts block textures from the **local, already-installed** client jar
   (`~/.minecraft/versions/<mc_version>/<mc_version>.jar`) and packs them into a grid atlas, cached in
   `src-tauri/.cache/` (gitignored; the cache name carries `ATLAS_CACHE_VERSION`). **Never download or
@@ -250,9 +268,14 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **No `SurvivalProcess`/threat detection or `ContainerScreen` simulation in the addon** — still only
   described in `docs/SPEC.md`.
 - **Biome tint is a fixed approximation, not the real colormap.** Grass/foliage/water textures are
-  gray in the jar and get fixed tints (`GRASS_TINT` and friends in `viewer3d.ts`) instead of a
-  per-column biome lookup — visually close, not exact. Blockstates (stair orientation, log axis,
-  slabs) also aren't modeled yet: every block renders as a full cube.
+  gray in the jar and get fixed tints (`GRASS_TINT` and friends) instead of a per-column biome
+  lookup — visually close, not exact. Per-power tints are approximated too (redstone wire is a fixed
+  red).
+- **Block models come from the vanilla jar, so modded blocks stay cubes.** `block_models.rs` bakes
+  what the installed jar has; blocks from other mods (or models it can't resolve) fall back to the
+  full-cube path, and **block entities** (chest, sign text, banners, beds' second half) aren't
+  rendered — `chunk_voxels` carries blockstates, not block-entity data. Textures the atlas skips
+  (static 32×32, e.g. signs/shelves) render as tinted white on those faces.
 - **No `minecraft-data` ingestion.** Item/block/recipe structs exist but nothing populates them.
   (Texture *extraction* is solved — see `texture_atlas.rs` — this is specifically about recipes/drops.)
 - **`StorageIndex` is in-memory only** — no persistence across restarts. (The explored world *is*
@@ -260,8 +283,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   chunks in the same cache; there's no per-world separation yet.)
 - **The schematic editor's blockstate/litematic/executor gaps.** The base editor works (visual
   palette from the atlas textures, region selection, place/break with an amber ghost layer, diff →
-  queued instruction), but: every block renders as a full cube (no stair/log-axis/slab states, so no
-  variant inspector and `blockstate_key` degrades to the block name), `.litematic` import isn't
+  queued instruction), but: the editor works in block names only (no blockstate/variant picker, so
+  `blockstate_key` degrades to the block name and ghosts are plain boxes), `.litematic` import isn't
   implemented, the palette derives block names from atlas texture names instead of a real block
   registry (`minecraft-data` ingestion still pending), and the addon has **no `Mine`/`Build`
   executor**, so applied schematics sit `Queued` in the queue.
