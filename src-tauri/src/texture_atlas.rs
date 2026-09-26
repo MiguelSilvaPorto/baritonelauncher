@@ -144,6 +144,101 @@ fn load_or_extract_clouds(mc_version: &str) -> Option<String> {
     Some(cache_clouds(mc_version, &bytes))
 }
 
+/// Diretórios do jar com as texturas de entidade que o viewer desenha (ver
+/// `entity_models.ts`): os modelos de mob suportados. Extrair o diretório
+/// inteiro (e não uma lista fixa de arquivos) cobre as variantes que o jogo
+/// tem hoje — zumbi/afogado/husk, esqueleto/errante/wither, vaca/porco/galinha
+/// e o bebê de cada um — sem o app precisar de uma tabela de nomes própria.
+const ENTITY_TEXTURE_DIRS: [&str; 8] = [
+    "assets/minecraft/textures/entity/zombie/",
+    "assets/minecraft/textures/entity/skeleton/",
+    "assets/minecraft/textures/entity/creeper/",
+    "assets/minecraft/textures/entity/spider/",
+    "assets/minecraft/textures/entity/cow/",
+    "assets/minecraft/textures/entity/pig/",
+    "assets/minecraft/textures/entity/sheep/",
+    "assets/minecraft/textures/entity/chicken/",
+];
+
+/// Versão do cache próprio das texturas de entidade (mesma ideia do
+/// `ATLAS_CACHE_VERSION`: mudar o formato/lista invalida o cache antigo).
+const ENTITY_TEXTURES_CACHE_VERSION: u32 = 1;
+
+fn entity_textures_cache_path(mc_version: &str) -> PathBuf {
+    cache_dir().join(format!(
+        "entity_textures_v{ENTITY_TEXTURES_CACHE_VERSION}_{mc_version}.json"
+    ))
+}
+
+/// Texturas de entidade (PNG em data URL), chave = caminho relativo a
+/// `textures/` no jar (ex: `entity/cow/cow_temperate.png`). Mesma regra do
+/// atlas de blocos: lê só o jar local do usuário e cacheia fora do git —
+/// nunca baixa nada da Mojang. O viewer mapeia tipo de mob → textura
+/// (`entity_models.ts`).
+pub fn build_or_load_entity_textures(mc_version: &str) -> Result<HashMap<String, String>, String> {
+    let cache = entity_textures_cache_path(mc_version);
+    if let Ok(json) = std::fs::read_to_string(&cache) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&json) {
+            return Ok(map);
+        }
+    }
+
+    let jar_path = find_local_client_jar(mc_version).ok_or_else(|| {
+        format!("Client jar do Minecraft {mc_version} não encontrado em ~/.minecraft/versions/.")
+    })?;
+    let textures = extract_entity_textures(&jar_path)?;
+
+    std::fs::create_dir_all(cache_dir()).map_err(|e| e.to_string())?;
+    std::fs::write(
+        &cache,
+        serde_json::to_string(&textures).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(textures)
+}
+
+/// Extração pura (sem cache) — separada do `build_or_load_*` pro teste poder
+/// rodar contra o jar real sem mexer no cache da versão de verdade.
+fn extract_entity_textures(jar_path: &Path) -> Result<HashMap<String, String>, String> {
+    let file = std::fs::File::open(jar_path).map_err(|e| e.to_string())?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+
+    // `file_names()` empresta o archive — coleta os nomes antes de ler as
+    // entradas (o `by_name` também empresta).
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|name| {
+            name.ends_with(".png") && ENTITY_TEXTURE_DIRS.iter().any(|dir| name.starts_with(dir))
+        })
+        .map(str::to_string)
+        .collect();
+
+    let mut textures = HashMap::new();
+    for name in names {
+        let mut entry = match archive.by_name(&name) {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let mut bytes = Vec::new();
+        if entry.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        // Chave sem `assets/minecraft/textures/`: é o caminho que o mapa de
+        // modelos usa, e mantém o JSON do cache legível.
+        let key = name
+            .strip_prefix("assets/minecraft/textures/")
+            .unwrap_or(&name)
+            .to_string();
+        textures.insert(key, to_data_url(&bytes));
+    }
+
+    if textures.is_empty() {
+        return Err("Nenhuma textura de entidade encontrada no jar local.".to_string());
+    }
+    Ok(textures)
+}
+
 /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco pra
 /// versão pedida.
 pub fn build_or_load_atlas(mc_version: &str) -> Result<TextureAtlas, String> {
@@ -379,5 +474,42 @@ mod tests {
         let _ = std::fs::remove_file(png_path);
         let _ = std::fs::remove_file(json_path);
         let _ = std::fs::remove_file(cloud_cache_path("26.3-test"));
+    }
+
+    /// Mesma integração real, pras texturas de entidade: valida que os
+    /// diretórios conhecidos saem do jar local como data URL. Pula sozinho se
+    /// não houver jar (a extração pura evita mexer no cache da versão real).
+    #[test]
+    fn extracts_entity_textures_from_local_jar_if_present() {
+        let Some(jar) = find_local_client_jar("26.3") else {
+            eprintln!("skip: sem client jar local pra testar contra");
+            return;
+        };
+        let textures = extract_entity_textures(&jar).expect("texturas de entidade deveriam sair");
+        assert!(
+            textures.len() > 30,
+            "esperava as texturas dos mobs suportados, achei {}",
+            textures.len()
+        );
+        for key in [
+            "entity/cow/cow_temperate.png",
+            "entity/cow/cow_temperate_baby.png",
+            "entity/pig/pig_temperate.png",
+            "entity/sheep/sheep.png",
+            "entity/sheep/sheep_wool.png",
+            "entity/chicken/chicken_temperate.png",
+            "entity/chicken/chicken_temperate_baby.png",
+            "entity/zombie/zombie.png",
+            "entity/zombie/zombie_baby.png",
+            "entity/skeleton/skeleton.png",
+            "entity/creeper/creeper.png",
+            "entity/spider/spider.png",
+        ] {
+            let url = textures.get(key).unwrap_or_else(|| panic!("{key} ausente"));
+            assert!(
+                url.starts_with("data:image/png;base64,"),
+                "{key} deveria ser data URL PNG"
+            );
+        }
     }
 }
