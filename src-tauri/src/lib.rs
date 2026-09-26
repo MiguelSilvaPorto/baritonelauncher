@@ -1,4 +1,5 @@
 mod addon_socket;
+mod block_models;
 mod instructions;
 mod items;
 mod mobs;
@@ -532,6 +533,22 @@ mod commands {
         crate::texture_atlas::build_or_load_atlas(&version)
     }
 
+    /// Modelos de bloco reais (geometria não-cúbica: tocha, cogumelo,
+    /// vitória-régia, escada, cerca...) assados do client jar local — payload
+    /// binário, ver `block_models::encode_payload`. Mesma exigência do atlas:
+    /// precisa da versão do MC que o addon reportou.
+    #[tauri::command]
+    fn get_block_models(state: State<AppState>) -> Result<tauri::ipc::Response, String> {
+        let version = state
+            .mc_version
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "Ainda não sei a versão do Minecraft — conecte o addon primeiro.".to_string())?;
+        let payload = crate::block_models::build_or_load_payload(&version)?;
+        Ok(tauri::ipc::Response::new(payload))
+    }
+
     /// Preferências atuais (aba Config) — o que está em memória, já
     /// carregado do disco no `setup()` ou com os padrões.
     #[tauri::command]
@@ -586,6 +603,7 @@ mod commands {
             player_skin,
             nearby_mobs,
             get_texture_atlas,
+            get_block_models,
             settings_get,
             settings_set,
             settings_reset,

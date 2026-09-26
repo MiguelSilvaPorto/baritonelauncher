@@ -21,9 +21,12 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   modelo de verdade do jogador em vez de um marcador genérico.
 - Assina `ChunkEvent.Load` (client-side) e enfileira o chunk pro envio de
   `chunk_voxels`: cada seção 16×16×16 vira paleta + índices (deflate + base64),
-  com flags de renderização/oclusão/fluido e o nível de cada fluido — é daí
-  que o viewer monta o terreno com face culling de verdade, inclusive água e
-  lava. Junto vai o bloco de **tints de bioma por coluna** (grama, folhagem e
+  com flags de renderização/oclusão/fluido, o nível de cada fluido e as
+  **propriedades do blockstate** de cada entrada (`facing=north,half=top,...`,
+  formato 5) — é daí que o viewer monta o terreno com face culling de verdade,
+  água/lava com nível e a **variante certa do modelo** de cada bloco (tocha de
+  parede, escada invertida, cerca). Junto vai o bloco de **tints de bioma por coluna** (grama,
+  folhagem e
   água), resolvido pelo `BiomeColors` do próprio client — o mesmo colormap e
   modificador de bioma que o jogo usa no render, então cada bioma aparece com
   a cor real. A fila drena poucos chunks por tick pra um backfill de reconexão
@@ -103,16 +106,20 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
   client ou do resource pack/jar instalado, nunca baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
+- `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
   (paleta + índices + luz por seção, **mais os tints de bioma por coluna**, deflate + base64). Por
   entrada da paleta: `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
-  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo). Depois dos índices de cada seção vêm
+  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) + `u16` tamanho das props + bytes
+  UTF-8 das props do blockstate (`facing=north,half=bottom`, ordenadas por nome). Depois dos índices
+  de cada seção vêm
   `u8[4096]` de **luz** do motor do jogo, um byte por posição (nibble baixo = luz de bloco, alto =
   luz de céu; mesma ordem dos índices). Depois das seções: `u8` tem_tints e, se `1`, `256×3` bytes de
   grama + `256×3` de folhagem + `256×3` de água (colunas `x + z*16`, cor RGB). Os tints saem do
   `BiomeColors` do client — colormap, override e modificador de bioma já aplicados, igual ao render
   do jogo — amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o viewer cai nas
-  cores fixas). Layout completo em `world_cache.rs`, `decode_voxels` (formato 4; **formatos 3 e 2,
-  sem luz, ainda são aceitos na leitura** pro `world.cache` antigo e pra addon desatualizado).
+  cores fixas). Layout completo em `world_cache.rs`, `decode_voxels` (formato 5; os formatos 4, 3 e 2
+  — sem props, sem luz e/ou sem tints — ainda são aceitos na leitura pro `world.cache` antigo e pra
+  addon desatualizado).
 - `{"type":"entities","radius":32.0,"entities":[{"id":42,"kind":"zombie","name":"Zumbi",
   "category":"hostile","x":1.5,"y":64.0,"z":-3.25,"health":20.0,"max_health":20.0,"distance":6.2,
   "height":1.95}, ...]}` — snapshot (~4x/s) das criaturas vivas no raio `radius` ao redor do

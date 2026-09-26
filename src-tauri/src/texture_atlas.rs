@@ -82,7 +82,7 @@ pub struct TextureAtlas {
     pub cloud_data_url: Option<String>,
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".cache")
 }
 
@@ -97,7 +97,7 @@ fn cache_paths(mc_version: &str) -> (PathBuf, PathBuf) {
 /// Onde o client jar já instalado deveria estar. Não baixa nada se não
 /// encontrar — devolve `None` e quem chamou decide o que fazer (hoje: erro
 /// honesto pedindo pra instalar a versão certa).
-fn find_local_client_jar(mc_version: &str) -> Option<PathBuf> {
+pub(crate) fn find_local_client_jar(mc_version: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let path = PathBuf::from(home)
         .join(".minecraft/versions")

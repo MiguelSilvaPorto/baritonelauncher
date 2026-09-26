@@ -360,11 +360,13 @@ pub struct StoredWorld {
     pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Option<ChunkTints>, Vec<u8>)>,
 }
 
-/// Formato antigo (container `BOWC` v1): usados na leitura, pra abrir (e
-/// importar) o `world.cache` gravado antes do log. Nada escreve mais nesse
-/// formato.
+/// Formato antigo (container `BOWC`): usado na leitura, pra abrir (e importar)
+/// o `world.cache` gravado antes do log. Nada escreve mais nesse formato.
+/// v1 = payloads de voxels v2/v3 (sem luz/props); v2 = payloads v4/v5 (o
+/// cabeçalho só acompanha o payload interno, que se descreve sozinho).
 const LEGACY_MAGIC: &[u8; 4] = b"BOWC";
 const LEGACY_FORMAT_VERSION: u8 = 1;
+const LEGACY_FORMAT_VERSION_PROPS: u8 = 2;
 const MAX_LEGACY_CHUNKS: u32 = 4_000_000;
 const MAX_LEGACY_CHUNK_PAYLOAD: u32 = 32 * 1024 * 1024;
 
@@ -380,7 +382,7 @@ pub fn load_legacy(path: &Path) -> Result<StoredWorld, String> {
         return Err("assinatura desconhecida".to_string());
     }
     let version = reader.u8()?;
-    if version != LEGACY_FORMAT_VERSION {
+    if version != LEGACY_FORMAT_VERSION && version != LEGACY_FORMAT_VERSION_PROPS {
         return Err(format!("versão de cache desconhecida: {version}"));
     }
 
@@ -490,6 +492,7 @@ mod tests {
                     block: block.to_string(),
                     flags: VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES,
                     level: 0,
+                    props: String::new(),
                 })
                 .collect(),
             indices: (0..4096).map(|i| (i % blocks.len()) as u16).collect(),
@@ -679,7 +682,7 @@ mod tests {
     fn write_legacy_cache(dir: &Path, mc_version: Option<&str>, positions: &[ChunkPos]) {
         let mut raw = Vec::new();
         raw.extend_from_slice(LEGACY_MAGIC);
-        raw.push(LEGACY_FORMAT_VERSION);
+        raw.push(LEGACY_FORMAT_VERSION_PROPS);
         let version = mc_version.unwrap_or("");
         raw.extend_from_slice(&(version.len() as u16).to_le_bytes());
         raw.extend_from_slice(version.as_bytes());

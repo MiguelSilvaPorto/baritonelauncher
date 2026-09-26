@@ -318,6 +318,22 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   UI mostra o valor **efetivo**, e "Restaurar padrões" volta tudo pro comportamento original. Pedido
   pelo usuário ("quero que vc adicione um configuração no meu app"). Referência dos campos em
   [`docs/CONFIG.md`](CONFIG.md).
+- **Modelos de bloco reais: tocha, cogumelo, vitória-régia, flor, escada, cerca, grade...** — o
+  viewer desenhava **todo** bloco como cubo cheio, então tudo que não é cubo saía deformado (o que o
+  usuário viu como "tochas e cogumelos, vitórias-régias" esticados/trocados). Agora o app lê os
+  `blockstates/*.json` + `models/block/*.json` do **client jar que já está instalado** (mesma regra do
+  atlas de texturas: nada é baixado nem empacotado da Mojang) e assa a geometria real de cada
+  variante: elementos (caixas e placas), rotação de elemento com `rescale` (tocha de parede inclinada,
+  plantas em cruz a 45°), rotação de variante (x/y/z) com `uvlock`, UVs padrão por face e `cullface`.
+  É um porte fiel do `FaceBakery`/`CuboidRotation`/`BlockMath` do jogo, então o que aparece na tela é
+  o modelo de verdade, não uma aproximação. Junto disso, o protocolo `chunk_voxels` passou a levar as
+  **propriedades do blockstate** (`facing=north,half=top,...`) — o payload virou o formato 4, que
+  junta as props com os tints de bioma da v3 (addon e Rust na mesma versão),
+  que é o que permite escolher a variante certa (tocha de parede virada pra cada lado, escada
+  invertida, cerca com braço só no norte). Blocos cujo modelo é um cubo cheio sem rotação continuam no
+  caminho antigo (sem custo e sem regressão); se o bake falhar, o viewer fica no cubo de antes em vez
+  de quebrar. Reportado pelo usuário ("quero que vc arrume meu viewer 3d que não consegue renderizar
+  correto tochas e cogumelos vitórias regias entre outras coisa").
 - **Céu no viewer 3D**: o fundo era uma cor chapada quase preta, então o horizonte e a profundidade do
   terreno sumiam — com o zoom afastado o mundo parecia flutuar no vazio. Agora há um domo de céu com
   gradiente (zênite azul → horizonte claro) numa textura de canvas, sempre centrado na câmera, e o

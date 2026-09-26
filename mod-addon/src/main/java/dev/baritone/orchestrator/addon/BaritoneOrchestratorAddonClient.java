@@ -107,16 +107,18 @@ public class BaritoneOrchestratorAddonClient {
             "{\"type\":\"hello\",\"addon_version\":\"0.1.0\",\"baritone_version\":\"1.20.0\",\"mc_version\":\"26.3\"}";
 
     // Layout do payload binário de `chunk_voxels` — precisa bater com
-    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 4):
+    // `decode_voxels` em src-tauri/src/world_cache.rs (formato 5):
     //   u8 versão | u8 nº de seções
     //   por seção: i8 Y da seção | u16 tamanho da paleta
-    //              por entrada: u16 tamanho do nome | bytes UTF-8 | u8 flags | u8 nível
+    //              por entrada: u16 tamanho do nome | bytes UTF-8 | u8 flags |
+    //                           u8 nível do fluido | u16 tamanho das props |
+    //                           bytes UTF-8 (props do blockstate)
     //              u16[4096] índices (x + z*16 + y*256)
     //              u8[4096] luz (x + z*16 + y*256; nibble baixo = bloco, alto = céu)
     //   u8 tem_tints | 256×3 bytes de grama, 256×3 de folhagem e 256×3 de água
-    //              (colunas x + z*16; v3 = sem luz, v2 = sem tints nem luz,
-    //              os dois ainda aceitos na leitura)
-    private static final byte VOXEL_FORMAT_VERSION = 4;
+    //              (colunas x + z*16; v4 = sem props, v3 = sem luz, v2 = sem
+    //               tints nem luz, todos ainda aceitos na leitura)
+    private static final byte VOXEL_FORMAT_VERSION = 5;
     private static final int VOXEL_FLAG_RENDER = 1;
     private static final int VOXEL_FLAG_OCCLUDES = 2;
     private static final int VOXEL_FLAG_FLUID = 4;
@@ -895,6 +897,11 @@ public class BaritoneOrchestratorAddonClient {
                 raw.write(name, 0, name.length);
                 raw.write(voxelFlags(state));
                 raw.write(voxelLevel(state));
+                // Props do blockstate (v3): o viewer escolhe a variante do
+                // modelo com isso (tocha de parede, escada, cerca...).
+                byte[] props = blockStateProps(state).getBytes(StandardCharsets.UTF_8);
+                writeU16(raw, props.length);
+                raw.write(props, 0, props.length);
             }
             for (short index : sectionIndices) {
                 writeU16(raw, index & 0xFFFF);
@@ -1050,6 +1057,18 @@ public class BaritoneOrchestratorAddonClient {
         }
         int amount = fluid.getAmount(); // 1..8, maior = mais cheio
         return amount >= 8 ? 8 : 8 - amount;
+    }
+
+    /**
+     * Propriedades do blockstate no formato `nome=valor,nome=valor` (ordenado
+     * por nome, pra ser determinístico) — o app casa isso com as chaves de
+     * `variants`/`multipart` do blockstate pra escolher o modelo certo.
+     */
+    private static String blockStateProps(BlockState state) {
+        ArrayList<String> props = new ArrayList<>();
+        state.getValues().forEach(value -> props.add(value.toString()));
+        props.sort(null);
+        return String.join(",", props);
     }
 
     private static void writeU16(ByteArrayOutputStream out, int value) {

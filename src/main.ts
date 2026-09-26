@@ -814,6 +814,18 @@ async function refreshState() {
           viewer3d?.setAtlasUnavailable();
         });
     }
+    // Modelos de bloco reais (tocha, cogumelo, escada...): mesmo jar do
+    // atlas, payload binário (ver `block_models.rs`). Uma tentativa só; se o
+    // bake falhar, o viewer fica no cubo cheio de antes.
+    if (viewer3d.needsBlockModels() && (status.connected || world.chunks_explored > 0)) {
+      viewer3d.markBlockModelsLoading();
+      invoke<ArrayBuffer | Uint8Array | number[]>("get_block_models")
+        .then((raw) => viewer3d?.setBlockModels(raw))
+        .catch((err) => {
+          console.error("[models] falha ao carregar os modelos de bloco:", err);
+          viewer3d?.setBlockModelsUnavailable();
+        });
+    }
     // Sem o jogo aberto o `bot_pos` do Rust volta a ser `None` — esconde o
     // modelo aqui (o polling de `bot_pose` faria o mesmo em 250ms, mas isso
     // mantém a garantia explícita de nunca ficar congelado na última pose).
