@@ -10,6 +10,23 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ## [Não lançado]
 
+### Added
+
+- **Luz de verdade no viewer — bloco emissor ilumina os vizinhos**: o terreno usava luz fixa (ambiente +
+  direcional), então tocha, lava e glowstone não iluminavam nada e uma caverna ficava igual à
+  superfície. Agora o addon lê o **motor de luz do próprio jogo** (as duas camadas que o cliente já
+  mantém: luz de bloco — tocha, lava, glowstone... — e luz de céu) e manda os níveis por posição no
+  `chunk_voxels` (formato 3: um byte por posição, um nibble por camada, lido direto da `DataLayer` da
+  seção — sem 4096 consultas ao motor por camada). O viewer faz *smooth lighting* como o jogo: para cada
+  canto de face, média das 4 posições de ar em volta nos dois canais, `max(céu, bloco)` e a curva de
+  brilho do jogo, multiplicada pelo tint e pelo sombreamento da direção (topo 1.0, norte/sul 0.8,
+  leste/oeste 0.6, fundo 0.5) — e o material do terreno passou a ser sem luz dinâmica, porque a luz já
+  vem assada no vértice. Resultado: degradê em volta da tocha, caverna escura, lava brilhando no escuro.
+  Céu conta como dia cheio (não há ciclo dia/noite no viewer ainda) e ar acima da última seção carregada
+  do chunk é céu cheio; o `world.cache` antigo (formato 2) é descartado e reconstruído no próximo
+  carregamento. Reportado pelo usuário ("quero que vc adicione luz que nem no minecraft onde alguns
+  blocos emitem luz e afetam outros no meu render").
+
 ### Fixed
 
 - **"Separação"/grade visível entre os blocos de longe**: o atlas não tinha folga entre os tiles nem

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 /// precisam estar de acordo — mudar o layout sem mudar isto corrompe a
 /// decodificação em vez de dar erro claro. v2 adicionou o byte de nível de
 /// fluido em cada entrada de paleta (água/lava).
-pub const VOXEL_FORMAT_VERSION: u8 = 2;
+pub const VOXEL_FORMAT_VERSION: u8 = 3;
 
 /// Bit 0: o bloco é desenhável como cubo cheio (não é ar nem decoração
 /// substituível, tipo grama alta). Bit 1: o bloco esconde as faces dos
@@ -76,7 +76,8 @@ impl PaletteEntry {
 
 /// Uma seção 16×16×16 do chunk (a mesma divisão do `LevelChunkSection` do
 /// jogo). `indices` tem sempre 4096 posições, na ordem `x + z*16 + y*256` —
-/// igual à do `PalettedContainer` vanilla.
+/// igual à do `PalettedContainer` vanilla. `light` tem 4096 bytes na mesma
+/// ordem: nibble baixo = luz de bloco, nibble alto = luz de céu (0–15 cada).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkSection {
     /// Y da seção (Y do mundo / 16) — absoluto, pode ser negativo
@@ -84,6 +85,9 @@ pub struct ChunkSection {
     pub y: i8,
     pub palette: Vec<PaletteEntry>,
     pub indices: Vec<u16>,
+    /// Luz do motor do jogo por posição (tocha/lava/céu já propagados), no
+    /// formato compacto de dois nibbles — ver o doc do módulo.
+    pub light: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -223,7 +227,7 @@ impl<'a> VoxelReader<'a> {
     }
 }
 
-/// Decodifica o payload de `chunk_voxels` (formato 2 — ver
+/// Decodifica o payload de `chunk_voxels` (formato 3 — ver
 /// `VOXEL_FORMAT_VERSION` e `mod-addon/README.md`):
 ///
 /// ```text
@@ -234,6 +238,7 @@ impl<'a> VoxelReader<'a> {
 ///   u16 tamanho da paleta
 ///   por entrada: u16 tamanho do nome, bytes UTF-8, u8 flags, u8 nível de fluido
 ///   u16[4096] índices (ordem x + z*16 + y*256)
+///   u8[4096]  luz (nibble baixo = bloco, alto = céu; mesma ordem)
 /// ```
 pub fn decode_voxels(bytes: &[u8]) -> Result<Vec<ChunkSection>, String> {
     let mut reader = VoxelReader::new(bytes);
@@ -276,10 +281,16 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<Vec<ChunkSection>, String> {
             indices.push(reader.u16()?);
         }
 
+        let mut light = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            light.push(reader.u8()?);
+        }
+
         sections.push(ChunkSection {
             y,
             palette,
             indices,
+            light,
         });
     }
 
@@ -306,6 +317,7 @@ pub fn encode_voxels(sections: &[ChunkSection]) -> Vec<u8> {
         for index in &section.indices {
             out.extend_from_slice(&index.to_le_bytes());
         }
+        out.extend_from_slice(&section.light);
     }
     out
 }
@@ -339,6 +351,8 @@ mod tests {
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 2) as u16).collect(),
+                // Luz de exemplo: bloco 15 na primeira metade, céu 15 na outra.
+                light: (0..4096).map(|i| if i < 2048 { 15 } else { 0xf0 }).collect(),
             },
             ChunkSection {
                 y: 4,
@@ -365,6 +379,8 @@ mod tests {
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 4) as u16).collect(),
+                // Céu 15 em tudo (superfície) — o caso comum do mundo carregado.
+                light: vec![0xf0; 4096],
             },
         ]
     }

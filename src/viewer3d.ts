@@ -155,10 +155,33 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
 // Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-const VOXEL_FORMAT_VERSION = 2;
+const VOXEL_FORMAT_VERSION = 3;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
+
+/** Luz: cada byte do payload carrega dois níveis 0–15 — nibble baixo = luz de
+ * bloco (tocha, lava, glowstone...), nibble alto = luz de céu, já propagados
+ * pelo motor de luz do próprio jogo (`LightLayer.BLOCK`/`SKY`). O viewer
+ * reamostra por canto de face (smooth lighting, como o jogo) e assa o
+ * resultado na cor do vértice — o terreno usa material sem luz dinâmica. */
+const SKY_LIGHT_DAY = 1; // sem ciclo dia/noite no viewer ainda: céu = dia cheio
+
+/** Curva de brilho do jogo (`LightTexture`): nível 15 = 1.0, queda suave
+ * até 0 (caverna sem tocha fica escura). */
+function lightCurve(level: number): number {
+  const f = level / 15;
+  return f / (4 - 3 * f);
+}
+
+/** Shading por direção da face, como no jogo: topo 1.0, norte/sul 0.8,
+ * leste/oeste 0.6, fundo 0.5. */
+function faceShade(face: FaceDef): number {
+  if (face.dir[1] > 0) return 1;
+  if (face.dir[1] < 0) return 0.5;
+  return face.dir[2] !== 0 ? 0.8 : 0.6;
+}
+
 
 /** Duração de cada frame das texturas animadas de fluido, em ms. O jogo lê
  * isso do `.mcmeta` de cada textura; aqui é fixo (aproximação honesta, ver
@@ -248,6 +271,9 @@ interface DecodedSection {
   y: number;
   palette: PaletteEntry[];
   indices: Uint16Array;
+  /** 4096 bytes, índice `x + z*16 + y*256`: nibble baixo = luz de bloco,
+   * nibble alto = luz de céu (0–15 cada) — ver `world_cache.rs`. */
+  light: Uint8Array;
 }
 
 interface DecodedChunk {
@@ -255,6 +281,9 @@ interface DecodedChunk {
   z: number;
   /** Seção Y (mundo / 16) → seção; ausente = ar. */
   sections: Map<number, DecodedSection>;
+  /** Maior seção Y que veio no payload — acima dela o ar é céu cheio (ver
+   * `lightAt`). */
+  maxSectionY: number;
 }
 
 /** Uma face do cubo, na ordem dos vértices em sentido anti-horário visto de
@@ -433,9 +462,17 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
     }
     const indices = new Uint16Array(4096);
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
-    sections.set(y, { y, palette, indices });
+    const light = new Uint8Array(4096);
+    for (let idx = 0; idx < 4096; idx++) light[idx] = reader.u8();
+    sections.set(y, { y, palette, indices, light });
   }
-  return { x, z, sections };
+  const sectionYs = Array.from(sections.keys());
+  return {
+    x,
+    z,
+    sections,
+    maxSectionY: sectionYs.length > 0 ? Math.max(...sectionYs) : 0,
+  };
 }
 
 export class Viewer3D {
@@ -552,12 +589,12 @@ export class Viewer3D {
   private faceRenderCache = new Map<string, FaceRender | null>();
   /** Material do terreno opaco: um só pra tudo, com UV apontando pro tile
    * certo do atlas por face e cor por vértice (tint). */
-  private opaqueMaterial: THREE.MeshStandardMaterial | null = null;
+  private opaqueMaterial: THREE.MeshBasicMaterial | null = null;
   /** Material por bucket de fluido (`water_still`, `water_flow`,
    * `lava_still`, `lava_flow`). */
-  private bucketMaterials = new Map<string, THREE.MeshStandardMaterial>();
+  private bucketMaterials = new Map<string, THREE.MeshBasicMaterial>();
   /** Materiais com textura animada + seus frames, pra trocar o `map`. */
-  private animatedMaterials: { material: THREE.MeshStandardMaterial; frames: THREE.Texture[] }[] = [];
+  private animatedMaterials: { material: THREE.MeshBasicMaterial; frames: THREE.Texture[] }[] = [];
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
@@ -955,15 +992,15 @@ export class Viewer3D {
     this.bucketMaterials.clear();
     this.faceRenderCache.clear();
     this.faceRectCache.clear();
-    // `alphaTest` recorta as texturas com transparência (folhas, plantas,
-    // tochas): sem ele o alpha é ignorado e os pixels vazios saem pretos.
-    // Sem atlas (`map: null`, modo degradado) não muda nada — o alpha do
-    // vértice é 1.
-    this.opaqueMaterial = new THREE.MeshStandardMaterial({
+    // Material do terreno é **sem luz dinâmica** (`MeshBasicMaterial`): a luz
+    // vem assada na cor do vértice, reamostrada da luz real do jogo (tocha,
+    // céu, lava...) em `pushQuadFlat` — é o que faz o bloco emissor iluminar
+    // os vizinhos e a caverna ficar escura. `alphaTest` recorta as texturas
+    // com transparência (folhas, plantas, tochas); no modo degradado
+    // (`map: null`) o alpha do vértice é 1 e nada muda.
+    this.opaqueMaterial = new THREE.MeshBasicMaterial({
       map: this.atlasTexture,
       vertexColors: true,
-      roughness: 0.95,
-      metalness: 0,
       alphaTest: 0.5,
     });
     this.bucketMaterials.set("opaque", this.opaqueMaterial);
@@ -973,22 +1010,20 @@ export class Viewer3D {
     this.bucketMaterials.set("lava_flow", this.buildFluidMaterial("lava", "flow"));
   }
 
-  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshStandardMaterial {
+  private buildFluidMaterial(kind: "water" | "lava", phase: "still" | "flow"): THREE.MeshBasicMaterial {
     const frames = this.loadFrames(`${kind}_${phase}`);
     const water = kind === "water";
-    const material = new THREE.MeshStandardMaterial({
+    const material = new THREE.MeshBasicMaterial({
       map: frames[0] ?? null,
       color: water ? WATER_TINT : 0xffffff,
-      roughness: water ? 0.35 : 0.6,
-      metalness: 0,
+      vertexColors: true,
       // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
-      // opaca e emite luz.
+      // opaca. A luz da lava vem do próprio dado do jogo (bloco 15 propagado
+      // nas posições vizinhas), então ela não precisa de emissive.
       transparent: water,
       opacity: water ? 0.72 : 1,
       depthWrite: !water,
       side: THREE.DoubleSide,
-      emissive: water ? 0x000000 : 0x8a3b0c,
-      emissiveIntensity: water ? 0 : 0.55,
     });
     if (frames.length > 1) this.animatedMaterials.push({ material, frames });
     return material;
@@ -1129,6 +1164,78 @@ export class Viewer3D {
   /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
    * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
    * usado pra superfície rebaixada de fluido. */
+  /** Byte de luz de uma posição (nibble baixo = bloco, alto = céu); 0 se o
+   * chunk/seção não está no cache. Acima do topo do mundo é céu cheio. */
+  private lightAt(x: number, y: number, z: number): number {
+    if (y > 319) return 0xf0;
+    if (y < -64) return 0;
+    const chunk = this.chunks.get(this.chunkKey(x >> 4, z >> 4));
+    if (!chunk) return 0;
+    const sectionY = y >> 4;
+    const section = chunk.sections.get(sectionY);
+    if (!section) {
+      // Seção de ar não vem no payload (só as que têm bloco): acima da maior
+      // seção do chunk é ar aberto (céu cheio); abaixo/entre, escuridão.
+      return sectionY > chunk.maxSectionY ? 0xf0 : 0;
+    }
+    return section.light[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] ?? 0;
+  }
+
+  /** Brilho 0–1 de um canto de face, no estilo do jogo: média das 4 posições
+   * de ar em volta do canto (a da frente da face + as duas arestas + a quina),
+   * nos dois canais, e `max(céu, bloco)` no fim. É isso que dá o degradê
+   * suave em volta de uma tocha em vez de blocos com brilho chapado. */
+  private cornerBrightness(
+    lightAt: (x: number, y: number, z: number) => number,
+    face: FaceDef,
+    corner: readonly [number, number, number],
+    x: number,
+    y: number,
+    z: number
+  ): number {
+    const axes: number[] = [];
+    for (let axis = 0; axis < 3; axis++) if (face.dir[axis] === 0) axes.push(axis);
+    const signs = axes.map((axis) => (corner[axis] === 1 ? 1 : -1));
+    const offset = (axis: number, sign: number) => {
+      const out = [0, 0, 0];
+      out[axis] = sign;
+      return out;
+    };
+    const o1 = offset(axes[0], signs[0]);
+    const o2 = offset(axes[1], signs[1]);
+    const bx = x + face.dir[0];
+    const by = y + face.dir[1];
+    const bz = z + face.dir[2];
+    const samples = [
+      [bx, by, bz],
+      [bx + o1[0], by + o1[1], bz + o1[2]],
+      [bx + o2[0], by + o2[1], bz + o2[2]],
+      [bx + o1[0] + o2[0], by + o1[1] + o2[1], bz + o1[2] + o2[2]],
+    ];
+
+    let block = 0;
+    let sky = 0;
+    for (const [sx, sy, sz] of samples) {
+      const value = lightAt(sx, sy, sz);
+      block += value & 15;
+      sky += value >> 4;
+    }
+    return lightCurve(Math.max(block >> 2, (sky >> 2) * SKY_LIGHT_DAY));
+  }
+
+  /** Brilho dos 4 cantos de uma face (0–1), já sem o shading direcional —
+   * `pushQuadFlat` aplica `faceShade` por cima. */
+  private faceCornerBrightness(
+    lightAt: (x: number, y: number, z: number) => number,
+    faceIndex: number,
+    x: number,
+    y: number,
+    z: number
+  ): number[] {
+    const face = FACES[faceIndex];
+    return face.corners.map((corner) => this.cornerBrightness(lightAt, face, corner, x, y, z));
+  }
+
   private pushQuadFlat(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1140,16 +1247,21 @@ export class Viewer3D {
     uv: readonly number[],
     r: number,
     g: number,
-    b: number
+    b: number,
+    light: readonly number[]
   ) {
     const face = FACES[faceIndex];
+    const shade = faceShade(face);
     const base = buffers.positions.length / 3;
     for (let i = 0; i < 4; i++) {
       const corner = face.corners[i];
       buffers.positions.push(x + corner[0], y + (corner[1] === 1 ? high : low), z + corner[2]);
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
       buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
-      buffers.colors.push(r, g, b);
+      // A luz do jogo já vem pronta (tocha, céu, lava...): aqui ela só é
+      // multiplicada no tint do vértice junto do shading da direção da face.
+      const brightness = light[i] * shade;
+      buffers.colors.push(r * brightness, g * brightness, b * brightness);
     }
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
@@ -1194,7 +1306,8 @@ export class Viewer3D {
     z: number,
     entry: PaletteEntry,
     neighbor: PaletteEntry | null,
-    flow: THREE.Vector3 | null
+    flow: THREE.Vector3 | null,
+    lightAt: (x: number, y: number, z: number) => number
   ) {
     const ownHeight = fluidHeight(entry.level);
     let low = 0;
@@ -1221,7 +1334,8 @@ export class Viewer3D {
       FLUID_ROTATED_UV[faceIndex][rotation],
       1,
       1,
-      1
+      1,
+      this.faceCornerBrightness(lightAt, faceIndex, x, y, z)
     );
   }
 
@@ -1258,6 +1372,15 @@ export class Viewer3D {
         }
         return this.entryAt(x, y, z);
       };
+      // Luz local: quase toda amostra do smooth lighting cai na seção
+      // corrente, então evita o `Map.get` global na maioria dos casos.
+      const lightAt = (x: number, y: number, z: number): number => {
+        if ((x >> 4) === chunk.x && (z >> 4) === chunk.z) {
+          const source = (y >> 4) === sectionY ? section : chunk.sections.get(y >> 4);
+          if (source) return source.light[((y & 15) << 8) | ((z & 15) << 4) | (x & 15)];
+        }
+        return this.lightAt(x, y, z);
+      };
 
       for (let ly = 0; ly < 16; ly++) {
         for (let lz = 0; lz < 16; lz++) {
@@ -1283,7 +1406,7 @@ export class Viewer3D {
                   flow = this.fluidFlowVector(x, y, z, entry);
                   flowNeeded = false;
                 }
-                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow);
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, lightAt);
                 continue;
               }
               // Sólido: face some se o vizinho é oclusor; oclusão entre
@@ -1295,7 +1418,20 @@ export class Viewer3D {
               }
               const render = this.faceRender(entry.block, f);
               if (!render) continue;
-              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, render.r, render.g, render.b);
+              this.pushQuadFlat(
+                buffered("opaque"),
+                f,
+                x,
+                y,
+                z,
+                0,
+                1,
+                render.uv,
+                render.r,
+                render.g,
+                render.b,
+                this.faceCornerBrightness(lightAt, f, x, y, z)
+              );
             }
           }
         }

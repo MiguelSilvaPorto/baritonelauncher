@@ -78,10 +78,12 @@ Documentado por completo em `src-tauri/src/addon_socket.rs` (lado Rust) — resu
   real). `model` é `slim` ou `wide`; o PNG é lido do cache de texturas do
   client ou do resource pack/jar instalado, nunca baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
-  (paleta + índices por seção, deflate + base64). Por entrada da paleta:
+  (paleta + índices + luz por seção, deflate + base64). Por entrada da paleta:
   `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
-  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) — layout
-  completo em `world_cache.rs`, `decode_voxels` (formato 2).
+  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo). Depois dos
+  índices vêm `u8[4096]` de **luz** do motor do jogo, um byte por posição
+  (nibble baixo = luz de bloco, alto = luz de céu; mesma ordem dos índices) —
+  layout completo em `world_cache.rs`, `decode_voxels` (formato 3).
 - `{"type":"instruction_status","id":"i1","status":"active","progress":0.42}` —
   estado da instrução ativa (`active`/`done`/`failed`; `progress` só no `active`
   do `travel_to` — `explore` é contínuo e não tem progresso).
