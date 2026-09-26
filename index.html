@@ -68,11 +68,33 @@
               </span>
               <span class="endpoint mono" id="viewer-endpoint">socket: aguardando implementação</span>
             </div>
+            <div class="viewer-hint">
+              <span><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> mover</span>
+              <span class="sep">·</span>
+              <span><kbd>Q</kbd>/<kbd>E</kbd> altura</span>
+              <span class="sep">·</span>
+              <span><kbd>Shift</kbd> rápido</span>
+              <span class="sep">·</span>
+              <span><kbd>Alt</kbd> preciso</span>
+              <span class="sep">·</span>
+              <span><kbd>F</kbd> focar bot</span>
+              <span class="sep">·</span>
+              <span>roda: zoom</span>
+            </div>
           </div>
           <aside class="side-panel" id="queue-panel">
             <div class="side-header">
               <h2>Fila</h2>
               <span class="count mono" id="queue-count">0</span>
+            </div>
+            <div class="queue-composer">
+              <div class="composer-row">
+                <input class="composer-input mono" type="number" name="x" placeholder="x" step="1" />
+                <input class="composer-input mono" type="number" name="z" placeholder="z" step="1" />
+                <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
+                <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
+              </div>
+              <span class="composer-hint">Ir para = coordenadas x/z · Explorar = a partir do bot</span>
             </div>
             <div class="queue-list" id="queue-list"></div>
             <div class="side-footer" id="storage-footer"></div>
@@ -99,6 +121,15 @@
             <div class="side-header">
               <h2>Fila de instruções</h2>
               <span class="count mono" id="queue-count-full">0</span>
+            </div>
+            <div class="queue-composer">
+              <div class="composer-row">
+                <input class="composer-input mono" type="number" name="x" placeholder="x" step="1" />
+                <input class="composer-input mono" type="number" name="z" placeholder="z" step="1" />
+                <button type="button" class="composer-btn" data-queue-action="travel">Ir para</button>
+                <button type="button" class="composer-btn ghost" data-queue-action="explore">Explorar</button>
+              </div>
+              <span class="composer-hint">Ir para = coordenadas x/z · Explorar = a partir do bot</span>
             </div>
             <div class="queue-list" id="queue-list-full"></div>
           </aside>

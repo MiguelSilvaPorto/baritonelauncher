@@ -219,6 +219,39 @@ button, input { font-family: inherit; }
 .progress-chip .bar > span { display: block; height: 100%; background: var(--teal); }
 .progress-chip .pct { font-size: 11px; color: var(--text-2); }
 
+/* Atalhos de câmera do viewer 3D (movimento por teclado) — canto oposto ao HUD. */
+.viewer-hint {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  max-width: min(70%, 620px);
+  font-size: 10px;
+  color: var(--text-3);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 6px 10px;
+  pointer-events: none;
+}
+
+.viewer-hint .sep { color: var(--border-2); }
+
+.viewer-hint kbd {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-2);
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border-2);
+  border-radius: 3px;
+  padding: 1px 4px;
+  margin-right: 1px;
+}
+
 .ghost-block {
   position: absolute;
   border: 1px dashed var(--amber);
@@ -294,12 +327,68 @@ button, input { font-family: inherit; }
 .queue-card.status-done { border-left-color: var(--success); }
 .queue-card.status-paused { border-left-color: var(--amber); }
 .queue-card.status-failed { border-left-color: var(--danger); }
+.queue-card.status-canceled { border-left-color: var(--text-3); }
 
 .queue-card .row1 { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
 .queue-card .label { font-size: 12px; color: var(--text); }
 .queue-card .kind { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.03em; }
 .queue-card .bar { height: 3px; border-radius: 2px; background: var(--border-2); overflow: hidden; }
 .queue-card .bar > span { display: block; height: 100%; background: var(--teal); }
+
+.queue-card .queue-cancel {
+  margin-top: 8px;
+  background: transparent;
+  border: 1px solid var(--border-2);
+  color: var(--text-3);
+  border-radius: var(--r-sm);
+  font-size: 10px;
+  padding: 2px 7px;
+  cursor: pointer;
+}
+.queue-card .queue-cancel:hover { border-color: var(--danger); color: var(--danger); }
+
+/* Composer de instruções — "Ir para" (TravelTo) e "Explorar" (Explore). */
+.queue-composer {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--border);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.composer-row { display: flex; gap: 6px; align-items: center; }
+
+.composer-input {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  background: var(--bg-base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 7px;
+}
+.composer-input:focus { outline: none; border-color: var(--amber); }
+.composer-input::-webkit-outer-spin-button,
+.composer-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+.composer-btn {
+  flex: 0 0 auto;
+  background: var(--amber-dim);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  border-radius: var(--r-sm);
+  font-size: 11px;
+  padding: 5px 9px;
+  cursor: pointer;
+}
+.composer-btn:hover { background: var(--amber); color: var(--bg-base); }
+.composer-btn.ghost { background: transparent; border-color: var(--border-2); color: var(--text-2); }
+.composer-btn.ghost:hover { background: transparent; border-color: var(--text-2); color: var(--text); }
+
+.composer-hint { font-size: 10px; color: var(--text-3); }
 
 .empty-state {
   flex: 1 1 auto;

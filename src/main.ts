@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
+import { Viewer3D, type ColumnBlock, type BotPos, type UvRect } from "./viewer3d";
 
 interface TextureAtlas {
   image_data_url: string;
@@ -20,7 +20,7 @@ interface WorldSummary {
   bot_pos?: BotPos;
 }
 
-type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed";
+type InstructionStatus = "Queued" | "Active" | "Paused" | "Done" | "Failed" | "Canceled";
 type InstructionKind =
   | "Explore"
   | "Mine"
@@ -30,12 +30,19 @@ type InstructionKind =
   | "Smelt"
   | "TravelTo";
 
+/** Alvo horizontal (x, z) — ver `InstructionTarget` em src-tauri/src/instructions.rs. */
+interface InstructionTarget {
+  x: number;
+  z: number;
+}
+
 interface Instruction {
   id: string;
   kind: InstructionKind;
   label: string;
   status: InstructionStatus;
   progress: number;
+  target: InstructionTarget | null;
 }
 
 interface ItemTotal {
@@ -98,17 +105,23 @@ const STATUS_LABEL: Record<InstructionStatus, string> = {
   Paused: "pausado",
   Done: "concluído",
   Failed: "falhou",
+  Canceled: "cancelado",
 };
 
 function queueCard(instruction: Instruction): string {
   const statusClass = `status-${instruction.status.toLowerCase()}`;
+  const cancellable = instruction.status === "Queued" || instruction.status === "Active";
+  // `Explore` é contínuo e não tem progresso mensurável (o addon não manda
+  // `progress`) — barra só onde existe progresso real, nada de fingir 0%.
+  const showBar = !(instruction.kind === "Explore" && instruction.status === "Active");
   return `
     <div class="queue-card ${statusClass}">
       <div class="row1">
         <span class="label">${instruction.label}</span>
         <span class="kind mono">${STATUS_LABEL[instruction.status]}</span>
       </div>
-      <div class="bar"><span style="width:${Math.round(instruction.progress * 100)}%"></span></div>
+      ${showBar ? `<div class="bar"><span style="width:${Math.round(instruction.progress * 100)}%"></span></div>` : ""}
+      ${cancellable ? `<button type="button" class="queue-cancel" data-queue-cancel="${instruction.id}">cancelar</button>` : ""}
     </div>
   `;
 }
@@ -119,13 +132,60 @@ function renderQueueInto(listId: string, countId: string | null, items: Instruct
     list.innerHTML = `
       <div class="empty-state">
         <span class="headline">Fila vazia</span>
-        <span class="detail">Nenhuma instrução foi enfileirada ainda — o editor de schematic e o painel de itens ainda geram instruções manualmente, a resolução automática de dependências está descrita em <code>docs/SPEC.md</code> mas não ligada aqui.</span>
+        <span class="detail">Enfileire uma instrução acima: "Ir para" manda o bot viajar até as coordenadas x/z e "Explorar" cobre a área a partir de onde ele está — o addon executa com o pathing do Baritone e devolve status/progresso. Resolução automática de dependências (baú/craft) ainda não está ligada.</span>
       </div>
     `;
   } else {
     list.innerHTML = items.map(queueCard).join("");
   }
   if (countId) $(`#${countId}`).textContent = String(items.length);
+}
+
+function renderQueue(items: Instruction[]) {
+  renderQueueInto("queue-list", "queue-count", items);
+  renderQueueInto("queue-list-full", "queue-count-full", items);
+}
+
+/** Mesma instrução "Ir para"/"Explorar" nos dois painéis de fila (viewer e
+ *  view cheia) — `lastBotPos` vem do polling e é a origem do "Explorar". */
+function bootstrapQueueComposers() {
+  $$<HTMLElement>(".queue-composer").forEach((composer) => {
+    const xInput = composer.querySelector<HTMLInputElement>('input[name="x"]');
+    const zInput = composer.querySelector<HTMLInputElement>('input[name="z"]');
+
+    composer.querySelector('[data-queue-action="travel"]')?.addEventListener("click", () => {
+      const x = Number(xInput?.value);
+      const z = Number(zInput?.value);
+      if (!Number.isFinite(x) || !Number.isFinite(z)) {
+        (Number.isFinite(x) ? zInput : xInput)?.focus();
+        return;
+      }
+      invoke<Instruction[]>("queue_push", { kind: "TravelTo", target: { x: Math.round(x), z: Math.round(z) } })
+        .then(renderQueue)
+        .catch((err) => console.error("[fila] ir para falhou:", err));
+    });
+
+    composer.querySelector('[data-queue-action="explore"]')?.addEventListener("click", () => {
+      const target = lastBotPos ? { x: lastBotPos.x, z: lastBotPos.z } : null;
+      invoke<Instruction[]>("queue_push", { kind: "Explore", target })
+        .then(renderQueue)
+        .catch((err) => console.error("[fila] explorar falhou:", err));
+    });
+  });
+}
+
+function bootstrapQueueActions() {
+  // Delegação: os cards são innerHTML recriado a cada refresh, então o
+  // listener fica no container, não no botão.
+  $$<HTMLElement>(".queue-list").forEach((list) => {
+    list.addEventListener("click", (event) => {
+      const btn = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-queue-cancel]");
+      if (!btn) return;
+      invoke<Instruction[]>("queue_cancel", { id: btn.dataset.queueCancel })
+        .then(renderQueue)
+        .catch((err) => console.error("[fila] cancelar falhou:", err));
+    });
+  });
 }
 
 /* ---------- Armazém ---------- */
@@ -256,17 +316,20 @@ function renderHud(vitals: Vitals | null) {
 /* ---------- Bootstrap ---------- */
 
 let viewer3d: Viewer3D | null = null;
+/** Última posição do bot (do polling) — origem do "Explorar" no composer. */
+let lastBotPos: BotPos | null = null;
 
 async function refreshState() {
-  const [status, world, chunks, queue, totals, vitals] = await Promise.all([
+  const [status, world, columns, queue, totals, vitals] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
-    invoke<ChunkPos[]>("world_chunks"),
+    invoke<ColumnBlock[]>("world_columns"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
   ]);
 
+  lastBotPos = world.bot_pos ?? null;
   renderViewer(status, world);
   if (status.connected && viewer3d) {
     // Atlas só existe depois que o addon já mandou `hello` (é de lá que
@@ -277,14 +340,11 @@ async function refreshState() {
         .then((atlas) => viewer3d?.setAtlas(atlas.image_data_url, atlas.textures))
         .catch((err) => console.error("[atlas]", err));
     }
-    // Chunk novo usa a altura atual do bot como aproximação de "chão local"
-    // — não temos altura de terreno de verdade ainda, ver viewer3d.ts.
-    viewer3d.setChunks(chunks, world.bot_pos?.y ?? 0);
+    viewer3d.setColumns(columns);
     viewer3d.setBotPos(world.bot_pos ?? null);
   }
   renderHud(vitals);
-  renderQueueInto("queue-list", "queue-count", queue);
-  renderQueueInto("queue-list-full", "queue-count-full", queue);
+  renderQueue(queue);
   renderStorage(totals);
 }
 
@@ -295,6 +355,8 @@ const REFRESH_INTERVAL_MS = 1000;
 window.addEventListener("DOMContentLoaded", () => {
   bootstrapRail();
   bootstrapTitlebar();
+  bootstrapQueueComposers();
+  bootstrapQueueActions();
 
   viewer3d = new Viewer3D($<HTMLElement>("#viewer-3d"), $<HTMLDivElement>("#bot-label"));
   window.addEventListener("resize", () => viewer3d?.resize());
