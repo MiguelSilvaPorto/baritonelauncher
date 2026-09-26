@@ -25,7 +25,7 @@
 //! nada de um segundo esquema pra dessincronizar. `crossing_hints` (política
 //! aprendida de água/lava) ainda é volátil, e nada o popula hoje.
 
-use crate::world_cache::{decode_voxels, ChunkPos, ChunkSection, WorldCache};
+use crate::world_cache::{decode_voxels, ChunkPos, ChunkSection, ChunkTints, WorldCache};
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
@@ -44,16 +44,16 @@ pub struct StoredWorld {
     /// Versão do Minecraft do último `hello` — `None` se o cache foi salvo
     /// antes de qualquer conexão.
     pub mc_version: Option<String>,
-    /// `(posição, seções, payload)` — o payload é mantido porque é
+    /// `(posição, seções, tints, payload)` — o payload é mantido porque é
     /// exatamente o formato que o `Chunk` guarda em cache; reencodá-lo no
     /// load (segundos num mundo grande, em debug) seria trabalho jogado fora.
-    pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Vec<u8>)>,
+    pub chunks: Vec<(ChunkPos, Vec<ChunkSection>, Option<ChunkTints>, Vec<u8>)>,
 }
 
 impl StoredWorld {
     pub fn apply_to(self, world: &mut WorldCache) {
-        for (pos, sections, payload) in self.chunks {
-            world.apply_voxels_with_payload(pos, sections, payload);
+        for (pos, sections, tints, payload) in self.chunks {
+            world.apply_voxels_with_payload(pos, sections, tints, payload);
         }
     }
 }
@@ -158,9 +158,14 @@ pub fn load(path: &Path) -> Result<Option<StoredWorld>, String> {
             return Err(format!("payload de chunk grande demais: {len}"));
         }
         let payload = reader.take(len as usize)?;
-        let sections = decode_voxels(payload)
+        let decoded = decode_voxels(payload)
             .map_err(|err| format!("chunk ({x}, {z}) inválido: {err}"))?;
-        chunks.push((ChunkPos { x, z }, sections, payload.to_vec()));
+        chunks.push((
+            ChunkPos { x, z },
+            decoded.sections,
+            decoded.tints,
+            payload.to_vec(),
+        ));
     }
 
     Ok(Some(StoredWorld { mc_version, chunks }))
@@ -235,8 +240,9 @@ mod tests {
         world.apply_voxels(
             ChunkPos { x: -2, z: 3 },
             vec![section(-4, &["stone", "dirt"]), section(4, &["grass_block", "water"])],
+            Some(ChunkTints::solid([0x79, 0xc0, 0x5a])),
         );
-        world.apply_voxels(ChunkPos { x: 0, z: 0 }, vec![section(4, &["sand"])]);
+        world.apply_voxels(ChunkPos { x: 0, z: 0 }, vec![section(4, &["sand"])], None);
         world
     }
 
@@ -258,6 +264,7 @@ mod tests {
         assert_eq!(restored.chunk_count(), world.chunk_count());
         for (pos, chunk) in &world.chunks {
             assert_eq!(restored.chunks[pos].sections, chunk.sections, "chunk {pos:?} diferente");
+            assert_eq!(restored.chunks[pos].tints, chunk.tints, "tints de {pos:?} diferentes");
         }
 
         let _ = std::fs::remove_file(&path);
