@@ -95,10 +95,11 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 6. **New Rust commands** go under `mod commands` in `lib.rs` and must be added to both the
    `tauri::generate_handler![...]` list inside `commands::register` — Tauri won't expose one without
    the other.
-7. **Commits follow the worktree flow (section 9).** Commit on your task branch; merging that branch
-   into the local `main` is pre-authorized there — check for conflicts first, fix them on the branch,
-   verify the merged result. **Pushing to `origin` still needs explicit permission** for that specific
-   push, and so does committing directly on the primary checkout instead of a branch.
+7. **Commits follow the worktree flow (section 9).** Commit on your task branch; merging it into
+   `main` **and pushing `main` to `origin`** are pre-authorized by that workflow (fetch, resolve
+   conflicts on the branch, verify, merge, push — finished work is expected to land on `origin/main`).
+   Committing directly on the primary checkout is still not allowed, and pushing anything else
+   (other branches, tags, force-pushes) still needs explicit permission.
 8. **Never commit `mod-addon/libs/*.jar`.** The Baritone jar is fetched by `mod-addon/scripts/
    fetch-baritone.sh` (which verifies its SHA-1 against the official release's `checksums.txt`) and is
    gitignored — don't vendor third-party binaries into the repo.
@@ -128,10 +129,6 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - `renderViewer`/`renderHud`/`renderQueueInto`/`renderStorage` each render an honest empty state when
   the underlying data is empty — follow that pattern for new panels instead of inventing placeholder
   rows.
-- **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
-- **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
-  own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
-  `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
   own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
   `main.ts` only calls `setAtlas()`/`addChunkVoxels()`/`setPlayerSkin()`/`setBotPose()`/`clear()`/
@@ -277,21 +274,36 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - Keep comments concise; add them only to explain non-obvious behavior or point back to the relevant
   `docs/SPEC.md` section, not to restate what the code already says.
 
-## 9. Parallel work: one worktree per task, auto-merge into `main` when clean
+## 9. Parallel work: one worktree per request, auto-merge and push into `origin/main`
 
 More than one agent session can be working on this repo at the same time. Concurrent edits to the
 same checkout lose writes and leave half-refactored trees behind (a Rust refactor and a texture fix
-already landed on top of each other once). So: **one task = one worktree + one branch**, and the
-primary checkout stays on `main`, used only to merge and verify.
+already landed on top of each other once). So: **one request = one worktree + one branch**, and
+finished work is merged into `main` and pushed to `origin/main` — see "Finish" below.
 
 ### Start a task
 
+**Every request gets its own worktree** — a feature, an edit, or a fix for something an agent
+forgot. Don't reuse a previous task's worktree or branch, even for a one-line follow-up: the base
+has to be the current `origin/main`, and mixing tasks in one branch is how this tree got
+half-refactored before.
+
 ```bash
-git worktree add ../baritonelauncher-<slug> -b <slug> main
+git fetch origin
+git worktree add ../baritonelauncher-<slug> -b <slug> origin/main
 cd ../baritonelauncher-<slug>
-npm install          # a fresh worktree has no node_modules/
+# Dependências: NÃO rode `npm install` — aponte pro que já está instalado no checkout primário.
+ln -s /media/miguelsp/16a390df-c228-4540-a9b5-b4eeda5b6324/Github/baritonelauncher/node_modules node_modules
 ```
 
+- Branch from **`origin/main`** (after `git fetch`), never from a stale local `main`.
+- **Reuse the primary checkout's builds — this is what makes a fresh worktree cheap:**
+  - `node_modules` → symlink the primary checkout's copy (above). It's already installed and works
+    for `tsc`/`vite`. Only when `package.json`/`package-lock.json` actually changed: run `npm install`
+    in the **primary checkout** (the shared install) and re-symlink — don't install per worktree.
+  - Rust → `export CARGO_TARGET_DIR=/media/miguelsp/16a390df-c228-4540-a9b5-b4eeda5b6324/Github/baritonelauncher/src-tauri/target`
+    before `cargo check`/`cargo test`, so the Tauri dependency tree isn't rebuilt from scratch
+    (concurrent builds serialize on the same lock — that's fine).
 - Worktrees live **as siblings** of the repo (`../baritonelauncher-<slug>`), never inside it — Vite,
   `tsc` and the app watchers would pick them up and rebuild over each other's files.
 - If your harness can move the session's working directory into the worktree (e.g. OpenCode's
@@ -299,48 +311,48 @@ npm install          # a fresh worktree has no node_modules/
   editing tools write, and you'd silently keep editing the primary checkout.
 - `<slug>` is short kebab-case for the task (`player-renderer`, `leaf-tint`, …).
 - Never edit files in another session's worktree, and never edit the primary checkout while you have
-  a task branch — the primary checkout must stay clean so it can merge.
-- A new worktree builds Rust from scratch (`target/` is per-worktree). If disk/time matter more than
-  build-cache isolation, share one `CARGO_TARGET_DIR` (builds then wait on each other's lock instead
-  of duplicating the dependency tree).
+  a task branch.
 - Do the work, follow rule 4 (changelog), run the checks **in the worktree** (`npm run build`; `cd
   src-tauri && cargo check`, plus `cargo test` when you touched Rust), then commit — English commit
   messages, per section 8.
 
-### Finish: verify, merge, verify again
+### Finish: integrate `origin/main`, verify, merge, push
 
 Run this from inside the task worktree, only with the branch committed and its checks green:
 
-1. Integrate `main` into your branch first — this is where conflicts show up, and fixing them on your
-   own branch keeps the context fresh:
+1. Integrate the **remote** tip into your branch first — this is where conflicts show up, and fixing
+   them on your own branch keeps the context fresh:
    ```bash
-   git merge main
+   git fetch origin
+   git merge origin/main
    ```
-   Resolve every conflict (the merge target is the **local** `main`; pulling from `origin` is the
-   user's call), re-run the checks, commit.
-   Optional dry run without touching anything: `git merge-tree --write-tree main <slug>` — exit 0
-   means no textual conflict.
-2. Merge into `main` from the primary checkout:
+   Resolve every conflict, re-run the checks, commit. Optional dry run, without touching anything:
+   `git merge-tree --write-tree origin/main <slug>` — exit 0 = no textual conflict.
+2. Merge into `main` and push — finished work is expected to land on `origin/main`. Prefer the
+   primary checkout when it is **clean**; when it has another session's uncommitted work, don't
+   touch it — use a temporary worktree of `main` instead:
    ```bash
-   cd /path/to/baritonelauncher     # the primary checkout, on main
-   git status                       # must be clean
+   # primário limpo:
+   cd /media/miguelsp/16a390df-c228-4540-a9b5-b4eeda5b6324/Github/baritonelauncher
+   # primário sujo (nunca mexa no trabalho não commitado de outra sessão):
+   # git worktree add ../baritonelauncher-main-merge main && cd ../baritonelauncher-main-merge
+   git fetch origin
+   git merge --ff-only origin/main     # o main local acompanha a origin
    git merge --no-ff <slug>
    ```
-   If `git status` shows uncommitted work, **stop and report it** — never stash, commit or discard
-   another session's work to unblock yourself.
-3. Verify the merged result on `main` with the same checks. If the merge broke something, roll back
-   (`git reset --hard ORIG_HEAD`) and go back to the worktree — never leave `main` broken.
-4. Clean up only after (3) is green:
-   ```bash
-   git worktree remove ../baritonelauncher-<slug>
-   git branch -d <slug>
-   ```
+3. Verify the merged `main` with the same checks (`npm run build`; `cargo test` when Rust was
+   touched). If it broke, `git reset --hard ORIG_HEAD` and go back to the worktree — **never push a
+   broken `main`**.
+4. Push: `git push origin main` (pre-authorized by this workflow, see rule 7).
+5. Clean up only after the push: `git worktree remove ../baritonelauncher-<slug>` and `git branch -d
+   <slug>`. If you used a temporary worktree of `main`, remove it too.
 
 Notes:
 
 - Textual conflicts are the easy case — the dangerous ones are semantic (main renamed a command
   while your branch still calls the old name). The checks **after** the merge are the real gate.
-- One merge at a time: if `.git/MERGE_HEAD` exists, another session is mid-merge; wait.
+- One merge/push at a time: if `.git/MERGE_HEAD` exists, another session is mid-merge; wait. If the
+  push is rejected because `origin/main` moved, go back to step 1 (`git fetch` + `git merge
+  origin/main` on your branch) — never force-push.
 - Abandoning a task? `git worktree remove --force ../baritonelauncher-<slug>` and `git branch -D
   <slug>` — don't leave stale worktrees around.
-- Pushing to `origin` stays out of this flow — see rule 7.
