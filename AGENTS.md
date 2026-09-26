@@ -192,8 +192,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   v2 is still accepted for old caches/addon jars, without tints — deflate+base64 →
   `world_cache.rs`) and
   `instruction_status` (`active` with progress / `done` / `failed`; updates the queue and dispatches
-  the next instruction). App → addon: `instruction` (`travel_to`/`explore`) and `cancel` — written by
-  a task consuming `AppState.addon_tx`, registered per connection. Stores the version from `hello`
+  the next instruction). App → addon: `instruction` (`travel_to`/`explore`, plus `mine`/`build` carrying
+  the editor's block list) and `cancel` — written by a task consuming `AppState.addon_tx`, registered
+  per connection. Stores the version from `hello`
   in `AppState.mc_version` (used by `texture_atlas.rs` to find the matching local jar — never
   hardcode a version here, read it from this field). The matching Java client is
   `mod-addon/src/main/java/dev/baritone/orchestrator/addon/BaritoneOrchestratorAddonClient.java`.
@@ -246,7 +247,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   block, the shape Baritone's `BuilderProcess` consumes). Edits on unknown chunks are ignored. The
   spec's `blockstate_key` is just the block name for now (blockstates aren't modeled — see "Known
   gaps"). Has unit tests. `schematic_apply` stores the resulting lists in `AppState.schematics` keyed
-  by instruction id (the queue is polled every second, so it must not carry hundreds of blocks).
+  by instruction id (the queue is polled every second, so it must not carry hundreds of blocks);
+  `encode_instruction` puts the list in the `instruction` payload when the queue dispatches it, and the
+  entry is dropped when the instruction reaches a terminal status or is canceled.
 
 **Addon (`mod-addon/`)**
 - `BaritoneOrchestratorAddon.java` — common `@Mod` entry point. Holds `SOCKET_HOST`/`SOCKET_PORT` as
@@ -260,7 +263,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   texture cache/resource pack), the world clock (`world_time`, 1x/s, from
   `getOverworldClockTime()`), and subscribes to `ChunkEvent.Load` (filtered to `ClientLevel`) to
   send one `chunk_voxels` per chunk (sections + per-column biome tints resolved with the client's own
-  `BiomeColors`, sampled at the top block of each column) — separate from the tick loop.
+  `BiomeColors`, sampled at the top block of each column) — separate from the tick loop. It also drains
+  the reverse channel on the client thread (`travel_to`/`explore`/`mine`/`build`): the `mine`/`build`
+  ones turn the block list into a sparse `OrchestratorSchematic` and call
+  `baritone.getBuilderProcess().build(...)`, reporting `active`/`done`/`failed` from the process itself.
 - `neoforge.mods.toml` (templated from `gradle.properties`) declares Baritone as a required dependency
   — modid is `baritoe`, confirmed from the real jar, not `baritone`.
 
@@ -272,9 +278,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **Chunks are a snapshot, not a live world.** `chunk_voxels` carries the chunk as it was when the
   client loaded it; block changes after that (mining, placing, opening a chest) aren't resent, so the
   viewer goes stale there until the chunk reloads. There is no per-block update delta channel yet.
-- **Instructions only cover `travel_to`/`explore`.** The reverse channel works end to end
-  (`queue_push` → addon → `instruction_status`), but `Mine`/`Build`/`FetchFromChest`/`Craft`/`Smelt`
-  have no executor in the addon yet, and the UI composer only creates the two executable kinds.
+- **Instructions cover `travel_to`/`explore`/`mine`/`build`.** The reverse channel works end to end
+  (`queue_push` → addon → `instruction_status`), and `Mine`/`Build` from the editor now execute through
+  the addon's `IBuilderProcess` executor; `FetchFromChest`/`Craft`/`Smelt` still have no executor in the
+  addon, and the UI composer only creates the `travel_to`/`explore` kinds.
 - **No `SurvivalProcess`/threat *reaction* or `ContainerScreen` simulation in the addon** — the mob
   scan exists (the addon streams `entities` and the viewer identifies each mob with a label), but
   nothing fights, flees or raises a shield; the rest is still only described in `docs/SPEC.md`.
@@ -299,8 +306,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   queued instruction), but: every block renders as a full cube (no stair/log-axis/slab states, so no
   variant inspector and `blockstate_key` degrades to the block name), `.litematic` import isn't
   implemented, the palette derives block names from atlas texture names instead of a real block
-  registry (`minecraft-data` ingestion still pending), and the addon has **no `Mine`/`Build`
-  executor**, so applied schematics sit `Queued` in the queue.
+  registry (`minecraft-data` ingestion still pending). Applied schematics now **execute** through the
+  addon's `IBuilderProcess` executor (`mine`/`build` instructions with the block list), instead of
+  sitting `Queued`; blockstate properties still degrade to the block name, so stairs/slabs/logs place
+  as the plain block.
 
 ## 8. Language and comment rules
 

@@ -6,6 +6,7 @@ import baritone.api.pathing.goals.Goal;
 import baritone.api.pathing.goals.GoalXZ;
 import baritone.api.utils.BetterBlockPos;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.NativeImage;
@@ -29,6 +30,7 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.entity.player.PlayerSkin;
 import net.minecraft.world.food.FoodData;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.LiquidBlock;
 import net.minecraft.world.level.block.MultifaceBlock;
 import net.minecraft.world.level.block.VineBlock;
@@ -61,6 +63,7 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.zip.Deflater;
@@ -136,6 +139,12 @@ public class BaritoneOrchestratorAddonClient {
     /** Teto de waypoints por exploração — o app já limita o raio a 5000
      *  blocos; isso é a segunda barreira contra uma lista gigante. */
     private static final int MAX_EXPLORE_WAYPOINTS = 4000;
+    /** Teto de blocos por `Mine`/`Build` — o app já limita a 50k por operação
+     *  (`MAX_EDIT_VOLUME` no viewer); isso é a segunda barreira. */
+    private static final int MAX_SCHEMATIC_BLOCKS = 60_000;
+    /** Ticks de carência pro `BuilderProcess` ficar ativo antes de reportar
+     *  falha — ele não ativa no mesmo tick em que `build()` é chamado. */
+    private static final int SCHEMATIC_START_GRACE_TICKS = 60;
 
     // Instrução ativa hoje (só uma por vez — a fila do app despacha em
     // sequência). `activeInstructionId == null` = nada em execução.
@@ -145,6 +154,11 @@ public class BaritoneOrchestratorAddonClient {
     private static double activeTargetZ;
     private static double activeInitialDistance;
     private static int ticksSinceLastInstructionStatus;
+    /** `Mine`/`Build` rodam no `BuilderProcess`: `schematicStarted` diz se ele
+     *  já ficou ativo (o status só fecha depois disso) e `schematicWaitTicks`
+     *  conta a carência até reportar falha se nunca começar. */
+    private static boolean schematicStarted;
+    private static int schematicWaitTicks;
 
     /** Waypoints da exploração com raio/estilo (ver `buildExploreWaypoints`):
      *  "círculos" e "zigue-zague" são uma sequência de Goals que este addon
@@ -488,7 +502,10 @@ public class BaritoneOrchestratorAddonClient {
      * {@code travel_to} → {@link GoalXZ} + {@code ICustomGoalProcess};
      * {@code explore} → com `radius`+`style`, percorre waypoints próprios
      * ({@link #buildExploreWaypoints}); sem eles, {@code IExploreProcess}
-     * nativo ({@code explore(origemX, origemZ)}), que não tem forma definida.
+     * nativo ({@code explore(origemX, origemZ)}), que não tem forma definida;
+     * {@code mine}/{@code build} → {@code IBuilderProcess} com um schematic
+     * esparso da lista de blocos (ar = quebrar, ver
+     * {@link OrchestratorSchematic}).
      */
     private static void handleInstruction(IBaritone baritone, JsonObject message) {
         String id = message.get("id").getAsString();
@@ -534,8 +551,95 @@ public class BaritoneOrchestratorAddonClient {
                 // sem progresso, até o app cancelar.
                 sendInstructionStatus("active", 0.0f);
             }
+            case "mine", "build" -> startSchematicInstruction(baritone, id, kind, message);
             default -> { }
         }
+    }
+
+    /**
+     * Executa {@code mine}/{@code build} do editor de schematic: a lista
+     * esparsa de blocos (posição absoluta + nome) vira um
+     * {@link OrchestratorSchematic} e o {@code BuilderProcess} do Baritone
+     * navega, quebra e coloca sozinho. `air` como alvo = quebrar, qualquer
+     * outro estado = colocar — o mesmo caminho que o `clearArea` usa.
+     */
+    private static void startSchematicInstruction(IBaritone baritone, String id, String kind, JsonObject message) {
+        activeInstructionId = id;
+        activeInstructionKind = kind;
+        schematicStarted = false;
+        schematicWaitTicks = 0;
+
+        JsonArray blocks = message.has("blocks") ? message.getAsJsonArray("blocks") : null;
+        if (blocks == null || blocks.isEmpty() || blocks.size() > MAX_SCHEMATIC_BLOCKS) {
+            System.out.println("[orchestrator] " + kind + " recusado: lista de blocos ausente/vazia/grande demais");
+            finishActiveInstruction("failed");
+            return;
+        }
+
+        // Primeira passada: caixa envolvente (o schematic é local ao canto) e
+        // quantos nomes de bloco o registry do jogo não conhece.
+        int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+        int maxX = Integer.MIN_VALUE, maxY = Integer.MIN_VALUE, maxZ = Integer.MIN_VALUE;
+        int unknown = 0;
+        for (JsonElement element : blocks) {
+            JsonObject block = element.getAsJsonObject();
+            if (resolveBlockState(block.get("block").getAsString()) == null) {
+                unknown++;
+                continue;
+            }
+            int x = block.get("x").getAsInt();
+            int y = block.get("y").getAsInt();
+            int z = block.get("z").getAsInt();
+            minX = Math.min(minX, x);
+            maxX = Math.max(maxX, x);
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+            minZ = Math.min(minZ, z);
+            maxZ = Math.max(maxZ, z);
+        }
+        if (maxX < minX) {
+            System.out.println("[orchestrator] " + kind + " recusado: nenhum bloco conhecido (" + unknown + " ignorados)");
+            finishActiveInstruction("failed");
+            return;
+        }
+
+        // Segunda passada: posições locais ao canto mínimo (0..size-1), que é
+        // o que o `BuilderProcess` espera do schematic.
+        Map<Long, BlockState> targets = new HashMap<>();
+        for (JsonElement element : blocks) {
+            JsonObject block = element.getAsJsonObject();
+            BlockState state = resolveBlockState(block.get("block").getAsString());
+            if (state == null) {
+                continue;
+            }
+            targets.put(
+                    BlockPos.asLong(
+                            block.get("x").getAsInt() - minX,
+                            block.get("y").getAsInt() - minY,
+                            block.get("z").getAsInt() - minZ),
+                    state);
+        }
+
+        OrchestratorSchematic schematic = new OrchestratorSchematic(
+                maxX - minX + 1, maxY - minY + 1, maxZ - minZ + 1, targets);
+        baritone.getBuilderProcess().build("orchestrator", schematic, new BlockPos(minX, minY, minZ));
+        System.out.println("[orchestrator] " + kind + " com " + targets.size() + " blocos ("
+                + unknown + " nomes desconhecidos ignorados) em "
+                + (maxX - minX + 1) + "x" + (maxY - minY + 1) + "x" + (maxZ - minZ + 1));
+        sendInstructionStatus("active", 0.0f);
+    }
+
+    /** Nome sem namespace (é o que trafega no protocolo) → estado padrão do
+     *  bloco. `null` = o registry do jogo não conhece esse nome (bloco de mod
+     *  que não está instalado, nome de textura que não é bloco...). */
+    private static BlockState resolveBlockState(String name) {
+        if ("air".equals(name) || "cave_air".equals(name) || "void_air".equals(name)) {
+            return Blocks.AIR.defaultBlockState();
+        }
+        return BuiltInRegistries.BLOCK
+                .getOptional(Identifier.withDefaultNamespace(name))
+                .map(block -> block.defaultBlockState())
+                .orElse(null);
     }
 
     /**
@@ -582,6 +686,9 @@ public class BaritoneOrchestratorAddonClient {
             return;
         }
         baritone.getPathingBehavior().cancelEverything();
+        // `Mine`/`Build` rodam no `BuilderProcess`, que não para só com o
+        // cancelamento do pathing — soltar o controle dele mata a tarefa.
+        baritone.getBuilderProcess().onLostControl();
         clearActiveInstruction();
     }
 
@@ -629,6 +736,19 @@ public class BaritoneOrchestratorAddonClient {
             sendInstructionStatus("active", (float) exploreWaypointIndex / exploreWaypoints.size());
         } else if ("explore".equals(activeInstructionKind) && !baritone.getExploreProcess().isActive()) {
             finishActiveInstruction("failed");
+        } else if ("mine".equals(activeInstructionKind) || "build".equals(activeInstructionKind)) {
+            if (baritone.getBuilderProcess().isActive()) {
+                schematicStarted = true;
+                // O BuilderProcess não expõe contagem de blocos/andamento, então
+                // reporta ativo sem fração em vez de inventar um número.
+                sendInstructionStatus("active", null);
+            } else if (schematicStarted) {
+                finishActiveInstruction("done");
+            } else if (++schematicWaitTicks > SCHEMATIC_START_GRACE_TICKS) {
+                // Nunca ficou ativo (sem caminho, blocos inalcançáveis...):
+                // falha honesta em vez de mentir "concluído".
+                finishActiveInstruction("failed");
+            }
         }
     }
 
@@ -642,6 +762,8 @@ public class BaritoneOrchestratorAddonClient {
         activeInstructionKind = null;
         exploreWaypoints = null;
         exploreWaypointIndex = 0;
+        schematicStarted = false;
+        schematicWaitTicks = 0;
     }
 
     /** `progress` só vai no JSON quando existe — ver `addon_socket.rs`. */
