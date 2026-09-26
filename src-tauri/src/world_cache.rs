@@ -11,18 +11,22 @@
 //! `mod-addon/README.md`.
 
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 /// Versão do payload binário de `chunk_voxels`. O addon Java e este módulo
 /// precisam estar de acordo — mudar o layout sem mudar isto corrompe a
 /// decodificação em vez de dar erro claro.
 /// - v2: o byte de nível de fluido em cada entrada de paleta (água/lava).
-/// - v3: bloco de tints de bioma por coluna no fim (`ChunkTints`).
-pub const VOXEL_FORMAT_VERSION: u8 = 3;
-/// Versão anterior (sem tints por coluna): aceita só na leitura, pro
-/// `world.cache` gravado antes do v3 continuar abrindo — nunca é gerada de
-/// novo. Um addon desatualizado que ainda mande v2 continua funcionando, só
-/// sem as cores de bioma (o viewer cai nas aproximações fixas).
+/// - v3: bloco de tints de bioma por coluna no fim (`ChunkTints`), sem luz.
+/// - v4: luz do jogo por posição de cada seção (nibble baixo = bloco, alto =
+///   céu) + os tints por coluna do v3.
+pub const VOXEL_FORMAT_VERSION: u8 = 4;
+/// Versões anteriores, aceitas só na leitura pro `world.cache` gravado antes
+/// continuar abrindo — nunca são geradas de novo. Sem luz, o viewer cai no
+/// dia cheio; um addon desatualizado que ainda mande v2/v3 continua
+/// funcionando, só sem as camadas que a versão dele não tinha.
+pub const VOXEL_FORMAT_VERSION_TINTS: u8 = 3;
 pub const VOXEL_FORMAT_VERSION_LEGACY: u8 = 2;
 
 /// Bit 0: o bloco é desenhável como cubo cheio (não é ar nem decoração
@@ -84,7 +88,8 @@ impl PaletteEntry {
 
 /// Uma seção 16×16×16 do chunk (a mesma divisão do `LevelChunkSection` do
 /// jogo). `indices` tem sempre 4096 posições, na ordem `x + z*16 + y*256` —
-/// igual à do `PalettedContainer` vanilla.
+/// igual à do `PalettedContainer` vanilla. `light` tem 4096 bytes na mesma
+/// ordem: nibble baixo = luz de bloco, nibble alto = luz de céu (0–15 cada).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkSection {
     /// Y da seção (Y do mundo / 16) — absoluto, pode ser negativo
@@ -92,6 +97,9 @@ pub struct ChunkSection {
     pub y: i8,
     pub palette: Vec<PaletteEntry>,
     pub indices: Vec<u16>,
+    /// Luz do motor do jogo por posição (tocha/lava/céu já propagados), no
+    /// formato compacto de dois nibbles — ver o doc do módulo.
+    pub light: Vec<u8>,
 }
 
 /// Quantas colunas tem um chunk (`x + z*16`, a mesma ordem dos índices das
@@ -144,6 +152,39 @@ pub struct Chunk {
     /// essa informação — o viewer cai nas aproximações fixas.
     pub tints: Option<ChunkTints>,
     pub dirty: bool,
+    /// Payload de `encode_voxels` derivado de `sections`, pronto pra ir pro
+    /// socket/arquivo — ver `encoded_payload`. Serializar um mundo de ~20 MB
+    /// leva segundos em build debug; recalcular isso a cada gravação (ou a
+    /// cada pedido de chunk) seguraria o lock do mundo por muito tempo, então
+    /// o resultado fica cacheado por versão das seções e fora do serde (é
+    /// derivado, não dado).
+    #[serde(skip)]
+    encoded: OnceCell<Vec<u8>>,
+}
+
+impl Chunk {
+    /// Payload do chunk no formato do `chunk_voxels`, calculado na primeira
+    /// leitura se ainda não tiver sido (caminho de teste; o de produção já
+    /// entrega pronto em `apply_voxels`/`apply_voxels_with_payload`).
+    pub fn encoded_payload(&self) -> &[u8] {
+        self.encoded
+            .get_or_init(|| encode_voxels(&self.sections, self.tints.as_ref()))
+    }
+
+    fn set_sections(
+        &mut self,
+        sections: Vec<ChunkSection>,
+        tints: Option<ChunkTints>,
+        payload: Option<Vec<u8>>,
+    ) {
+        self.sections = sections;
+        self.tints = tints;
+        let cell = OnceCell::new();
+        if let Some(payload) = payload {
+            let _ = cell.set(payload);
+        }
+        self.encoded = cell;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -171,16 +212,35 @@ impl WorldCache {
     /// Substitui o conteúdo do chunk por um snapshot completo (o addon manda
     /// o chunk inteiro no load). Sem merge: se o chunk for reenviado (ex:
     /// recarregado depois de sair e voltar ao render distance), o snapshot
-    /// novo manda.
+    /// Substitui o conteúdo do chunk por um snapshot completo (o addon manda
+    /// o chunk inteiro no load). Sem merge: se o chunk for reenviado (ex:
+    /// recarregado depois de sair e voltar ao render distance), o snapshot
+    /// novo manda. O payload binário é montado aqui, por chunk — assim a
+    /// gravação do mundo (`world_store.rs`) só copia bytes prontos.
     pub fn apply_voxels(
         &mut self,
         pos: ChunkPos,
         sections: Vec<ChunkSection>,
         tints: Option<ChunkTints>,
     ) {
+        let payload = encode_voxels(&sections, tints.as_ref());
         let chunk = self.chunks.entry(pos).or_default();
-        chunk.sections = sections;
-        chunk.tints = tints;
+        chunk.set_sections(sections, tints, Some(payload));
+        chunk.dirty = true;
+    }
+
+    /// Igual a `apply_voxels`, mas recebe o payload já pronto (o arquivo de
+    /// cache guarda exatamente esses bytes) — evita re-serializar o mundo
+    /// inteiro ao carregar do disco.
+    pub fn apply_voxels_with_payload(
+        &mut self,
+        pos: ChunkPos,
+        sections: Vec<ChunkSection>,
+        tints: Option<ChunkTints>,
+        payload: Vec<u8>,
+    ) {
+        let chunk = self.chunks.entry(pos).or_default();
+        chunk.set_sections(sections, tints, Some(payload));
         chunk.dirty = true;
     }
 
@@ -189,7 +249,7 @@ impl WorldCache {
     /// trata isso como "ainda não pronto", não como chunk vazio.
     pub fn chunk_voxels_bytes(&self, pos: ChunkPos) -> Vec<u8> {
         match self.chunks.get(&pos) {
-            Some(chunk) => encode_voxels(&chunk.sections, chunk.tints.as_ref()),
+            Some(chunk) => chunk.encoded_payload().to_vec(),
             None => Vec::new(),
         }
     }
@@ -294,14 +354,15 @@ pub struct DecodedVoxels {
 /// `mod-addon/README.md`):
 ///
 /// ```text
-/// u8  versão do formato (3; 2 = formato antigo, sem tints)
+/// u8  versão do formato (4; 3 = sem luz; 2 = sem luz nem tints)
 /// u8  quantidade de seções
 /// por seção:
 ///   i8  Y da seção
 ///   u16 tamanho da paleta
 ///   por entrada: u16 tamanho do nome, bytes UTF-8, u8 flags, u8 nível de fluido
 ///   u16[4096] índices (ordem x + z*16 + y*256)
-/// u8  tem_tints (só na v3; 0 = sem tints)
+///   u8[4096]  luz (só na v4; nibble baixo = bloco, alto = céu; mesma ordem)
+/// u8  tem_tints (só na v3+; 0 = sem tints)
 /// se tem_tints:
 ///   256 × (u8 r, u8 g, u8 b)  grama,   coluna x + z*16
 ///   256 × (u8 r, u8 g, u8 b)  folhagem, coluna x + z*16
@@ -310,7 +371,10 @@ pub struct DecodedVoxels {
 pub fn decode_voxels(bytes: &[u8]) -> Result<DecodedVoxels, String> {
     let mut reader = VoxelReader::new(bytes);
     let version = reader.u8()?;
-    if version != VOXEL_FORMAT_VERSION && version != VOXEL_FORMAT_VERSION_LEGACY {
+    if version != VOXEL_FORMAT_VERSION
+        && version != VOXEL_FORMAT_VERSION_TINTS
+        && version != VOXEL_FORMAT_VERSION_LEGACY
+    {
         return Err(format!(
             "versão de payload desconhecida: {version} (esperava {VOXEL_FORMAT_VERSION})"
         ));
@@ -348,15 +412,27 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<DecodedVoxels, String> {
             indices.push(reader.u16()?);
         }
 
+        let mut light = Vec::with_capacity(4096);
+        if version >= VOXEL_FORMAT_VERSION {
+            for _ in 0..4096 {
+                light.push(reader.u8()?);
+            }
+        } else {
+            // Payload antigo (cache v2/v3) não tem luz: cai no dia cheio, como
+            // o viewer desenhava antes de existir luz de verdade.
+            light.resize(4096, 0xf0);
+        }
+
         sections.push(ChunkSection {
             y,
             palette,
             indices,
+            light,
         });
     }
 
-    // v2 termina aqui (sem tints); v3 traz a flag + o bloco por coluna.
-    let tints = if version == VOXEL_FORMAT_VERSION {
+    // v2 termina aqui (sem tints); v3+ traz a flag + o bloco por coluna.
+    let tints = if version >= VOXEL_FORMAT_VERSION_TINTS {
         match reader.u8()? {
             0 => None,
             1 => Some(ChunkTints {
@@ -402,6 +478,7 @@ pub fn encode_voxels(sections: &[ChunkSection], tints: Option<&ChunkTints>) -> V
         for index in &section.indices {
             out.extend_from_slice(&index.to_le_bytes());
         }
+        out.extend_from_slice(&section.light);
     }
     match tints.filter(|tints| tints.is_valid()) {
         Some(tints) => {
@@ -449,6 +526,8 @@ mod tests {
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 2) as u16).collect(),
+                // Luz de exemplo: bloco 15 na primeira metade, céu 15 na outra.
+                light: (0..4096).map(|i| if i < 2048 { 15 } else { 0xf0 }).collect(),
             },
             ChunkSection {
                 y: 4,
@@ -475,6 +554,8 @@ mod tests {
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 4) as u16).collect(),
+                // Céu 15 em tudo (superfície) — o caso comum do mundo carregado.
+                light: vec![0xf0; 4096],
             },
         ]
     }
@@ -595,5 +676,32 @@ mod tests {
 
         // `limit` maior que o conjunto devolve tudo.
         assert_eq!(nearest_chunks(chunks.iter(), 0, 0, 99).len(), chunks.len());
+    }
+
+    #[test]
+    fn encoded_payload_follows_the_sections() {
+        let mut world = WorldCache::new();
+        let sections = example_sections();
+        let pos = ChunkPos { x: 0, z: 0 };
+        world.apply_voxels(pos, sections.clone(), None);
+        assert_eq!(
+            world.chunk_voxels_bytes(pos),
+            encode_voxels(&sections, None),
+            "payload cacheado deveria ser o encode das seções"
+        );
+
+        // Reaplicar um snapshot novo invalida o payload antigo.
+        let other = vec![ChunkSection {
+            y: 9,
+            palette: vec![PaletteEntry {
+                block: "sand".to_string(),
+                flags: VOXEL_FLAG_RENDER,
+                level: 0,
+            }],
+            indices: vec![0; 4096],
+            light: vec![0xf0; 4096],
+        }];
+        world.apply_voxels(pos, other.clone(), None);
+        assert_eq!(world.chunk_voxels_bytes(pos), encode_voxels(&other, None));
     }
 }

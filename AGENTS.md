@@ -149,12 +149,21 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. Chunks
   are added once and never removed (cumulative "explored" semantics, matching `WorldCache`). It also
   hosts the **schematic editor**: voxel DDA picking (`pickBlock` — meshes are merged per chunk, so a
-  `Raycaster` can't map back to a block), the edit layer (`edits` + `rebuildGhosts`, amber
-  translucent ghost, never mutates `WorldCache`), region selection/hover wire boxes, and `mountTo()`
+  `Raycaster` can't map back to a block; the ray skips columns that aren't in the cache yet instead of
+  giving up, so picking works with the camera away from the terrain), the edit layer (`edits` +
+  `rebuildGhosts`, amber translucent ghost, never mutates `WorldCache`), region selection/hover wire
+  boxes, and `mountTo()`
   — the viewer and the editor share this one renderer, the canvas is moved to the active view instead
   of opening a second WebGL context (`main.ts`, `setMode`). The click-to-target popup and the editor
-  share one pointer handler: with an editor tool active the click edits, otherwise it picks the queue
-  target. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
+  share one pointer handler: **with an editor tool active the left button belongs to the editor**
+  (`setEditMode` unbinds OrbitControls' LEFT and moves rotate/pan to RIGHT/MIDDLE) — a click edits, a
+  drag in `select` draws the region live, and without a tool left-drag orbits as usual. The hover box
+  is also recomputed when the camera moves (`handleCameraChange`): damping and the bot follow keep
+  moving the scene after the pointer stops, and a stale preview would point at a block the click no
+  longer lands on. It also draws the **sky** (gradient dome, `buildSky`) and the **vanilla cloud layer**
+  (`buildClouds`): the real `clouds.png` from the local jar, one 12×12×4-block box per texel with the
+  game's per-face shading, cloud height 192.33, drift 0.6 block/s on X and the 3072-block repeating
+  pattern — see `CloudRenderer` in the client. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
   (which the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in
   a separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
   redo that tradeoff; if wgpu comes up again, confirm first.
@@ -228,7 +237,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   requirement (Mojang's license doesn't allow redistributing game assets). Animated textures (water,
   lava, fire) contribute every frame as `{stem}_fN` tiles (32×32 frames are downscaled to 16×16), with
   the bare name aliasing frame 0; a synthetic white tile (`WHITE_TILE_NAME`) is the tintable fallback
-  for blocks with no matching texture. Has a real integration test (`cargo test texture_atlas`) that
+  for blocks with no matching texture. It also extracts `textures/environment/clouds.png` as
+  `cloud_data_url` (same local-jar-only rule), which the viewer turns into the cloud layer; the PNG
+  gets its own small cache file (`clouds_<version>.png`) so cached atlases from before this feature
+  don't need a rebuild. Has a real integration test (`cargo test texture_atlas`) that
   runs against whatever local jar exists, skipping itself (not failing) if none is found — keep that
   skip behavior if you touch this file, other environments won't have the jar.
 - `storage_index.rs` — `StorageIndex` (chest position → contents) and `aggregated_totals()`.
@@ -288,6 +300,11 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
 - **Mobs are identified, not modeled.** The viewer draws a projected label (real game name, category,
   distance, health) per mob — there is no entity-model/UV/animation pipeline for mob types (the
   atlas only covers block textures).
+- **Clouds are fixed overworld height, with the viewer's fog.** The pattern, the 192.33 height, the
+  12×12×4 cells, the per-face shading, the 0.6 block/s drift and the day/night color multiplier
+  (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`) are the game's, but the height is always the
+  overworld's (the addon doesn't send the dimension) and the fade uses the viewer's scene fog instead
+  of the game's own 2048-block cloud fog.
 - **Biome tint is real, but per column (surface) and only for what the viewer draws.** The addon
   samples the top block of each chunk column and sends grass/foliage/water colors resolved by the
   client's own `BiomeColors` — the same colormap + biome modifier the game renders with — so each
