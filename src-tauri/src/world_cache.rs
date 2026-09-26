@@ -19,14 +19,18 @@ use std::collections::HashMap;
 /// decodificação em vez de dar erro claro.
 /// - v2: o byte de nível de fluido em cada entrada de paleta (água/lava).
 /// - v3: bloco de tints de bioma por coluna no fim (`ChunkTints`).
-/// - v4: props do blockstate por entrada de paleta (`facing=north,...`), que
+/// - v4: luz do jogo por posição de cada seção (nibble baixo = bloco, alto =
+///   céu) + os tints por coluna do v3.
+/// - v5: props do blockstate por entrada de paleta (`facing=north,...`), que
 ///   escolhem a variante do modelo no viewer.
-pub const VOXEL_FORMAT_VERSION: u8 = 4;
-/// Versão anterior (tints, mas sem props por entrada): aceita só na leitura,
-/// pro `world.cache`/addon gravado antes do v4 continuar funcionando.
-pub const VOXEL_FORMAT_VERSION_LEGACY: u8 = 3;
-/// Duas versões atrás (sem tints nem props): idem.
-pub const VOXEL_FORMAT_VERSION_LEGACY_2: u8 = 2;
+pub const VOXEL_FORMAT_VERSION: u8 = 5;
+/// Versões anteriores, aceitas só na leitura pro `world.cache` gravado antes
+/// continuar abrindo — nunca são geradas de novo. Sem luz, o viewer cai no
+/// dia cheio; um addon desatualizado que ainda mande v2/v3/v4 continua
+/// funcionando, só sem as camadas que a versão dele não tinha.
+pub const VOXEL_FORMAT_VERSION_LIGHT: u8 = 4;
+pub const VOXEL_FORMAT_VERSION_TINTS: u8 = 3;
+pub const VOXEL_FORMAT_VERSION_LEGACY: u8 = 2;
 
 /// Bit 0: o bloco é desenhável como cubo cheio (não é ar nem decoração
 /// substituível, tipo grama alta). Bit 1: o bloco esconde as faces dos
@@ -91,7 +95,8 @@ impl PaletteEntry {
 
 /// Uma seção 16×16×16 do chunk (a mesma divisão do `LevelChunkSection` do
 /// jogo). `indices` tem sempre 4096 posições, na ordem `x + z*16 + y*256` —
-/// igual à do `PalettedContainer` vanilla.
+/// igual à do `PalettedContainer` vanilla. `light` tem 4096 bytes na mesma
+/// ordem: nibble baixo = luz de bloco, nibble alto = luz de céu (0–15 cada).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkSection {
     /// Y da seção (Y do mundo / 16) — absoluto, pode ser negativo
@@ -99,6 +104,9 @@ pub struct ChunkSection {
     pub y: i8,
     pub palette: Vec<PaletteEntry>,
     pub indices: Vec<u16>,
+    /// Luz do motor do jogo por posição (tocha/lava/céu já propagados), no
+    /// formato compacto de dois nibbles — ver o doc do módulo.
+    pub light: Vec<u8>,
 }
 
 /// Quantas colunas tem um chunk (`x + z*16`, a mesma ordem dos índices das
@@ -353,7 +361,7 @@ pub struct DecodedVoxels {
 /// `mod-addon/README.md`):
 ///
 /// ```text
-/// u8  versão do formato (4; 3 = sem props, 2 = sem props nem tints)
+/// u8  versão do formato (5; 4 = sem props, 3 = sem luz, 2 = sem nada)
 /// u8  quantidade de seções
 /// por seção:
 ///   i8  Y da seção
@@ -361,7 +369,8 @@ pub struct DecodedVoxels {
 ///   por entrada: u16 tamanho do nome, bytes UTF-8, u8 flags, u8 nível de
 ///                fluido, u16 tamanho das props, bytes UTF-8 (só na v4)
 ///   u16[4096] índices (ordem x + z*16 + y*256)
-/// u8  tem_tints (v3/v4; 0 = sem tints)
+///   u8[4096]  luz (da v4 em diante; nibble baixo = bloco, alto = céu)
+/// u8  tem_tints (da v3 em diante; 0 = sem tints)
 /// se tem_tints:
 ///   256 × (u8 r, u8 g, u8 b)  grama,   coluna x + z*16
 ///   256 × (u8 r, u8 g, u8 b)  folhagem, coluna x + z*16
@@ -372,7 +381,10 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<DecodedVoxels, String> {
     let version = reader.u8()?;
     if !matches!(
         version,
-        VOXEL_FORMAT_VERSION | VOXEL_FORMAT_VERSION_LEGACY | VOXEL_FORMAT_VERSION_LEGACY_2
+        VOXEL_FORMAT_VERSION
+            | VOXEL_FORMAT_VERSION_LIGHT
+            | VOXEL_FORMAT_VERSION_TINTS
+            | VOXEL_FORMAT_VERSION_LEGACY
     ) {
         return Err(format!(
             "versão de payload desconhecida: {version} (esperava {VOXEL_FORMAT_VERSION})"
@@ -403,7 +415,7 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<DecodedVoxels, String> {
                 .to_string();
             let flags = reader.u8()?;
             let level = reader.u8()?;
-            // Props do blockstate só existem a partir da v4; v2/v3 (cache
+            // Props do blockstate só existem a partir da v5; v2/v3/v4 (cache
             // antigo, addon desatualizado) vêm sem.
             let props = if version >= VOXEL_FORMAT_VERSION {
                 let props_len = reader.u16()? as usize;
@@ -431,15 +443,27 @@ pub fn decode_voxels(bytes: &[u8]) -> Result<DecodedVoxels, String> {
             indices.push(reader.u16()?);
         }
 
+        let mut light = Vec::with_capacity(4096);
+        if version >= VOXEL_FORMAT_VERSION_LIGHT {
+            for _ in 0..4096 {
+                light.push(reader.u8()?);
+            }
+        } else {
+            // Payload antigo (cache v2/v3) não tem luz: cai no dia cheio, como
+            // o viewer desenhava antes de existir luz de verdade.
+            light.resize(4096, 0xf0);
+        }
+
         sections.push(ChunkSection {
             y,
             palette,
             indices,
+            light,
         });
     }
 
-    // v2 termina aqui (sem tints); v3/v4 trazem a flag + o bloco por coluna.
-    let tints = if version >= VOXEL_FORMAT_VERSION_LEGACY {
+    // v2 termina aqui (sem tints); v3+ traz a flag + o bloco por coluna.
+    let tints = if version >= VOXEL_FORMAT_VERSION_TINTS {
         match reader.u8()? {
             0 => None,
             1 => Some(ChunkTints {
@@ -488,6 +512,7 @@ pub fn encode_voxels(sections: &[ChunkSection], tints: Option<&ChunkTints>) -> V
         for index in &section.indices {
             out.extend_from_slice(&index.to_le_bytes());
         }
+        out.extend_from_slice(&section.light);
     }
     match tints.filter(|tints| tints.is_valid()) {
         Some(tints) => {
@@ -537,6 +562,8 @@ mod tests {
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 2) as u16).collect(),
+                // Luz de exemplo: bloco 15 na primeira metade, céu 15 na outra.
+                light: (0..4096).map(|i| if i < 2048 { 15 } else { 0xf0 }).collect(),
             },
             ChunkSection {
                 y: 4,
@@ -573,6 +600,8 @@ mod tests {
                     },
                 ],
                 indices: (0..4096).map(|i| (i % 5) as u16).collect(),
+                // Céu 15 em tudo (superfície) — o caso comum do mundo carregado.
+                light: vec![0xf0; 4096],
             },
         ]
     }
@@ -612,7 +641,7 @@ mod tests {
     fn voxels_accept_legacy_v2_payload() {
         // Payload v2 (o `world.cache` de antes dos tints e das props):
         // versão + zero seções, sem o bloco de tints no fim.
-        let legacy = [VOXEL_FORMAT_VERSION_LEGACY_2, 0];
+        let legacy = [VOXEL_FORMAT_VERSION_LEGACY, 0];
         let decoded = decode_voxels(&legacy).expect("payload v2 deveria decodificar");
         assert!(decoded.sections.is_empty());
         assert_eq!(decoded.tints, None);
@@ -624,7 +653,7 @@ mod tests {
         // antes dos modelos): a leitura tem que aceitar e devolver props
         // vazias, caindo no cubo.
         let mut payload = Vec::new();
-        payload.push(VOXEL_FORMAT_VERSION_LEGACY);
+        payload.push(VOXEL_FORMAT_VERSION_TINTS);
         payload.push(1); // uma seção
         payload.push(0); // Y da seção = 0
         payload.extend_from_slice(&1u16.to_le_bytes()); // paleta: 1 entrada
@@ -640,6 +669,31 @@ mod tests {
         assert_eq!(decoded.sections.len(), 1);
         assert_eq!(decoded.sections[0].palette[0].block, "stone");
         assert_eq!(decoded.sections[0].palette[0].props, "");
+    }
+
+    #[test]
+    fn voxels_accept_legacy_v4_payload_without_props() {
+        // v4 = luz + tints, mas sem props por entrada de paleta (o payload
+        // que o addon mandava antes dos modelos): a leitura tem que aceitar
+        // e devolver props vazias, caindo no cubo.
+        let mut payload = Vec::new();
+        payload.push(VOXEL_FORMAT_VERSION_LIGHT);
+        payload.push(1); // uma seção
+        payload.push(0); // Y da seção = 0
+        payload.extend_from_slice(&1u16.to_le_bytes()); // paleta: 1 entrada
+        payload.extend_from_slice(&5u16.to_le_bytes());
+        payload.extend_from_slice(b"stone");
+        payload.push(VOXEL_FLAG_RENDER | VOXEL_FLAG_OCCLUDES);
+        payload.push(0); // nível de fluido
+        for _ in 0..4096 {
+            payload.extend_from_slice(&0u16.to_le_bytes());
+        }
+        payload.extend_from_slice(&vec![0xf0u8; 4096]); // luz
+        payload.push(0); // sem tints
+        let decoded = decode_voxels(&payload).expect("payload v4 deveria decodificar");
+        assert_eq!(decoded.sections.len(), 1);
+        assert_eq!(decoded.sections[0].palette[0].props, "");
+        assert_eq!(decoded.sections[0].light.len(), 4096);
     }
 
     #[test]
@@ -742,6 +796,7 @@ mod tests {
                 props: String::new(),
             }],
             indices: vec![0; 4096],
+            light: vec![0xf0; 4096],
         }];
         world.apply_voxels(pos, other.clone(), None);
         assert_eq!(world.chunk_voxels_bytes(pos), encode_voxels(&other, None));

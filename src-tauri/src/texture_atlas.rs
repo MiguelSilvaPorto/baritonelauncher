@@ -36,6 +36,10 @@ use std::path::{Path, PathBuf};
 
 const TILE_SIZE: u32 = 16;
 
+/// Textura das nuvens no jar do client — o viewer monta o layer de nuvens a
+/// partir dela (ver `viewer3d.ts`, `buildClouds`).
+const CLOUDS_JAR_ENTRY: &str = "assets/minecraft/textures/environment/clouds.png";
+
 /// Folga em volta de cada tile no atlas, preenchida replicando a borda do
 /// próprio tile. Com mipmaps ligados no viewer (ver `viewer3d.ts`), os níveis
 /// menores misturam texels vizinhos — sem folga, eles misturam o tile do
@@ -71,6 +75,11 @@ pub struct TextureAtlas {
     pub image_data_url: String,
     /// Nome da textura (ex: `"grass_block_top"`) -> retângulo UV normalizado (0..1).
     pub textures: HashMap<String, UvRect>,
+    /// `textures/environment/clouds.png` do jar local como data URL — é a
+    /// textura das nuvens vanilla (ver `viewer3d.ts`, `buildClouds`). `None`
+    /// quando nem o cache nem o jar têm o arquivo; nesse caso o viewer
+    /// simplesmente não desenha nuvens.
+    pub cloud_data_url: Option<String>,
 }
 
 pub(crate) fn cache_dir() -> PathBuf {
@@ -97,13 +106,57 @@ pub(crate) fn find_local_client_jar(mc_version: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Caminho do cache próprio das nuvens — separado do par PNG+JSON do atlas
+/// pra não mudar o formato do JSON já cacheado.
+fn cloud_cache_path(mc_version: &str) -> PathBuf {
+    cache_dir().join(format!("clouds_{mc_version}.png"))
+}
+
+/// Lê `clouds.png` de um zip já aberto (o jar) e guarda no cache da versão.
+/// `None` = o jar não tem o arquivo (jar inválido/versão exótica).
+fn read_clouds_from_archive<R: Read + std::io::Seek>(archive: &mut zip::ZipArchive<R>) -> Option<Vec<u8>> {
+    let mut entry = archive.by_name(CLOUDS_JAR_ENTRY).ok()?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// Guarda o PNG das nuvens no cache da versão e devolve o data URL.
+fn cache_clouds(mc_version: &str, bytes: &[u8]) -> String {
+    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::write(cloud_cache_path(mc_version), bytes);
+    to_data_url(bytes)
+}
+
+/// PNG das nuvens pra uma versão: cache local primeiro; se não houver, lê do
+/// jar instalado e deixa em cache. Mesma regra do atlas: só lê o que o usuário
+/// já tem, nunca baixa nada (rule 10). `None` = nem cache nem jar — o viewer
+/// fica sem nuvens, honestamente.
+fn load_or_extract_clouds(mc_version: &str) -> Option<String> {
+    if let Ok(bytes) = std::fs::read(cloud_cache_path(mc_version)) {
+        return Some(to_data_url(&bytes));
+    }
+
+    let jar_path = find_local_client_jar(mc_version)?;
+    let file = std::fs::File::open(&jar_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let bytes = read_clouds_from_archive(&mut archive)?;
+    Some(cache_clouds(mc_version, &bytes))
+}
+
 /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco pra
 /// versão pedida.
 pub fn build_or_load_atlas(mc_version: &str) -> Result<TextureAtlas, String> {
     let (png_path, json_path) = cache_paths(mc_version);
 
     if png_path.is_file() && json_path.is_file() {
-        return load_cached(&png_path, &json_path);
+        let mut atlas = load_cached(&png_path, &json_path)?;
+        // Cache antigo (de antes das nuvens) não tem o PNG separado; extrai do
+        // jar nesta primeira chamada e deixa em cache daí em diante.
+        if atlas.cloud_data_url.is_none() {
+            atlas.cloud_data_url = load_or_extract_clouds(mc_version);
+        }
+        return Ok(atlas);
     }
 
     let jar_path = find_local_client_jar(mc_version).ok_or_else(|| {
@@ -131,6 +184,7 @@ fn load_cached(png_path: &Path, json_path: &Path) -> Result<TextureAtlas, String
     Ok(TextureAtlas {
         image_data_url: to_data_url(&png_bytes),
         textures,
+        cloud_data_url: None,
     })
 }
 
@@ -263,6 +317,10 @@ fn build_atlas(jar_path: &Path, mc_version: &str) -> Result<TextureAtlas, String
     Ok(TextureAtlas {
         image_data_url: to_data_url(&png_bytes),
         textures,
+        // Do mesmo jar que já está aberto — não re-resolve o caminho pela
+        // versão (que no teste é sintética, ex: "26.3-test").
+        cloud_data_url: read_clouds_from_archive(&mut archive)
+            .map(|bytes| cache_clouds(mc_version, &bytes)),
     })
 }
 
@@ -311,10 +369,15 @@ mod tests {
             atlas.textures.contains_key(WHITE_TILE_NAME),
             "tile sintético de fallback deveria entrar no atlas"
         );
+        assert!(
+            atlas.cloud_data_url.is_some(),
+            "PNG das nuvens deveria sair do jar local como data URL"
+        );
 
         // limpa o cache de teste pra não sujar o diretório real
         let (png_path, json_path) = cache_paths("26.3-test");
         let _ = std::fs::remove_file(png_path);
         let _ = std::fs::remove_file(json_path);
+        let _ = std::fs::remove_file(cloud_cache_path("26.3-test"));
     }
 }

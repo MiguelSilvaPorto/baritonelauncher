@@ -31,6 +31,12 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   seguintes do *mesmo tick* (vitais, posição, skin, chunks, mobs) estouravam NPE na thread do cliente
   em vez de simplesmente esperar a reconexão do próximo tick. `send()` agora devolve `false` quando
   não há conexão, sem tentar escrever.
+- **Sem client jar, o mundo não aparecia (modo degradado não montava malha nenhuma)**: quando o atlas
+  de texturas falha (jar ausente ou extração quebrada), o viewer deveria desenhar o terreno com cor
+  sólida por bloco — o material sem textura e o caminho degradado do `buildChunkMesh` existem desde
+  que esse modo foi criado, mas a fila de montagem (`drainMeshQueue`) só chamava o construtor de malha
+  quando o atlas estava carregado: todo chunk ficava preso na fila e a tela só mostrava céu (e as
+  caixas de arame do editor). Achado ao testar a seleção com a câmera afastada do terreno.
 - **Controles da câmera: WASD invertia olhando pra baixo, órbita continuava girando e o boneco
   deslizava depois que o bot parava**: três ajustes independentes. (1) Com a câmera quase vertical, a
   projeção da direção de visão no chão degenera — e o fallback usava o eixo local `-Y` (o "para
@@ -210,6 +216,44 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Editor de schematic agora executa de verdade (posicionar e quebrar blocos)**: antes o "Aplicar" só
+  enfileirava `Mine`/`Build` e parava ali — o addon não tinha executor e os cards ficavam `Queued` para
+  sempre. Agora a lista de blocos viaja na própria instrução e o addon usa o `IBuilderProcess` do
+  Baritone com um schematic esparso das posições exatas (`OrchestratorSchematic`): `build` coloca os
+  blocos e `mine` manda ar como alvo (o mesmo caminho do `clearArea`), com o bot navegando, quebrando e
+  colocando sozinho. O status segue o processo real (`active` sem progresso medível — o
+  `BuilderProcess` não expõe contagem — e `done`/`failed` quando ele para ou nunca começa), o
+  cancelamento solta o controle do builder, e a lista de blocos é descartada quando a instrução termina
+  ou é cancelada. Nomes de bloco que o registry do jogo não conhece são ignorados (sem nenhum, a
+  instrução falha em vez de mentir sucesso); propriedades de blockstate ainda não existem, então
+  escada/laje/tora entram como o bloco base.
+- **Nuvens iguais às do jogo**: o viewer tinha céu, mas nenhuma nuvem. Agora o layer de nuvens é um
+  porte do `CloudRenderer` do client: o padrão sai do PNG real do jar
+  (`textures/environment/clouds.png`, 256×256, corte em alpha < 10), cada célula é uma caixa de
+  12×12×4 blocos com topo em **192.33** (a altura padrão do overworld), sombreamento por face como no
+  jogo (base 0.7, topo 1.0, norte/sul 0.8, leste/oeste 0.9) e deriva de **0.6 bloco/s** no eixo X
+  (+3.96 fixo no Z, igual ao código vanilla), repetindo a cada 3072 blocos. A cor acompanha o ciclo
+  dia/noite que o addon reporta: brancas de dia e azul quase preto à noite, como no multiplicador
+  noturno do `Timelines`. A textura sai do jar local (mesma regra do atlas: nunca baixa nada) e, sem
+  ela, o viewer simplesmente não desenha nuvens. Limitações honestas: a altura é sempre a do overworld
+  (o addon não manda a dimensão) e a névoa das nuvens usa a névoa do viewer em vez do fade próprio de
+  2048 blocos do jogo — ver "Known gaps".
+- **Luz de verdade no viewer — bloco emissor ilumina os vizinhos**: o terreno usava luz fixa (ambiente +
+  direcional), então tocha, lava e glowstone não iluminavam nada e uma caverna ficava igual à
+  superfície. Agora o addon lê o **motor de luz do próprio jogo** (as duas camadas que o cliente já
+  mantém: luz de bloco — tocha, lava, glowstone... — e luz de céu) e manda os níveis por posição no
+  `chunk_voxels` (formato 4: um byte por posição, um nibble por camada, lido direto da `DataLayer` da
+  seção — sem 4096 consultas ao motor por camada). O viewer faz *smooth lighting* como o jogo: para cada
+  canto de face, média das 4 posições de ar em volta nos dois canais, `max(céu, bloco)` e a curva de
+  brilho do jogo, multiplicada pelo tint (bioma) e pelo sombreamento da direção (topo 1.0, norte/sul 0.8,
+  leste/oeste 0.6, fundo 0.5) — e o material do terreno passou a ser sem luz dinâmica, porque a luz já
+  vem assada no vértice. A luz de céu assada acompanha o **ciclo dia/noite** (de noite ela cai até o
+  luar e só tocha/lava continuam iluminando; a malha é remontada em saltos grandes, pela fila orçada).
+  Resultado: degradê em volta da tocha, caverna escura, lava brilhando no escuro. Ar acima da última
+  seção carregada do chunk é céu cheio; o `world.cache` antigo (v2/v3, sem luz) continua abrindo no dia
+  cheio. **O jar do addon precisa ser rebuildado** — com o jar antigo o app avisa no console e mantém o
+  comportamento antigo. Reportado pelo usuário ("quero que vc adicione luz que nem no minecraft onde
+  alguns blocos emitem luz e afetam outros no meu render").
 - **Mobs ao redor do bot no viewer (nome, categoria, distância e vida)**: o addon agora varre as
   criaturas vivas num raio de 32 blocos (~4x/s, mesma cadência da posição) e manda um snapshot
   `entities` pelo socket; o app expõe `nearby_mobs` e o viewer desenha um rótulo por mob — nome real
@@ -510,3 +554,19 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   uma esfera teal emissiva + luz pontual na posição XYZ real, com label mono projetado em tela.
   Ainda não é blocos texturizados de verdade — isso continua dependendo do pipeline de atlas descrito
   em `docs/SPEC.md`, "Blocos 3D"; o que existe agora é a malha de chunks e o bot em 3D navegável.
+
+### Changed
+
+- **Seleção e posicionamento no editor: o clique não briga mais com a câmera**: com uma ferramenta
+  ativa, o botão esquerdo agora é só do editor — clique edita e **arrastar marca a região direto** (de
+  um bloco ao outro, com a caixa âmbar crescendo ao vivo), enquanto a câmera passa a orbitar no botão
+  **direito** e a se mover no **meio**; sem ferramenta ativa nada muda (esquerdo orbita, como no
+  viewer). Antes o mesmo botão esquerdo editava **e** girava a câmera: um arrasto curto movia a vista e
+  o clique caía noutro bloco. O primeiro canto também passou a dar retorno (cubo âmbar sobre o bloco +
+  "canto A em (x,y,z)" no status) — antes o primeiro clique não mostrava nada e parecia que a seleção
+  não tinha funcionado. Mais dois consertos no caminho: o realce sob o cursor é recalculado quando a
+  câmera se move (a inércia do damping continua movendo a cena depois do arrasto, e o cubo de preview
+  ficava apontando pra um bloco enquanto o clique cairia em outro) e o picking passou a atravessar
+  colunas ainda não carregadas em vez de desistir na primeira — com a câmera afastada do terreno
+  **nada** era selecionável antes disso. `Esc` cancela a seleção pendente. Reportado pelo usuário ("a
+  seleção está mal feita ele interfere na camera").

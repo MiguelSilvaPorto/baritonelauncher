@@ -340,6 +340,9 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                     .unwrap()
                     .apply_remote_status(&id, status, progress);
                 if terminal {
+                    // Mine/Build guardam a lista de blocos em `schematics` por
+                    // id; instrução terminal não precisa mais dela.
+                    state.schematics.lock().unwrap().remove(&id);
                     crate::dispatch_next_instruction(&state);
                 }
             }

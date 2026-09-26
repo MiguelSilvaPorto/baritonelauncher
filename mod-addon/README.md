@@ -23,7 +23,7 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   `chunk_voxels`: cada seção 16×16×16 vira paleta + índices (deflate + base64),
   com flags de renderização/oclusão/fluido, o nível de cada fluido e as
   **propriedades do blockstate** de cada entrada (`facing=north,half=top,...`,
-  formato 4) — é daí que o viewer monta o terreno com face culling de verdade,
+  formato 5) — é daí que o viewer monta o terreno com face culling de verdade,
   água/lava com nível e a **variante certa do modelo** de cada bloco (tocha de
   parede, escada invertida, cerca). Junto vai o bloco de **tints de bioma por coluna** (grama,
   folhagem e
@@ -41,8 +41,10 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   `SurvivalProcess` do spec continua pendente).
 - Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
   "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
-  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
-  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios); a
+  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`), `explore` (nativo via
+  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios) e
+  `mine`/`build` do editor de schematic (`IBuilderProcess.build` com um
+  schematic esparso das posições — ver `OrchestratorSchematic`); a
   leitura roda numa thread própria e a execução acontece na thread do cliente.
 - Reconecta sozinho (a cada 5s) se o app Rust não estiver rodando ainda — não
   trava nem falha o carregamento do mod.
@@ -68,8 +70,9 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
   isso ainda é só o que está descrito em `docs/SPEC.md`.
 - `armor_pieces` (durabilidade por peça) e `active_effects` — o protocolo já
   reserva os campos do lado Rust, o addon só não manda ainda.
-- Instruções além de `travel_to`/`explore` — o canal reverso existe (ver
-  protocolo abaixo), mas `Mine`/`Build`/baú/craft ainda não têm executor aqui.
+- Instruções de baú/craft (`FetchFromChest`/`Craft`/`Smelt`) — o canal reverso
+  existe (ver protocolo abaixo) e `Mine`/`Build` já têm executor aqui, mas baú e
+  crafting ainda não.
 
 ## Protocolo do socket (v0)
 
@@ -104,19 +107,19 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   client ou do resource pack/jar instalado, nunca baixado pela Mojang.
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
 - `{"type":"chunk_voxels","x":3,"z":-7,"data":"..."}` — um por chunk carregado
-  (paleta + índices por seção, **mais os tints de bioma por coluna**, deflate +
-  base64). Por entrada da paleta: `u8` flags (`1` renderizável, `2` oclusor,
-  `4` fluido) + `u8` nível do fluido (blockstate vanilla: `0` fonte, `1..7`
-  fluindo, `8+` caindo) + `u16` tamanho das props + bytes UTF-8 das props do
-  blockstate (`facing=north,half=bottom`, ordenadas por nome). Depois das
-  seções: `u8` tem_tints e, se `1`,
-  `256×3` bytes de grama + `256×3` de folhagem + `256×3` de água (colunas
-  `x + z*16`, cor RGB). Os tints saem do `BiomeColors` do client — colormap,
-  override e modificador de bioma já aplicados, igual ao render do jogo —
-  amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o
-  viewer cai nas cores fixas). Layout completo em `world_cache.rs`,
-  `decode_voxels` (formato 4; os formatos 3 e 2, sem props e/ou sem tints,
-  ainda são aceitos na leitura pro `world.cache` antigo).
+  (paleta + índices + luz por seção, **mais os tints de bioma por coluna**, deflate + base64). Por
+  entrada da paleta: `u8` flags (`1` renderizável, `2` oclusor, `4` fluido) + `u8` nível do fluido
+  (blockstate vanilla: `0` fonte, `1..7` fluindo, `8+` caindo) + `u16` tamanho das props + bytes
+  UTF-8 das props do blockstate (`facing=north,half=bottom`, ordenadas por nome). Depois dos índices
+  de cada seção vêm
+  `u8[4096]` de **luz** do motor do jogo, um byte por posição (nibble baixo = luz de bloco, alto =
+  luz de céu; mesma ordem dos índices). Depois das seções: `u8` tem_tints e, se `1`, `256×3` bytes de
+  grama + `256×3` de folhagem + `256×3` de água (colunas `x + z*16`, cor RGB). Os tints saem do
+  `BiomeColors` do client — colormap, override e modificador de bioma já aplicados, igual ao render
+  do jogo — amostrados no bloco mais alto de cada coluna; `null`/`0` = sem dados (o viewer cai nas
+  cores fixas). Layout completo em `world_cache.rs`, `decode_voxels` (formato 5; os formatos 4, 3 e 2
+  — sem props, sem luz e/ou sem tints — ainda são aceitos na leitura pro `world.cache` antigo e pra
+  addon desatualizado).
 - `{"type":"entities","radius":32.0,"entities":[{"id":42,"kind":"zombie","name":"Zumbi",
   "category":"hostile","x":1.5,"y":64.0,"z":-3.25,"health":20.0,"max_health":20.0,"distance":6.2,
   "height":1.95}, ...]}` — snapshot (~4x/s) das criaturas vivas no raio `radius` ao redor do
@@ -137,7 +140,14 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   (`style` = `circles` ou `zigzag`) — exploração com área definida: o addon gera os waypoints
   (passo entre faixas/anéis = render distance efetiva) e os percorre com `GoalXZ`, reportando
   progresso real; waypoint inalcançável é pulado. Sem `radius`/`style`, é o `explore` nativo acima.
-- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()`.
+- `{"type":"instruction","id":"i4","kind":"build","blocks":[{"x":10,"y":64,"z":-3,"block":"stone"}, …]}`
+  — posiciona blocos com `IBuilderProcess.build(nome, schematic, origem)`, com um schematic esparso
+  que cobre exatamente as posições da lista (`OrchestratorSchematic`). `mine` é o mesmo payload com
+  `"block":"air"`: o builder quebra o que estiver lá (o caminho do `clearArea`). Nome de bloco é o
+  path do registry sem namespace; nome desconhecido é ignorado (sem nenhum, a instrução falha). Sem
+  progresso medível, reporta `active` sem `progress` e fecha em `done`/`failed`.
+- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()` + `IBuilderProcess.onLostControl()`
+  (o builder não para só com o cancelamento do pathing).
 
 O recebimento roda numa thread leitora que só enfileira as linhas; a execução
 acontece na thread do cliente (`onClientTick`), onde a API do Baritone é segura.
