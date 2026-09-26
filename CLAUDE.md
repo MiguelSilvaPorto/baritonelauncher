@@ -343,7 +343,10 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   12×12×4 cells, the per-face shading, the 0.6 block/s drift and the day/night color multiplier
   (`Timelines.NIGHT_CLOUD_COLOR_MULTIPLIER`) are the game's, but the height is always the
   overworld's (the addon doesn't send the dimension) and the fade uses the viewer's scene fog instead
-  of the game's own 2048-block cloud fog.
+  of the game's own 2048-block cloud fog. The layer also fades out as the camera reaches its height
+  (across the 4-block layer + 8 blocks above, `updateClouds`): from above, that 80%-opaque sheet
+  would sit between the camera and the terrain — pitch black at night — and the viewer is for
+  looking at the world; below the layer nothing changes.
 - **Biome tint is real, but per column (surface) and only for what the viewer draws.** The addon
   samples the top block of each chunk column and sends grass/foliage/water colors resolved by the
   client's own `BiomeColors` — the same colormap + biome modifier the game renders with — so each
