@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Viewer3D, CHUNKS_PER_REFRESH, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
+import { Viewer3D, CHUNKS_PER_REFRESH, NEARBY_CHUNK_LIMIT, type ChunkPos, type BotPos, type UvRect } from "./viewer3d";
 
 interface TextureAtlas {
   image_data_url: string;
@@ -348,10 +348,9 @@ function requestChunk(pos: ChunkPos) {
 }
 
 async function refreshState() {
-  const [status, world, chunks, queue, totals, vitals] = await Promise.all([
+  const [status, world, queue, totals, vitals] = await Promise.all([
     invoke<ConnectionStatus>("connection_status"),
     invoke<WorldSummary>("world_summary"),
-    invoke<ChunkPos[]>("world_chunks"),
     invoke<Instruction[]>("queue_snapshot"),
     invoke<ItemTotal[]>("storage_totals"),
     invoke<Vitals | null>("vitals_snapshot"),
@@ -379,17 +378,32 @@ async function refreshState() {
     // `None`, e sem isso o marcador ficaria congelado na última posição.
     viewer3d.setBotPos(world.bot_pos ?? null);
 
-    // Voxels são buscados aos poucos: montar malha é CPU na thread
-    // principal, então um backfill de centenas de chunks numa tacada
-    // travaria o viewer. O resto fica na fila implícita do Rust e chega
-    // nos próximos refreshes — vale igual pro mundo vindo do cache em
-    // disco, que também chega inteiro de uma vez em `world_chunks`.
-    let budget = CHUNKS_PER_REFRESH;
-    for (const pos of chunks) {
-      if (budget <= 0) break;
-      if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
-      requestChunk(pos);
-      budget--;
+    // Prioridade: chunks ao redor do bot primeiro. O backend devolve os N
+    // mais próximos já ordenados (`world_chunks_near`); antes disso o cache
+    // inteiro vinha em ordem arbitrária de `HashMap` e o terreno ao redor do
+    // bot podia chegar por último. Com o jogo fechado (mundo em cache sendo
+    // navegado) a âncora passa a ser o ponto que a câmera orbita.
+    const anchor: ChunkPos = world.bot_pos
+      ? { x: world.bot_pos.x >> 4, z: world.bot_pos.z >> 4 }
+      : viewer3d.getFocusChunk();
+    try {
+      const chunks = await invoke<ChunkPos[]>("world_chunks_near", {
+        x: anchor.x,
+        z: anchor.z,
+        limit: NEARBY_CHUNK_LIMIT,
+      });
+      // Voxels são buscados aos poucos; a montagem em si já é orçada por
+      // frame no viewer (`drainMeshQueue`), então pedir vários por refresh
+      // não trava — só acelera o preenchimento ao redor do bot.
+      let budget = CHUNKS_PER_REFRESH;
+      for (const pos of chunks) {
+        if (budget <= 0) break;
+        if (viewer3d.hasChunk(pos.x, pos.z) || pendingChunks.has(`${pos.x},${pos.z}`)) continue;
+        requestChunk(pos);
+        budget--;
+      }
+    } catch (err) {
+      console.warn("[chunks] prioridade por distância indisponível:", err);
     }
   }
   renderHud(vitals);

@@ -123,10 +123,12 @@ There is no test suite yet.
   rows.
 - **`src/viewer3d.ts`** (`Viewer3D` class) — the real 3D renderer (Three.js/WebGL, not DOM). Owns its
   own `WebGLRenderer`/`Scene`/`PerspectiveCamera`/`OrbitControls` and a `requestAnimationFrame` loop;
-  `main.ts` only calls `setChunks()`/`setBotPos()`/`clear()`/`resize()` on it from `refreshState()` and
-  `setMode()`. Chunks are added once and never removed (cumulative "explored" semantics, matching
-  `WorldCache`) as flat plates at their real world position — there is no block data to render yet
-  (see "Known gaps"). This intentionally uses WebGL inside the existing webview instead of a native
+  `main.ts` only calls `addChunkVoxels()`/`setBotPos()`/`clear()`/`resize()`/`getFocusChunk()` on it.
+  Voxels from `chunk_voxels` are decoded and meshed with face culling against loaded neighbors; the
+  mesh work is queued and drained with a per-frame budget (`drainMeshQueue`), and `main.ts` asks the
+  backend for the nearest chunks first (`world_chunks_near`) so terrain around the bot fills in
+  before distant cache. Chunks are added once and never removed (cumulative "explored" semantics,
+  matching `WorldCache`). This intentionally uses WebGL inside the existing webview instead of a native
   wgpu surface (which the spec's architecture diagram shows) — an explicit user decision, because
   embedding wgpu in a separate window synced to the Tauri window is much higher-risk to get right
   blind. Don't silently redo that tradeoff; if wgpu comes up again, confirm first.
@@ -135,8 +137,9 @@ There is no test suite yet.
 - `lib.rs` — `AppState` (in-memory `WorldCache`, `StorageIndex`, `InstructionQueue`,
   `Option<Vitals>`, `ConnectionStatus`, `Option<String>` mc_version, plus `addon_tx` — the outbound
   write channel to the addon, all behind `Mutex`) + the commands currently exposed:
-  `connection_status`, `world_summary`, `world_chunks`, `chunk_voxels`, `queue_snapshot`,
-  `queue_push`, `queue_cancel`, `storage_totals`, `vitals_snapshot`, `get_texture_atlas`. Spawns
+  `connection_status`, `world_summary`, `world_chunks`, `world_chunks_near`, `chunk_voxels`,
+  `queue_snapshot`, `queue_push`, `queue_cancel`, `storage_totals`, `vitals_snapshot`,
+  `get_texture_atlas`. Spawns
   `addon_socket::listen` in `setup()`. `dispatch_next_instruction`/`send_to_addon`/`encode_instruction`
   are the reverse-channel helpers (queue → socket), called from `queue_push`, from the `hello`
   handler and when an instruction reaches a terminal status. `setup()` also loads the persisted world

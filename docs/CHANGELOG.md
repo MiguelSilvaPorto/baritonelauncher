@@ -12,6 +12,21 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Carregamento de chunks em ordem arbitrária, sem priorizar o que está ao redor do bot**: o viewer
+  pedia `world_chunks` (o cache inteiro, que cresce sem limite) e usava os primeiros quatro na ordem
+  em que o `HashMap` devolvia — o terreno ao redor do bot podia ser o último a chegar. Agora o
+  backend expõe `world_chunks_near` (os N chunks mais próximos, já ordenados por distância) e o
+  viewer carrega primeiro o que está ao redor do bot; com o jogo fechado, a âncora passa a ser o
+  ponto que a câmera orbita, então o mundo em cache abre onde o usuário está olhando. Reportado pelo
+  usuário ("começe a carregar as chunks ao meu redor primeiro antes de buscar algo novo em cache").
+- **Montagem de malha travando o frame e custo alto por face**: cada chunk recebido remontava ele e
+  os 4 vizinhos na hora (até 20 remontagens no mesmo tick com o polling antigo), e o laço de meshing
+  refazia string/rect/cor e alocava arrays a cada face. Agora as malhas entram numa fila drenada com
+  orçamento de ~8 ms por frame (um backfill de centenas de chunks aparece em frames seguidos, sem
+  engasgo), um vizinho só é remontado se a borda do chunk que chegou tem algo desenhável, o laço de
+  meshing usa cache de UV/tint por (bloco, face), UVs de fluido pré-rotacionadas e acesso local ao
+  chunk sendo montado, e as meshes estáticas não recalculam matriz por frame
+  (`matrixAutoUpdate = false`). Reportado pelo usuário ("melhore a perfomance das chunks").
 - **Folhas, videira e lírio-d'água saíam cinza**: essas texturas vêm em tons de cinza no próprio jar
   — o verde só existe em runtime via "biome tint" (colormap/JSON de bioma, não implementado). Agora
   levam tint fixo aproximado, igual já era feito com a grama: folhagem no tom de floresta (carvalho,
