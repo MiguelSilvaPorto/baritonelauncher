@@ -38,8 +38,30 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
   UI mostra o valor **efetivo**, e "Restaurar padrões" volta tudo pro comportamento original. Pedido
   pelo usuário ("quero que vc adicione um configuração no meu app").
 
+### Changed
+
+- **Seleção e posicionamento no editor: o clique não briga mais com a câmera**: com uma ferramenta
+  ativa, o botão esquerdo agora é só do editor — clique edita e **arrastar marca a região direto** (de
+  um bloco ao outro, com a caixa âmbar crescendo ao vivo), enquanto a câmera passa a orbitar no botão
+  **direito** e a se mover no **meio**; sem ferramenta ativa nada muda (esquerdo orbita, como no
+  viewer). Antes o mesmo botão esquerdo editava **e** girava a câmera: um arrasto curto movia a vista e
+  o clique caía noutro bloco. O primeiro canto também passou a dar retorno (cubo âmbar sobre o bloco +
+  "canto A em (x,y,z)" no status) — antes o primeiro clique não mostrava nada e parecia que a seleção
+  não tinha funcionado. Mais dois consertos no caminho: o realce sob o cursor é recalculado quando a
+  câmera se move (a inércia do damping continua movendo a cena depois do arrasto, e o cubo de preview
+  ficava apontando pra um bloco enquanto o clique cairia em outro) e o picking passou a atravessar
+  colunas ainda não carregadas em vez de desistir na primeira — com a câmera afastada do terreno
+  **nada** era selecionável antes disso. `Esc` cancela a seleção pendente. Reportado pelo usuário ("a
+  seleção está mal feita ele interfere na camera").
+
 ### Fixed
 
+- **Sem client jar, o mundo não aparecia (modo degradado não montava malha nenhuma)**: quando o atlas
+  de texturas falha (jar ausente ou extração quebrada), o viewer deveria desenhar o terreno com cor
+  sólida por bloco — o material sem textura e o caminho degradado do `buildChunkMesh` existem desde
+  que esse modo foi criado, mas a fila de montagem (`drainMeshQueue`) só chamava o construtor de malha
+  quando o atlas estava carregado: todo chunk ficava preso na fila e a tela só mostrava céu (e as
+  caixas de arame do editor). Achado ao testar a seleção com a câmera afastada do terreno.
 - **Controles da câmera: WASD invertia olhando pra baixo, órbita continuava girando e o boneco
   deslizava depois que o bot parava**: três ajustes independentes. (1) Com a câmera quase vertical, a
   projeção da direção de visão no chão degenera — e o fallback usava o eixo local `-Y` (o "para

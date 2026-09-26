@@ -146,12 +146,18 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   (`world_chunks_near`, anchored on the bot or on the camera target when the game is closed). Chunks
   are added once and never removed (cumulative "explored" semantics, matching `WorldCache`). It also
   hosts the **schematic editor**: voxel DDA picking (`pickBlock` — meshes are merged per chunk, so a
-  `Raycaster` can't map back to a block), the edit layer (`edits` + `rebuildGhosts`, amber
-  translucent ghost, never mutates `WorldCache`), region selection/hover wire boxes, and `mountTo()`
+  `Raycaster` can't map back to a block; the ray skips columns that aren't in the cache yet instead of
+  giving up, so picking works with the camera away from the terrain), the edit layer (`edits` +
+  `rebuildGhosts`, amber translucent ghost, never mutates `WorldCache`), region selection/hover wire
+  boxes, and `mountTo()`
   — the viewer and the editor share this one renderer, the canvas is moved to the active view instead
   of opening a second WebGL context (`main.ts`, `setMode`). The click-to-target popup and the editor
-  share one pointer handler: with an editor tool active the click edits, otherwise it picks the queue
-  target. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
+  share one pointer handler: **with an editor tool active the left button belongs to the editor**
+  (`setEditMode` unbinds OrbitControls' LEFT and moves rotate/pan to RIGHT/MIDDLE) — a click edits, a
+  drag in `select` draws the region live, and without a tool left-drag orbits as usual. The hover box
+  is also recomputed when the camera moves (`handleCameraChange`): damping and the bot follow keep
+  moving the scene after the pointer stops, and a stale preview would point at a block the click no
+  longer lands on. This intentionally uses WebGL inside the existing webview instead of a native wgpu surface
   (which the spec's architecture diagram shows) — an explicit user decision, because embedding wgpu in
   a separate window synced to the Tauri window is much higher-risk to get right blind. Don't silently
   redo that tradeoff; if wgpu comes up again, confirm first.

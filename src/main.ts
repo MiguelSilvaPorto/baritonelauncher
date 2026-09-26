@@ -504,15 +504,29 @@ function renderPalette() {
 function updateEditorStatus() {
   const stats = viewer3d?.getEditStats() ?? { total: 0, breaks: 0, builds: 0 };
   const region = viewer3d?.getSelection() ?? null;
+  const pending = viewer3d?.getPendingCorner() ?? null;
   const place = viewer3d?.getPlaceBlock() ?? null;
+  const tool = viewer3d?.getEditMode() ?? null;
   const parts: string[] = [];
   if (stats.total === 0) parts.push("nenhuma edição");
   else parts.push(`${stats.total} edições (${stats.breaks} quebrar / ${stats.builds} colocar)`);
   if (region) {
     const size = `${region.max.x - region.min.x + 1}×${region.max.y - region.min.y + 1}×${region.max.z - region.min.z + 1}`;
     parts.push(`região ${size} em (${region.min.x},${region.min.y},${region.min.z})`);
+  } else if (pending) {
+    // O primeiro clique precisa de retorno: sem isso parecia que o canto A
+    // não tinha sido marcado (e o usuário tentava de novo, arrastando a
+    // câmera sem querer).
+    parts.push(`canto A em (${pending.x},${pending.y},${pending.z}) — clique (ou arraste) o canto oposto`);
   }
   if (place) parts.push(`bloco: ${place}`);
+  // Com ferramenta ativa o botão esquerdo pertence ao editor (ver
+  // `viewer3d.setEditMode`); sem ela, o viewer orbita como sempre.
+  parts.push(
+    tool
+      ? "esquerdo edita (arraste marca a região) · direito orbita · meio move"
+      : "nenhuma ferramenta ativa — esquerdo orbita"
+  );
   setEditorStatus(parts.join(" · "));
   $<HTMLButtonElement>("#editor-apply").disabled = stats.total === 0;
 }
