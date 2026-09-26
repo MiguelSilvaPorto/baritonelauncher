@@ -9,8 +9,10 @@
 //! - Mensagens hoje: `hello` (handshake), `vitals` (vida/fome/armadura,
 //!   ~1x/segundo), `position` (pés do jogador + yaw/pitch, ~4x/segundo),
 //!   `player_skin` (PNG da skin do próprio jogador, quando muda — ver
-//!   `player_skin.rs`) e `chunk_voxels` (o chunk inteiro, seção por seção,
-//!   comprimido — ver abaixo). Baús ainda não trafegam por aqui.
+//!   `player_skin.rs`), `entities` (snapshot dos mobs vivos ao redor do
+//!   jogador, ~4x/segundo — ver `mobs.rs`) e `chunk_voxels` (o chunk inteiro,
+//!   seção por seção, comprimido — ver abaixo). Baús ainda não trafegam por
+//!   aqui.
 //! - Canal reverso (app → addon, mesmo socket): `instruction` (`travel_to` ou
 //!   `explore`) e `cancel` (id da instrução). O addon responde com
 //!   `instruction_status` (`active` com `progress`, ou `done`/`failed`), que
@@ -94,6 +96,14 @@ enum AddonMessage {
         /// Payload binário (ver `world_cache::decode_voxels`) comprimido com
         /// zlib e codificado em base64.
         data: String,
+    },
+    /// Snapshot dos mobs vivos num raio ao redor do jogador (ver `mobs.rs`).
+    /// É o estado atual, não um delta: mob que saiu do raio some da lista, e
+    /// o viewer remove o marcador sozinho (`setNearbyMobs`). Jogadores não
+    /// entram — só criaturas.
+    Entities {
+        radius: f32,
+        entities: Vec<crate::mobs::NearbyMob>,
     },
     /// Estado de execução de uma instrução do canal reverso. `progress` é
     /// opcional (só faz sentido em `active`; `explore` não tem progresso
@@ -289,6 +299,15 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
                 }
                 Err(err) => eprintln!("[addon_socket] chunk_voxels inválido em ({x}, {z}): {err}"),
             },
+            AddonMessage::Entities { radius, entities } => {
+                // Snapshot inteiro: substitui o anterior. `None` (nunca
+                // recebido) e lista vazia são estados diferentes na UI — "sem
+                // dados do addon" vs. "varreu e não achou nada".
+                *state.mobs.lock().unwrap() = Some(crate::mobs::MobSnapshot {
+                    radius,
+                    mobs: entities,
+                });
+            }
             AddonMessage::InstructionStatus { id, status, progress } => {
                 let status = match status {
                     AddonInstructionState::Active => QueueInstructionStatus::Active,
@@ -340,6 +359,10 @@ async fn handle_connection(stream: TcpStream, app: AppHandle) {
     *state.vitals.lock().unwrap() = None;
     *state.bot_pos.lock().unwrap() = None;
     *state.bot_pose.lock().unwrap() = None;
+    // Mobs são do mundo daquela conexão: sem o addon online não existe
+    // varredura, e o viewer não pode continuar mostrando a última posição
+    // deles como se fossem atuais.
+    *state.mobs.lock().unwrap() = None;
     // A skin fica: é um dado real do jogador, e mantê-la evita o modelo
     // piscar de volta pro placeholder a cada reconexão.
 }

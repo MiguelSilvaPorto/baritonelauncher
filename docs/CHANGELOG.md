@@ -25,6 +25,11 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **Conexão do addon caindo no meio do tick derrubava o jogo com `NullPointerException`**: quando um
+  envio falhava (app Rust fechado, socket derrubado), o fluxo ficava com `out = null` e os envios
+  seguintes do *mesmo tick* (vitais, posição, skin, chunks, mobs) estouravam NPE na thread do cliente
+  em vez de simplesmente esperar a reconexão do próximo tick. `send()` agora devolve `false` quando
+  não há conexão, sem tentar escrever.
 - **Controles da câmera: WASD invertia olhando pra baixo, órbita continuava girando e o boneco
   deslizava depois que o bot parava**: três ajustes independentes. (1) Com a câmera quase vertical, a
   projeção da direção de visão no chão degenera — e o fallback usava o eixo local `-Y` (o "para
@@ -206,6 +211,20 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Mobs ao redor do bot no viewer (nome, categoria, distância e vida)**: o addon agora varre as
+  criaturas vivas num raio de 32 blocos (~4x/s, mesma cadência da posição) e manda um snapshot
+  `entities` pelo socket; o app expõe `nearby_mobs` e o viewer desenha um rótulo por mob — nome real
+  do jogo (já localizado pelo client, com nome customizado se o mob tiver), categoria (hostil em
+  vermelho, neutro/passivo/outro no cinza padrão), distância e vida — mais um painel "mobs" no viewer
+  (hostis primeiro, depois por distância) e estado vazio honesto ("nenhum mob num raio de N blocos")
+  quando a varredura não acha nada. A categoria é classificada no addon pelo tipo real do jogo
+  (`NeutralMob`/`Enemy`/`MobCategory`): lobo, abelha, enderman e piglin zumbificado saem como
+  **neutro** (não atacam sem provocação), zumbi/esqueleto/creeper como **hostil**. É identificação,
+  não os modelos 3D reais de cada mob — o viewer ainda não tem o pipeline de modelos de entidade (ver
+  "Known gaps"). O snapshot é o estado atual, não um delta (mob que sai do raio some sozinho), e o
+  `SurvivalProcess` que vai *reagir* a isso continua pendente; jogadores ficam de fora (não são mobs).
+  Reportado pelo usuário ("quero que vc adicione um renderizador capaz de identificar mobs ao redor
+  no meu player").
 - **Céu no viewer 3D**: o fundo era uma cor chapada quase preta, então o horizonte e a profundidade do
   terreno sumiam — com o zoom afastado o mundo parecia flutuar no vazio. Agora há um domo de céu com
   gradiente (zênite azul → horizonte claro) numa textura de canvas, sempre centrado na câmera, e o
