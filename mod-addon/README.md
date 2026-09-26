@@ -38,8 +38,10 @@ deste repositório. Ver `docs/SPEC.md`, seção "Arquitetura", pro desenho compl
   `SurvivalProcess` do spec continua pendente).
 - Recebe instruções do app pelo mesmo socket (`instruction`/`cancel`, ver
   "canal reverso" abaixo) e devolve `instruction_status` com status/progresso —
-  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`) e `explore` (nativo via
-  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios); a
+  hoje `travel_to` (`GoalXZ` via `ICustomGoalProcess`), `explore` (nativo via
+  `IExploreProcess`, ou com raio/estilo percorrendo waypoints próprios) e
+  `mine`/`build` do editor de schematic (`IBuilderProcess.build` com um
+  schematic esparso das posições — ver `OrchestratorSchematic`); a
   leitura roda numa thread própria e a execução acontece na thread do cliente.
 - Reconecta sozinho (a cada 5s) se o app Rust não estiver rodando ainda — não
   trava nem falha o carregamento do mod.
@@ -65,8 +67,9 @@ Código: `src/main/java/dev/baritone/orchestrator/addon/`
   isso ainda é só o que está descrito em `docs/SPEC.md`.
 - `armor_pieces` (durabilidade por peça) e `active_effects` — o protocolo já
   reserva os campos do lado Rust, o addon só não manda ainda.
-- Instruções além de `travel_to`/`explore` — o canal reverso existe (ver
-  protocolo abaixo), mas `Mine`/`Build`/baú/craft ainda não têm executor aqui.
+- Instruções de baú/craft (`FetchFromChest`/`Craft`/`Smelt`) — o canal reverso
+  existe (ver protocolo abaixo) e `Mine`/`Build` já têm executor aqui, mas baú e
+  crafting ainda não.
 
 ## Protocolo do socket (v0)
 
@@ -130,7 +133,14 @@ evoluem separados — referência completa em [`docs/PROTOCOL.md`](../docs/PROTO
   (`style` = `circles` ou `zigzag`) — exploração com área definida: o addon gera os waypoints
   (passo entre faixas/anéis = render distance efetiva) e os percorre com `GoalXZ`, reportando
   progresso real; waypoint inalcançável é pulado. Sem `radius`/`style`, é o `explore` nativo acima.
-- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()`.
+- `{"type":"instruction","id":"i4","kind":"build","blocks":[{"x":10,"y":64,"z":-3,"block":"stone"}, …]}`
+  — posiciona blocos com `IBuilderProcess.build(nome, schematic, origem)`, com um schematic esparso
+  que cobre exatamente as posições da lista (`OrchestratorSchematic`). `mine` é o mesmo payload com
+  `"block":"air"`: o builder quebra o que estiver lá (o caminho do `clearArea`). Nome de bloco é o
+  path do registry sem namespace; nome desconhecido é ignorado (sem nenhum, a instrução falha). Sem
+  progresso medível, reporta `active` sem `progress` e fecha em `done`/`failed`.
+- `{"type":"cancel","id":"i1"}` — `IPathingBehavior.cancelEverything()` + `IBuilderProcess.onLostControl()`
+  (o builder não para só com o cancelamento do pathing).
 
 O recebimento roda numa thread leitora que só enfileira as linhas; a execução
 acontece na thread do cliente (`onClientTick`), onde a API do Baritone é segura.

@@ -68,7 +68,16 @@ tints, e um jar do addon antigo segue funcionando (o app avisa no console).
 - `{"type":"instruction","id":"i3","kind":"explore","x":0,"z":0,"radius":256,"style":"circles"}`
   (`style`: `circles` ou `zigzag`) — exploração com área definida; o addon gera e percorre os
   waypoints, reportando progresso real e pulando waypoint inalcançável.
-- `{"type":"cancel","id":"i1"}` — cancela a instrução no jogo (`cancelEverything`).
+- `{"type":"instruction","id":"i4","kind":"build","blocks":[{"x":10,"y":64,"z":-3,"block":"stone"}, …]}`
+  — posicionar blocos com o `IBuilderProcess.build(nome, schematic, origem)`, onde o schematic é
+  esparso e cobre exatamente as posições da lista (`OrchestratorSchematic`). `mine` é o mesmo payload
+  com `"block":"air"` em cada posição: o builder quebra o que estiver lá — o mesmo caminho que o
+  `clearArea` usa. O nome do bloco é o path do registry sem namespace (`stone`, `oak_planks`); nome
+  desconhecido é ignorado (e se nenhum sobrar, a instrução falha em vez de mentir sucesso). Essas duas
+  não têm progresso medível — o `BuilderProcess` não expõe contagem — então reportam `active` sem
+  `progress` e fecham em `done` quando o processo para (ou `failed` se ele nunca começar).
+- `{"type":"cancel","id":"i1"}` — cancela a instrução no jogo: `cancelEverything` no pathing e
+  `onLostControl` no builder (ele não para só com o cancelamento do pathing).
 
 A leitura roda numa thread dedicada que só enfileira as linhas; a execução acontece na thread do
 client (`onClientTick`), onde a API do Baritone é segura.

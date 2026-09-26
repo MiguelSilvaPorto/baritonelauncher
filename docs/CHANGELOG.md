@@ -216,6 +216,17 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Added
 
+- **Editor de schematic agora executa de verdade (posicionar e quebrar blocos)**: antes o "Aplicar" só
+  enfileirava `Mine`/`Build` e parava ali — o addon não tinha executor e os cards ficavam `Queued` para
+  sempre. Agora a lista de blocos viaja na própria instrução e o addon usa o `IBuilderProcess` do
+  Baritone com um schematic esparso das posições exatas (`OrchestratorSchematic`): `build` coloca os
+  blocos e `mine` manda ar como alvo (o mesmo caminho do `clearArea`), com o bot navegando, quebrando e
+  colocando sozinho. O status segue o processo real (`active` sem progresso medível — o
+  `BuilderProcess` não expõe contagem — e `done`/`failed` quando ele para ou nunca começa), o
+  cancelamento solta o controle do builder, e a lista de blocos é descartada quando a instrução termina
+  ou é cancelada. Nomes de bloco que o registry do jogo não conhece são ignorados (sem nenhum, a
+  instrução falha em vez de mentir sucesso); propriedades de blockstate ainda não existem, então
+  escada/laje/tora entram como o bloco base.
 - **Nuvens iguais às do jogo**: o viewer tinha céu, mas nenhuma nuvem. Agora o layer de nuvens é um
   porte do `CloudRenderer` do client: o padrão sai do PNG real do jar
   (`textures/environment/clouds.png`, 256×256, corte em alpha < 10), cada célula é uma caixa de
