@@ -12,6 +12,15 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 
 ### Fixed
 
+- **"Separação"/grade visível entre os blocos de longe**: o atlas não tinha folga entre os tiles nem
+  mipmaps, então de longe cada face de bloco amostrava um texel diferente do vizinho — blocos do mesmo
+  terreno ganhavam tons ligeiramente distintos e o chão virava uma grade de quadrados ("separação") em
+  vez de uma superfície contínua, além de cintilar com a distância (aliasing de minificação). Agora o
+  atlas é empacotado com uma folga de 8px em volta de cada tile, preenchida replicando a borda do
+  próprio tile — o mesmo truque do atlas do próprio Minecraft — e o viewer usa mipmaps
+  (`NearestMipmapLinearFilter`: nítido de perto, média entre níveis de longe) com anisotropia. Cada
+  nível de mip mistura só conteúdo do mesmo bloco, então some a grade e a cintilação. Reportado pelo
+  usuário ("essa separação que fica quando eu enxergo de longe").
 - **Carregamento de chunks em ordem arbitrária, sem priorizar o que está ao redor do bot**: o viewer
   pedia `world_chunks` (o cache inteiro, que cresce sem limite) e usava os primeiros quatro na ordem
   em que o `HashMap` devolvia — o terreno ao redor do bot podia ser o último a chegar. Agora o
