@@ -370,6 +370,8 @@ Creeper é o caso mais crítico: dano de explosão à queima-roupa pode passar d
 
 O mod Java escaneia entidades próximas (raio configurável, ex: 16 blocos — mesmo alcance de detecção de um creeper) a cada poucos ticks, classifica pelo tipo e distância, e manda pro Rust como parte do mesmo canal de vitals já existente. O `SurvivalProcess` cruza isso com a tabela acima pra decidir a resposta, com a mesma prioridade máxima (acima de qualquer instrução da fila) que já usamos pra vida/fome baixa.
 
+> **Implementado até agora (ver `docs/CHANGELOG.md`):** a varredura existe — o addon manda o snapshot `entities` (raio de 32 blocos, categoria/nome/vida/distância por criatura) e o viewer identifica cada mob no mundo e num painel. A *resposta* da tabela abaixo (escudo, recuar, prioridade sobre a fila) continua não implementada.
+
 ## Agendamento por estimativa de tempo — preenchendo janelas de espera
 
 Essa é a peça que faz o tier 5 (fundição/etc.) funcionar de verdade: o app precisa saber **quanto tempo cada ação leva** pra decidir se vale mandar o bot fazer outra coisa enquanto uma fornalha cozinha, e voltar bem na hora que terminar — sem ficar parado, mas também sem se arriscar a voltar tarde demais ou cedo demais.
@@ -469,6 +471,7 @@ Tom: ferramenta técnica de desenvolvedor, não "gamer" — escura, precisa, sem
 | Accent — âmbar (tocha) | `#f2b155` | Ações primárias, itens "planejados/fantasma", instrução ativa de build |
 | Accent — teal (bot/explorado) | `#5eead4` | Posição do bot, área explorada, progresso |
 | Status — sucesso | `#4ade80` | Conectado, concluído |
+| Status — perigo | `#f2555f` | Ameaça (mob hostil no viewer), vida crítica no HUD |
 
 ### Tipografia
 

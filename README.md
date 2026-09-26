@@ -12,15 +12,19 @@ orquestrado externamente, com:
 
 O bot é "burro" — só executa instruções literais — mas confiável. O app é o "cérebro" que decide o
 quê, quando e em que ordem. Ver [`docs/SPEC.md`](docs/SPEC.md) para a especificação completa da
-arquitetura, e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mudanças.
+arquitetura e [`docs/CHANGELOG.md`](docs/CHANGELOG.md) para o histórico de mudanças; o índice da
+documentação (com as referências externas oficiais) está em [`docs/README.md`](docs/README.md).
 
 > **Status: ponta a ponta funcionando, escopo mínimo.** A shell do app, os modelos de dados Rust, a
 > identidade visual, a ponte real com o Baritone (addon Java em NeoForge → socket local → app, nos
 > dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
-> chunks explorados e o **jogador com o modelo e a skin reais do jogo** em coordenadas reais) e a
-> **fila executando `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) estão
-> implementados e testados manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não
-> existem — ver "O que falta" abaixo.
+> dois sentidos), um **viewer 3D de verdade** (Three.js/WebGL, câmera orbitável, voxels reais dos
+> chunks explorados, o **jogador com o modelo e a skin reais do jogo** em coordenadas reais e os
+> **mobs ao redor identificados** por nome/categoria/distância/vida), a **fila executando
+> `travel_to`/`explore` de verdade** (com status e progresso vindos do addon) e uma **aba Config** com
+> preferências reais salvas em disco (viewer 3D e cadência do polling) estão implementados e testados
+> manualmente. Baús e instruções de `#build`/`#mine`/craft ainda não existem — ver "O que falta"
+> abaixo.
 
 ## Arquitetura
 
@@ -35,8 +39,8 @@ Addon Java (mod-addon/ — NeoForge, real)                    App Rust/Tauri (es
 └─ reporta posição/progresso/vitais ────────────┐            └─ Vitais/ameaças (src-tauri/src/vitals.rs)
                                                  ↓
                          socket TCP local 127.0.0.1:31173 (src-tauri/src/addon_socket.rs)
-                         manda vitais, posição + rotação, skin do jogador e o chunk em voxels;
-                         recebe instruções/cancelamento — baú ainda não trafega
+                         manda vitais, posição + rotação, skin do jogador, mobs ao redor e o chunk
+                         em voxels; recebe instruções/cancelamento — baú ainda não trafega
 ```
 
 ## Identidade visual
@@ -78,14 +82,21 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
   (`chunk_voxels`) e a fila já executa de verdade pelo canal reverso (o app manda `instruction`/
   `cancel` e recebe `instruction_status` com status e progresso); `StorageIndex` continua vazio (sem
   leitura de baú/`ContainerScreen`) e `Mine`/`Build`/`Craft`/`Smelt` ainda não têm executor no addon.
-- **`SurvivalProcess`/detecção de ameaça e simulação de `ContainerScreen`** no addon — só descrito em
-  `docs/SPEC.md`, sem código ainda.
+- **`SurvivalProcess` (reagir a ameaça) e simulação de `ContainerScreen`** — a **detecção** de mobs
+  já existe (o addon varre as criaturas ao redor e manda `entities`; o viewer identifica cada uma),
+  mas nenhuma decisão de lutar/fugir/levantar escudo, e crafting/fundição continuam só descritos em
+  `docs/SPEC.md`.
+- **Modelos 3D reais dos mobs** — o viewer identifica cada mob com um marcador (nome/categoria/
+  distância/vida), não com o modelo de entidade do jogo; o pipeline de modelo/UV/animação por tipo de
+  entidade ainda não existe (o atlas atual cobre só texturas de bloco).
 - **Terreno real com bloco real por posição** (greedy meshing, heightmap) — o viewer 3D
   (`src/viewer3d.ts`, Three.js/WebGL) renderiza os voxels reais do `chunk_voxels` em coordenadas
-  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`) e os
+  reais, com uma textura por face extraída do jar local (`src-tauri/src/texture_atlas.rs`), tint de
+  bioma real por coluna (grama/folhagem/água, resolvido pelo `BiomeColors` do client no addon) e os
   **modelos de verdade** dos blocos não-cúbicos assados do jar (`src-tauri/src/block_models.rs`:
-  tocha, cogumelo, vitória-régia, flor, escada, cerca, grade...). O que falta é tint real por bioma
-  (é fixo aproximado), blocos de **mods** (caem no cubo) e block entities (baú, texto de placa). (O
+  tocha, cogumelo, vitória-régia, flor, escada, cerca, grade...). O que falta é blocos de **mods**
+  (caem no cubo), block entities (baú, texto de placa) e tint por energia (fio de redstone é vermelho
+  fixo); o bioma é amostrado no topo da coluna (bloco subterrâneo usa o bioma da superfície). (O
   spec descreve esse renderer como wgpu nativo; aqui é WebGL dentro do próprio
   webview do app — decisão explícita pra evitar o risco de embutir uma superfície wgpu numa janela
   separada sem conseguir validar visualmente.)
@@ -107,8 +118,13 @@ No Linux, se o ícone não aparecer na barra de tarefas em modo dev, rode
 - `src/` — frontend: `main.ts` (toda a lógica de UI, sem framework) + `viewer3d.ts` (o renderer 3D,
   Three.js/WebGL) + `styles.css`.
 - `src-tauri/` — backend Rust/Tauri, incluindo `addon_socket.rs` (servidor TCP que fala com o addon),
-  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada) e
-  `world_store.rs` (grava/carrega o mundo explorado em disco).
+  `texture_atlas.rs` (extrai texturas do client jar local, nunca baixa/empacota nada),
+  `world_store.rs` (grava/carrega o mundo explorado em disco) e `settings.rs` (preferências da aba
+  Config, em `settings.json` no diretório de dados do app).
 - `mod-addon/` — addon Java real (NeoForge), ver [`mod-addon/README.md`](mod-addon/README.md).
+- `docs/README.md` — índice da documentação, incluindo as referências externas oficiais.
+- `docs/PROTOCOL.md` — socket app ↔ addon: mensagens e formato binário do `chunk_voxels`.
+- `docs/CONFIG.md` — aba Config: campos, faixas aceitas e padrões.
 - `docs/CHANGELOG.md` — histórico de mudanças voltado ao usuário.
 - `docs/SPEC.md` — especificação completa da arquitetura e do produto.
+- `docs/mockup-visao-principal.html` — mockup original da UI (referência visual, não doc técnica).

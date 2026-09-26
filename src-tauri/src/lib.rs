@@ -2,8 +2,10 @@ mod addon_socket;
 mod block_models;
 mod instructions;
 mod items;
+mod mobs;
 mod player_skin;
 mod schematic;
+mod settings;
 mod storage_index;
 mod texture_atlas;
 mod time_estimate;
@@ -50,9 +52,16 @@ pub(crate) struct AppState {
     /// Mesma posição de `bot_pos` + yaw/pitch do jogador — o viewer usa os
     /// ângulos pra orientar o modelo (ver `addon_socket::BotPose`).
     pub(crate) bot_pose: Mutex<Option<addon_socket::BotPose>>,
+    /// Hora real do mundo em ticks (0..=23999), reportada 1x/s pelo addon —
+    /// o viewer usa pro ciclo de dia/noite (ver `addon_socket::WorldTime`).
+    pub(crate) world_time: Mutex<Option<u32>>,
     /// Skin real do jogador (PNG), mandada pelo addon quando muda — ver
     /// `player_skin.rs`.
     pub(crate) player_skin: Mutex<Option<player_skin::PlayerSkin>>,
+    /// Último snapshot dos mobs vivos ao redor do jogador (`entities`, ver
+    /// `mobs.rs`). `None` = o addon não mandou nada nesta conexão (a UI não
+    /// mostra painel); `Some` com lista vazia = varreu e não achou nada.
+    pub(crate) mobs: Mutex<Option<mobs::MobSnapshot>>,
     /// Versão do Minecraft reportada no `hello` do addon — usada pra achar
     /// o client jar certo em `texture_atlas.rs`. Real, não hardcoded: se o
     /// addon nunca conectou ainda, isso fica `None` e o comando do atlas
@@ -69,6 +78,11 @@ pub(crate) struct AppState {
     /// fila é pollada a cada segundo e um schematic inteiro dentro dela
     /// inflaria o IPC — o card mostra só contagem/centro.
     pub(crate) schematics: Mutex<HashMap<String, Vec<schematic::SchematicBlock>>>,
+    /// Preferências do usuário (aba Config — `settings.rs`), carregadas no
+    /// `setup()` e gravadas por `settings_set`/`settings_reset`. O frontend só
+    /// aplica o que veio daqui: o backend é a fonte da verdade e prende cada
+    /// campo na faixa válida.
+    pub(crate) settings: Mutex<settings::Settings>,
 }
 
 /// Ids de instrução são gerados aqui (nunca pelo addon) — só precisam ser
@@ -440,12 +454,30 @@ mod commands {
         *state.bot_pose.lock().unwrap()
     }
 
+    /// Hora real do mundo em ticks (0..=23999; 0 = nascer do sol, 6000 =
+    /// meio-dia, 12000 = pôr do sol, 18000 = meia-noite) — ver
+    /// `addon_socket.rs`. `None` enquanto o jogo não conectou (ou desconectou):
+    /// o viewer congela na última hora conhecida em vez de inventar um ciclo.
+    #[tauri::command]
+    fn world_time(state: State<AppState>) -> Option<u32> {
+        *state.world_time.lock().unwrap()
+    }
+
     /// Skin real do jogador (PNG em data URL + variante do modelo), mandada
     /// pelo addon — ver `player_skin.rs`. `None` enquanto o addon não mandou
     /// (o viewer mostra o modelo sem textura, não uma skin inventada).
     #[tauri::command]
     fn player_skin(state: State<AppState>) -> Option<player_skin::PlayerSkin> {
         state.player_skin.lock().unwrap().clone()
+    }
+
+    /// Snapshot dos mobs vivos ao redor do bot (comando `nearby_mobs`), com o
+    /// raio varrido reportado pelo addon — ver `mobs.rs`. `None` = o addon
+    /// ainda não mandou `entities` (painel escondido); lista vazia é resposta
+    /// real ("nenhum mob no raio").
+    #[tauri::command]
+    fn nearby_mobs(state: State<AppState>) -> Option<mobs::MobSnapshot> {
+        state.mobs.lock().unwrap().clone()
     }
 
     /// Gera (ou reaproveita do cache local) o atlas de texturas de bloco a
@@ -479,6 +511,42 @@ mod commands {
         Ok(tauri::ipc::Response::new(payload))
     }
 
+    /// Preferências atuais (aba Config) — o que está em memória, já
+    /// carregado do disco no `setup()` ou com os padrões.
+    #[tauri::command]
+    fn settings_get(state: State<AppState>) -> crate::settings::Settings {
+        state.settings.lock().unwrap().clone()
+    }
+
+    /// Grava preferências e devolve o valor **efetivo** (já preso na faixa
+    /// válida em `settings::sanitized`) — a UI mostra o que o backend aceitou,
+    /// não o que ela pediu. Grava em disco antes de aplicar em memória: um
+    /// erro de escrita vira erro pro usuário em vez de uma preferência que
+    /// vale só até o próximo boot.
+    #[tauri::command]
+    fn settings_set(
+        app: tauri::AppHandle,
+        state: State<AppState>,
+        settings: crate::settings::Settings,
+    ) -> Result<crate::settings::Settings, String> {
+        let effective = settings.sanitized();
+        let path = settings_path(&app)?;
+        crate::settings::save(&path, &effective)?;
+        *state.settings.lock().unwrap() = effective.clone();
+        Ok(effective)
+    }
+
+    /// Volta todas as preferências pro padrão (os mesmos valores que o app
+    /// tinha antes da aba Config existir) e grava — devolve o efetivo.
+    #[tauri::command]
+    fn settings_reset(app: tauri::AppHandle, state: State<AppState>) -> Result<crate::settings::Settings, String> {
+        let defaults = crate::settings::Settings::default();
+        let path = settings_path(&app)?;
+        crate::settings::save(&path, &defaults)?;
+        *state.settings.lock().unwrap() = defaults.clone();
+        Ok(defaults)
+    }
+
     pub(super) fn register(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
         builder.invoke_handler(tauri::generate_handler![
             connection_status,
@@ -493,9 +561,14 @@ mod commands {
             storage_totals,
             vitals_snapshot,
             bot_pose,
+            world_time,
             player_skin,
+            nearby_mobs,
             get_texture_atlas,
             get_block_models,
+            settings_get,
+            settings_set,
+            settings_reset,
         ])
     }
 }
@@ -514,6 +587,34 @@ fn world_cache_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map(|dir| dir.join("world.cache"))
         .map_err(|err| err.to_string())
+}
+
+/// Caminho das preferências — mesmo diretório de dados do app, ao lado do
+/// `world.cache` (`settings.json`, ver `settings.rs`).
+fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("settings.json"))
+        .map_err(|err| err.to_string())
+}
+
+/// Carrega as preferências salvas pro `AppState`. Arquivo ausente é normal
+/// (primeira execução) e os padrões já estão no `AppState`; arquivo ilegível é
+/// logado e ignorado — o app abre com os padrões em vez de não abrir.
+fn load_persisted_settings(app: &tauri::AppHandle) {
+    let Ok(path) = settings_path(app) else {
+        eprintln!("[settings] sem diretório de dados; usando padrões");
+        return;
+    };
+    match settings::load(&path) {
+        Ok(Some(loaded)) => {
+            let state = app.state::<AppState>();
+            *state.settings.lock().unwrap() = loaded;
+            println!("[settings] preferências carregadas de {}", path.display());
+        }
+        Ok(None) => {}
+        Err(err) => eprintln!("[settings] preferências ignoradas ({err}); usando padrões"),
+    }
 }
 
 /// Carrega o mundo persistido (se existir) no `AppState` e restaura a versão
@@ -543,32 +644,63 @@ fn load_persisted_world(app: &tauri::AppHandle) {
     }
 }
 
-/// Grava o cache agora, se a revisão mudou desde a última gravação.
-fn save_world_if_dirty(app: &tauri::AppHandle, last_saved: &mut u64) {
+/// Última revisão do mundo que foi parar no disco com sucesso. Fica num
+/// `AtomicU64` (e não numa variável local da task) porque o fechamento do app
+/// também grava — assim o exit não reescreve o que a task acabou de salvar.
+static LAST_SAVED_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot pronto pra gravar: o `encode` já saiu feito (barato, sob o lock
+/// do mundo) e a compressão/escrita fica pro chamador, **fora** do lock.
+struct PendingWorldSave {
+    path: PathBuf,
+    raw: Vec<u8>,
+    revision: u64,
+}
+
+/// Serializa o mundo se a revisão mudou desde a última gravação. Só o
+/// `encode` (memcpy dos chunks) roda com o lock do mundo segurado — comprimir
+/// ~20 MB com zlib leva ~1,2 s, e segurar o lock durante isso travava o
+/// refresh e o socket a cada gravação (ver `docs/CHANGELOG.md`).
+fn encode_world_if_dirty(app: &tauri::AppHandle) -> Option<PendingWorldSave> {
     let state = app.state::<AppState>();
     let revision = state.world_revision.load(Ordering::Relaxed);
-    if revision == *last_saved {
-        return;
+    if revision == LAST_SAVED_REVISION.load(Ordering::Relaxed) {
+        return None;
     }
-    let Ok(path) = world_cache_path(app) else {
-        return;
-    };
+    let path = world_cache_path(app).ok()?;
     let version = state.mc_version.lock().unwrap().clone();
-    let world = state.world.lock().unwrap();
-    match world_store::save(&path, &world, version.as_deref()) {
-        Ok(()) => *last_saved = revision,
-        Err(err) => eprintln!("[world_store] falha ao gravar: {err}"),
-    }
+    let raw = {
+        let world = state.world.lock().unwrap();
+        world_store::encode(&world, version.as_deref())
+    };
+    Some(PendingWorldSave {
+        path,
+        raw,
+        revision,
+    })
 }
 
 /// Gravação periódica em background (`setup()`), em vez de a cada chunk: o
 /// handler do socket aplica centenas de chunks num backfill de reconexão, e
 /// gravar por chunk transformaria isso em centenas de arquivos escritos.
 async fn world_store_task(app: tauri::AppHandle) {
-    let mut last_saved = 0u64;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(WORLD_SAVE_INTERVAL_SECS)).await;
-        save_world_if_dirty(&app, &mut last_saved);
+        let Some(pending) = encode_world_if_dirty(&app) else {
+            continue;
+        };
+        let PendingWorldSave {
+            path,
+            raw,
+            revision,
+        } = pending;
+        // Compressão de CPU + I/O numa thread de blocking, sem o lock do
+        // mundo e sem segurar um worker do runtime async.
+        match tokio::task::spawn_blocking(move || world_store::write(&path, &raw)).await {
+            Ok(Ok(())) => LAST_SAVED_REVISION.store(revision, Ordering::Relaxed),
+            Ok(Err(err)) => eprintln!("[world_store] falha ao gravar: {err}"),
+            Err(err) => eprintln!("[world_store] gravação cancelada: {err}"),
+        }
     }
 }
 
@@ -590,6 +722,7 @@ pub fn run() {
             }
 
             load_persisted_world(app.handle());
+            load_persisted_settings(app.handle());
             tauri::async_runtime::spawn(world_store_task(app.handle().clone()));
             tauri::async_runtime::spawn(addon_socket::listen(app.handle().clone()));
 
@@ -602,9 +735,13 @@ pub fn run() {
         .run(|app, event| {
             // Gravação final no fechamento: o intervalo do gravador periódico
             // pode deixar os últimos segundos de exploração fora do disco.
+            // (No exit pode ser síncrono — o app está fechando.)
             if let tauri::RunEvent::Exit = event {
-                let mut last_saved = 0u64;
-                save_world_if_dirty(app, &mut last_saved);
+                if let Some(pending) = encode_world_if_dirty(app) {
+                    if let Err(err) = world_store::write(&pending.path, &pending.raw) {
+                        eprintln!("[world_store] falha na gravação final: {err}");
+                    }
+                }
             }
         });
 }

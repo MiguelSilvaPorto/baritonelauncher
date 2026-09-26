@@ -132,6 +132,7 @@ mod tests {
                 palette,
                 indices,
             }],
+            None,
         );
         world
     }

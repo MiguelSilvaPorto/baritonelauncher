@@ -179,6 +179,82 @@ button, input { font-family: inherit; }
   white-space: nowrap;
 }
 
+/* ---------- Mobs ao redor do bot (comando `nearby_mobs`) ---------- */
+
+.mob-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* Rótulo projetado por mob — nome, categoria (pela cor) e distância/vida. */
+.mob-label {
+  position: absolute;
+  display: none;
+  transform: translate(-50%, -100%);
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 6px;
+  background: rgba(10, 12, 15, 0.72);
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 1.25;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.mob-label .mob-name { color: var(--text-2); }
+.mob-label .mob-meta { font-size: 9px; color: var(--text-3); }
+
+/* Hostil = perigo (token `--danger`, mesma semântica de ameaça do HUD de
+ * vida); neutro/passivo/outro ficam no cinza padrão — sem cor decorativa. */
+.mob-label.mob-hostile { border-color: var(--danger); }
+.mob-label.mob-hostile .mob-name { color: var(--danger); }
+
+.mob-panel {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  display: none;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 200px;
+  max-width: 280px;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+
+.mob-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mob-panel-header .title {
+  font-size: 10px;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mob-panel-header .count { font-size: 10px; color: var(--text-3); }
+
+.mob-row { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.mob-row .dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: var(--border-2); }
+.mob-row.hostile .dot { background: var(--danger); }
+.mob-row .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.mob-row.hostile .name { color: var(--text); }
+.mob-row .meta { flex: 0 0 auto; font-size: 10px; color: var(--text-3); }
+
+.mob-empty { font-size: 11px; color: var(--text-3); }
+.mob-more { font-size: 10px; color: var(--text-3); }
+
 /* Alvo do clique no terreno (âmbar = planejado): coordenadas + ações. Fica
  * acima e centralizado no bloco escolhido — a posição vem do `viewer3d.ts`,
  * que projeta o ponto 3D na tela a cada frame. */
@@ -621,6 +697,77 @@ table.item-table th {
 }
 table.item-table td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--text-2); }
 table.item-table td.num { text-align: right; }
+
+/* ---------- Configurações (aba Config) ---------- */
+
+.config-view { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; }
+
+.config-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.config-header h1 { font-size: 13px; color: var(--text); }
+.config-status { font-size: 11px; color: var(--text-3); }
+.config-status.error { color: var(--danger); }
+
+.config-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px 18px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 860px;
+}
+
+.config-section { display: flex; flex-direction: column; gap: 8px; }
+
+.config-section > h2 {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+
+.config-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.config-info { flex: 1 1 auto; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.config-label { font-size: 12px; color: var(--text); }
+.config-detail { font-size: 11px; color: var(--text-3); max-width: 520px; line-height: 1.45; }
+
+.config-control { flex: 0 0 auto; display: flex; align-items: center; gap: 10px; }
+.config-value { font-size: 11px; color: var(--text-2); min-width: 88px; text-align: right; }
+
+.config-row input[type="range"] { width: 150px; accent-color: var(--amber); }
+.config-row input[type="range"]:disabled { opacity: 0.45; }
+
+.config-select {
+  background: var(--bg-base);
+  border: 1px solid var(--border-2);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 7px;
+  cursor: pointer;
+}
+.config-select:focus { outline: none; border-color: var(--amber); }
+.config-select:disabled { opacity: 0.45; cursor: default; }
+
+.config-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 /* ---------- Status pill ---------- */
 

@@ -37,16 +37,57 @@ import {
  */
 
 const BLOCK_TEXTURE_PX = 16; // resolução dos tiles do atlas (frames 32×32 são reduzidos lá)
-// Céu: o addon ainda não manda a hora do mundo, então o viewer não cicla
-// dia/noite (ver "Known gaps" no README) — este gradiente é uma aproximação
-// fixa de dia claro. O horizonte é também a cor do fog e do canvas: é nele
-// que o terreno distante se dissolve.
-const SKY_ZENITH = "#2f6ba8";
-const SKY_MID = "#6f9cc9";
-const SKY_HORIZON = "#c2d6e8";
+// Céu e ciclo de dia/noite: o addon manda a hora real do mundo 1x/s
+// (`world_time`, ticks 0..23999 — 0 = nascer do sol, 6000 = meio-dia, 12000 =
+// pôr do sol, 18000 = meia-noite), o viewer interpola a 20 ticks/s (como o
+// jogo) e move sol, lua, luz ambiente e o gradiente do céu. Sem hora
+// conhecida (jogo fechado, app recém-aberto), fica no meio-dia fixo — não
+// inventa um ciclo. O horizonte é também a cor do fog e do canvas: é nele que
+// o terreno distante se dissolve.
+const SKY_DAY = { zenith: 0x2f6ba8, mid: 0x6f9cc9, horizon: 0xc2d6e8 };
+const SKY_NIGHT = { zenith: 0x050a18, mid: 0x0a1226, horizon: 0x141d30 };
+/** Tom quente do horizonte no nascer/pôr do sol (pico quando o sol cruza o
+ * horizonte) — é o laranja que o céu do jogo ganha nesses momentos. */
+const SKY_TWILIGHT = 0xe8955a;
+/** Paletas de luz do ciclo: `LOW` = sol rasante, `HIGH` = meio-dia. */
+const SUN_COLOR_LOW = 0xff9e63;
+const SUN_COLOR_HIGH = 0xfff4e0;
+const MOON_COLOR = 0x9db4e8;
+const AMBIENT_DAY = 0.55; // era a luz fixa antiga
+const AMBIENT_NIGHT = 0.13;
+const MOON_INTENSITY = 0.1;
+// 1 dia do jogo = 24000 ticks = 20 min reais; a hora local anda 20 ticks por
+// segundo entre as mensagens do addon.
+const TICKS_PER_SECOND = 20;
+const TICKS_PER_DAY = 24000;
+const DEFAULT_DAY_TIME = 6000; // meio-dia fixo quando não há hora real
+/** Céu/fog não precisam ser recoloridos a cada frame — o ciclo é lento. */
+const SKY_REPAINT_MS = 500;
+const SUN_DISTANCE = 300;
 /** Raio do domo de céu: dentro do `far` da câmera (5000) e maior que o
  * `maxDistance` do OrbitControls (2000), pra nunca cortar terreno. */
 const SKY_RADIUS = 3000;
+
+// Cores pré-alocadas do ciclo: `updateDayNight` roda por frame e não pode
+// alocar `THREE.Color` a cada chamada.
+const SKY_DAY_ZENITH = new THREE.Color(SKY_DAY.zenith);
+const SKY_DAY_MID = new THREE.Color(SKY_DAY.mid);
+const SKY_DAY_HORIZON = new THREE.Color(SKY_DAY.horizon);
+const SKY_NIGHT_ZENITH = new THREE.Color(SKY_NIGHT.zenith);
+const SKY_NIGHT_MID = new THREE.Color(SKY_NIGHT.mid);
+const SKY_NIGHT_HORIZON = new THREE.Color(SKY_NIGHT.horizon);
+const SKY_TWILIGHT_COLOR = new THREE.Color(SKY_TWILIGHT);
+const SUN_COLOR_LOW_C = new THREE.Color(SUN_COLOR_LOW);
+const SUN_COLOR_HIGH_C = new THREE.Color(SUN_COLOR_HIGH);
+const AMBIENT_DAY_COLOR = new THREE.Color(0xffffff);
+const AMBIENT_NIGHT_COLOR = new THREE.Color(MOON_COLOR);
+
+/** Interpolação suave (Hermite) entre dois limiares — usada pra transformar
+ * a elevação do sol num fator de luz do dia contínuo. */
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
 const COLOR_TEAL = 0x5eead4; // token `--teal` do SPEC ("estado atual/progresso")
 // token `--amber` do SPEC ("ação planejada"): camada de edição do editor e
 // alvo clicado da fila.
@@ -88,45 +129,79 @@ const MOVE_KEYS = new Set([
 // usuário se afastava.
 const FOG_NEAR_BASE = 60;
 const FOG_FAR_BASE = 260;
+/** Início do fog como fração do fim — a aba Config expõe só a distância do
+ * horizonte (`fog_far`), e o início acompanha nessa proporção. */
+const FOG_NEAR_RATIO = FOG_NEAR_BASE / FOG_FAR_BASE;
 
 // Perseguição do jogador: a pose real chega 4x/s (ver `addon_socket.rs`), e
 // estes valores são o que evita o modelo "piscar" de posição em posição — o
 // alvo é interpolado a cada frame (constante de tempo ~83ms com 12), e um
 // salto grande (reconexão, `/tp`) encaixa direto em vez de deslizar pelo mapa.
-const BOT_FOLLOW_RATE = 12; // 1/s
+// O addon manda `bot_pose` a cada 250 ms (mesma cadência do `POSE_INTERVAL_MS`
+// no `main.ts`); o follow do boneco cobre a distância da pose no intervalo real
+// entre elas, em velocidade constante — chegando exato no alvo, sem a
+// aproximação exponencial que nunca fechava a conta e deixava o boneco
+// deslizando depois que o bot parava. O teto evita que um ajuste grande (mas
+// abaixo do teleporte) vire um borrão.
+const BOT_FOLLOW_INTERVAL_FALLBACK = 0.25; // s — primeira pose, sem histórico
+const BOT_FOLLOW_MAX_SPEED = 40; // blocos/s
 const BOT_TELEPORT_DISTANCE = 8; // blocos
 const BOT_CAMERA_HEIGHT = 1; // altura do alvo da órbita (peito do jogador)
 const PLAYER_HEAD_HEIGHT = 2.25; // rótulo de coordenadas acima da cabeça
 
-// Aproximação, não tint real por bioma (isso exigiria saber o bioma da
-// coluna e amostrar o colormap/JSON de bioma — não implementado, ver
-// docs/SPEC.md "Blocos 3D"). "grass_block_top" vem cinza no jar por design
-// (RGB médio 147,147,147, R=G=B); sem isso ficaria tudo cinza de novo.
-// Só o topo leva tint: o lado ("grass_block_side") já vem com a franja verde
-// impressa na própria textura, sobre a terra.
-const GRASS_TINT = 0x79c05a;
+// Marcadores de mob (`nearby_mobs`): a posição chega 4x/s e é interpolada a
+// cada frame, como a pose do bot — sem isso os rótulos piscariam de posição
+// em posição. Um salto grande é teleporte (enderman) ou id reciclado: encaixa
+// direto em vez de deslizar pelo mapa.
+const MOB_FOLLOW_RATE = 10; // 1/s
+const MOB_TELEPORT_DISTANCE = 16; // blocos
+const MOB_LABEL_GAP = 0.4; // acima da hitbox do mob (que já tem altura própria)
 
-// Mesma ideia do GRASS_TINT, pras outras texturas que vêm cinza no jar e que
-// o jogo colore em runtime: tom de folhagem/água "floresta/plains", não a cor
-// exata do bioma da coluna. Espécies cuja textura já vem colorida no arquivo
-// (cerejeira, azaleia, carvalho-pálido) ficam de fora de propósito — tint
-// nelas só escureceria uma cor que já está certa.
+// Cores reais de bioma chegam no payload v3, por coluna (`ChunkTints`): grama,
+// folhagem e água com a mesma cor que o `BiomeColors` do jogo resolve pra
+// renderização (colormap + modificador de bioma já aplicados). Os valores
+// abaixo são só o fallback de payload antigo/sem tint — um tom temperado
+// médio, nunca a cor de um bioma específico. Ver docs/SPEC.md "Blocos 3D".
+const GRASS_TINT = 0x79c05a;
 const FOLIAGE_TINT = 0x59ae30;
 const WATER_TINT = 0x3f76e4;
+
+/** Blocos cuja cor o jogo resolve pelo `BlockColors` (26.3): `grass` e
+ * `foliage` vêm do tint de bioma da coluna; sem tint no payload, caem no
+ * fallback acima. Espécies cuja textura já vem colorida no arquivo (cerejeira,
+ * azaleia, carvalho-pálido) ficam de fora de propósito — tint nelas só
+ * escureceria uma cor que já está certa. O topo do `grass_block` é tingido; o
+ * lado leva tint só na camada de overlay (ver `GRASS_SIDE_OVERLAY`). */
+const BLOCK_TINT_KIND: Record<string, "grass" | "foliage"> = {
+  grass_block: "grass",
+  lily_pad: "grass", // o jogo usa a cor de grama no lírio
+  sugar_cane: "grass",
+  oak_leaves: "foliage",
+  jungle_leaves: "foliage",
+  acacia_leaves: "foliage",
+  dark_oak_leaves: "foliage",
+  mangrove_leaves: "foliage",
+  vine: "foliage",
+};
+
+/** Cores fixas do jogo pra blocos que não dependem de bioma — mesmos valores
+ * de `BlockColors.createDefault()` no 26.3 (em `0xRRGGBB`). */
 const BLOCK_TINTS: Record<string, number> = {
-  oak_leaves: FOLIAGE_TINT,
-  jungle_leaves: FOLIAGE_TINT,
-  acacia_leaves: FOLIAGE_TINT,
-  dark_oak_leaves: FOLIAGE_TINT,
-  mangrove_leaves: FOLIAGE_TINT,
-  vine: FOLIAGE_TINT,
-  lily_pad: GRASS_TINT, // o jogo usa a cor de grama no lírio
-  spruce_leaves: 0x619961, // cor fixa no jogo, não vem do bioma
+  spruce_leaves: 0x619961,
   birch_leaves: 0x80a755,
   // Modelo de fio de redstone tem `tintindex` e a cor real depende da
   // energia; usa o vermelho de potência máxima como aproximação.
   redstone_wire: 0xff0000,
 };
+
+/** Segunda camada do lado do `grass_block` no modelo vanilla: a base
+ * (`grass_block_side`) é terra com uma franja clara, e por cima vem
+ * `grass_block_side_overlay` — cinza no arquivo, tingida com a cor de grama do
+ * bioma. Sem ela os lados da grama não acompanhavam o bioma (só o topo). O
+ * jogo desenha as duas coincidentes; aqui a de cima sai um fio ao longo da
+ * normal pra não brigar no z-buffer. */
+const GRASS_SIDE_OVERLAY = "grass_block_side_overlay";
+const GRASS_SIDE_OVERLAY_OFFSET = 0.002;
 
 /** Blocos cujo nome não bate com o nome da textura no jar: água/lava/fogo
  * são animados (`water_still`, `fire_0`) e o atlas guarda todos os frames,
@@ -163,8 +238,13 @@ const COLOR_UNKNOWN_BLOCK = 0x3a3f47;
  * `map`, então o valor não importa — só precisa existir. */
 const NO_ATLAS_RECT: UvRect = { u0: 0, v0: 0, u1: 1, v1: 1 };
 
-// Flags do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
-const VOXEL_FORMAT_VERSION = 3;
+// Flags/versão do payload binário de `chunk_voxels` — espelham `world_cache.rs`.
+// v4 = seções + props do blockstate + tints de bioma por coluna; v3 (sem
+// props) e v2 (sem tints) ainda são aceitos na leitura pro `world.cache`
+// gravado antes/addon desatualizado, caindo no fallback fixo.
+const VOXEL_FORMAT_VERSION = 4;
+const VOXEL_FORMAT_VERSION_LEGACY = 3;
+const VOXEL_FORMAT_VERSION_LEGACY_2 = 2;
 const VOXEL_FLAG_RENDER = 1;
 const VOXEL_FLAG_OCCLUDES = 2;
 const VOXEL_FLAG_FLUID = 4;
@@ -186,9 +266,10 @@ export const CHUNKS_PER_REFRESH = 16;
  * persistido (que cresce sem limite). */
 export const NEARBY_CHUNK_LIMIT = 1024;
 
-/** Orçamento de CPU por frame pra montar malhas de chunk, em ms. Um backfill
- * pode enfileirar centenas de chunks; montar todos de uma vez derruba o fps,
- * então a fila é drenada em pedaços por frame. */
+/** Orçamento de CPU por frame pra montar malhas de chunk, em ms — padrão do
+ * app; a aba Config pode mudar (`applySettings`). Um backfill pode enfileirar
+ * centenas de chunks; montar todos de uma vez derruba o fps, então a fila é
+ * drenada em pedaços por frame. */
 const MESH_BUDGET_MS = 8;
 
 export interface BotPos {
@@ -204,6 +285,27 @@ export interface BotPose {
   z: number;
   yaw: number;
   pitch: number;
+}
+
+/** Categoria do mob, classificada pelo addon a partir do tipo real do jogo —
+ *  ver `MobCategory` em `src-tauri/src/mobs.rs`. */
+export type MobCategory = "hostile" | "neutral" | "passive" | "other";
+
+/** Um mob vivo ao redor do bot (comando `nearby_mobs`, espelha `NearbyMob` em
+ *  `src-tauri/src/mobs.rs`). Posição em blocos (double), `distance` já é a
+ *  distância real até o jogador medida pelo addon na varredura. */
+export interface NearbyMob {
+  id: number;
+  kind: string;
+  name: string;
+  category: MobCategory;
+  x: number;
+  y: number;
+  z: number;
+  health: number;
+  max_health: number;
+  height: number;
+  distance: number;
 }
 
 export interface ChunkPos {
@@ -227,6 +329,20 @@ export interface BlockPos {
 /** Ferramenta ativa do editor de schematic. `null` = viewer puro (clique não
  * edita nada). */
 export type EditMode = "select" | "place" | "break";
+
+/** Preferências do viewer vindas da aba Config (comando `settings_get`, ver
+ * `src-tauri/src/settings.rs`). O backend já prende os valores na faixa
+ * válida — o viewer só aplica o que chegou. */
+export interface ViewerSettings {
+  /** Distância (blocos) em que o fog fecha o horizonte. */
+  fogFar: number;
+  /** Orçamento por frame (ms) pra montar malhas de chunk. */
+  meshBudgetMs: number;
+  /** Teto do device pixel ratio do canvas. */
+  maxPixelRatio: number;
+  /** Teto de FPS — 0 = sem limite (vsync). */
+  fpsCap: number;
+}
 
 /** Uma edição da camada de pintura: `block = null` = quebrar (vira ar). O
  * frontend manda isso inteiro em `schematic_apply` e o diff real acontece no
@@ -262,11 +378,38 @@ interface DecodedSection {
   indices: Uint16Array;
 }
 
+/** Tints de bioma por coluna (payload v3): cor `0xRRGGBB` por coluna
+ * (`lx + lz*16`, a mesma ordem dos índices das seções), já resolvida pelo
+ * addon com o `BiomeColors` do client. `null` = payload v2 ou sem dados — o
+ * viewer cai nas cores fixas (`GRASS_TINT` e companhia). */
+interface ChunkTints {
+  grass: Uint32Array;
+  foliage: Uint32Array;
+  water: Uint32Array;
+}
+
+/** Uma coluna do chunk tem `x + z*16` — os tint maps seguem essa ordem. */
+const TINT_COLUMNS = 256;
+
 interface DecodedChunk {
   x: number;
   z: number;
   /** Seção Y (mundo / 16) → seção; ausente = ar. */
   sections: Map<number, DecodedSection>;
+  /** Tints de bioma por coluna; `null` = chunk sem essa informação. */
+  tints: ChunkTints | null;
+}
+
+/** Estado de um marcador de mob: o rótulo HTML, o último snapshot recebido e
+ *  as posições desenhada (interpolada) e alvo — ver
+ *  `setNearbyMobs`/`updateMobs`. */
+interface MobMarker {
+  el: HTMLDivElement;
+  nameEl: HTMLSpanElement;
+  metaEl: HTMLSpanElement;
+  mob: NearbyMob;
+  target: THREE.Vector3;
+  position: THREE.Vector3;
 }
 
 /** Uma face do cubo, na ordem dos vértices em sentido anti-horário visto de
@@ -381,15 +524,16 @@ interface MeshBuffers {
   indices: number[];
 }
 
-/** UVs já no espaço do atlas (flat) + tint linear, cacheados por (bloco,
- * face do cubo) — o laço de meshing roda uma vez por face exposta e refazer
- * string + rect + conversão de cor a cada iteração era o grosso do custo
- * num chunk denso. */
+/** UVs já no espaço do atlas (flat) + se veio de textura real, cacheados por
+ * (bloco, face do cubo) — o laço de meshing roda uma vez por face exposta e
+ * refazer string + rect a cada iteração era o grosso do custo num chunk denso.
+ * A cor não entra aqui: desde os tints por coluna ela varia dentro do chunk
+ * (ver `faceTint`). */
 interface FaceRender {
   uv: number[];
-  r: number;
-  g: number;
-  b: number;
+  /** Veio de textura real do atlas (`faceRect`) — bloco sem textura sai cinza
+   * neutro em vez de fingir que é outro bloco. */
+  known: boolean;
 }
 
 /** Rect resolvido de uma face + se veio de textura real do atlas (`known`)
@@ -422,11 +566,15 @@ function byteReader(bytes: Uint8Array) {
   };
 }
 
-/** Decodifica o payload de `chunk_voxels` (formato 2, ver `world_cache.rs`). */
+/** Decodifica o payload de `chunk_voxels` (formato 3, ver `world_cache.rs` —
+ * v2, sem tints, ainda é aceito pro cache antigo). */
 function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
   const reader = byteReader(bytes);
   const version = reader.u8();
-  if (version !== VOXEL_FORMAT_VERSION) {
+  const isCurrent = version === VOXEL_FORMAT_VERSION;
+  const isLegacy = version === VOXEL_FORMAT_VERSION_LEGACY;
+  const isLegacy2 = version === VOXEL_FORMAT_VERSION_LEGACY_2;
+  if (!isCurrent && !isLegacy && !isLegacy2) {
     throw new Error(`versão de payload desconhecida: ${version}`);
   }
   const sectionCount = reader.u8();
@@ -441,15 +589,41 @@ function decodeVoxels(x: number, z: number, bytes: Uint8Array): DecodedChunk {
       const block = reader.utf8(nameLen);
       const flags = reader.u8();
       const level = reader.u8();
-      const propsLen = reader.u16();
-      const props = propsLen > 0 ? reader.utf8(propsLen) : "";
+      // Props do blockstate só existem a partir da v4 (addon atual); cache
+      // antigo / addon desatualizado vem sem e usa o cubo.
+      const props = isCurrent
+        ? (() => {
+            const propsLen = reader.u16();
+            return propsLen > 0 ? reader.utf8(propsLen) : "";
+          })()
+        : "";
       palette.push({ block, flags, level, props });
     }
     const indices = new Uint16Array(4096);
     for (let idx = 0; idx < 4096; idx++) indices[idx] = reader.u16();
     sections.set(y, { y, palette, indices });
   }
-  return { x, z, sections };
+
+  let tints: ChunkTints | null = null;
+  if (!isLegacy2) {
+    const hasTints = reader.u8();
+    if (hasTints === 1) {
+      const readColumns = () => {
+        const columns = new Uint32Array(TINT_COLUMNS);
+        for (let column = 0; column < TINT_COLUMNS; column++) {
+          const r = reader.u8();
+          const g = reader.u8();
+          const b = reader.u8();
+          columns[column] = (r << 16) | (g << 8) | b;
+        }
+        return columns;
+      };
+      tints = { grass: readColumns(), foliage: readColumns(), water: readColumns() };
+    } else if (hasTints !== 0) {
+      throw new Error(`flag de tints inválida: ${hasTints}`);
+    }
+  }
+  return { x, z, sections, tints };
 }
 
 export class Viewer3D {
@@ -459,6 +633,15 @@ export class Viewer3D {
   private controls: OrbitControls;
   private container: HTMLElement;
   private fog: THREE.Fog;
+
+  // Preferências da aba Config (ver `applySettings`). Os valores iniciais são
+  // os padrões do backend (`src-tauri/src/settings.rs`); `main.ts` substitui
+  // assim que o `settings_get` responde.
+  private fogFar = FOG_FAR_BASE;
+  private meshBudgetMs = MESH_BUDGET_MS;
+  private maxPixelRatio = 2;
+  private fpsCap = 0;
+  private lastRenderMs = 0;
 
   /** Chunks decodificados (voxels crus), chave = `chunkKey`. */
   private chunks = new Map<number, DecodedChunk>();
@@ -473,8 +656,23 @@ export class Viewer3D {
   private playerModel = new MinecraftPlayerModel();
   /** Alvo da interpolação da pose; `null` = sem jogador. */
   private targetBotPos: THREE.Vector3 | null = null;
+  /** Velocidade do follow do boneco (blocos/s), calculada na última pose pra
+   * cobrir a distância no intervalo real entre poses — ver `setBotPose`. */
+  private followSpeed = 0;
+  /** Timestamp (ms) da última pose recebida; 0 = sem histórico ainda. */
+  private lastPoseAtMs = 0;
   private botYaw = 0;
   private botPitch = 0;
+
+  /** Rótulos dos mobs vivos ao redor (comando `nearby_mobs`), chave = id de
+   *  rede da entidade — ver `setNearbyMobs`. */
+  private readonly mobMarkers = new Map<number, MobMarker>();
+  /** Camada dos rótulos de mob — mesmo padrão do `bot-label` (HTML projetado
+   *  por cima do canvas), um elemento por mob. */
+  private readonly mobLayer: HTMLDivElement;
+  /** Scratch da projeção dos rótulos (`updateMobLabels`) — evita alocar um
+   *  `Vector3` por mob por frame. */
+  private readonly mobScratch = new THREE.Vector3();
 
   private labelEl: HTMLDivElement;
 
@@ -586,16 +784,39 @@ export class Viewer3D {
   private animationFrame = 0;
   private lastAnimationMs = 0;
   private readonly scratchColor = new THREE.Color();
+  /** Cache `0xRRGGBB` → componentes lineares — ver `linearColor`. */
+  private readonly linearColorCache = new Map<number, [number, number, number]>();
   /** Domo de céu com gradiente, sempre centrado na câmera — ver `updateSky`. */
   private sky: THREE.Mesh;
+  /** Canvas/textura do gradiente do domo — `paintSky` redesenha os dois. */
+  private skyCanvas: HTMLCanvasElement | null = null;
+  private skyTexture: THREE.CanvasTexture | null = null;
+  /** Hora do mundo (ticks 0..23999) e se o addon está reportando agora. Sem
+   * jogo, a hora congela na última real; sem nenhuma, vale `DEFAULT_DAY_TIME`. */
+  private worldTime: number | null = null;
+  private worldTimeLive = false;
+  private lastSkyPaintMs = -Infinity;
+  /** Luzes do ciclo dia/noite — ver `updateDayNight`. */
+  private ambientLight: THREE.AmbientLight;
+  private sunLight: THREE.DirectionalLight;
+  private moonLight: THREE.DirectionalLight;
+  private readonly dayNightA = new THREE.Color();
+  private readonly dayNightB = new THREE.Color();
+  private readonly dayNightC = new THREE.Color();
 
   constructor(container: HTMLElement, labelEl: HTMLDivElement, targetEl: HTMLDivElement) {
     this.container = container;
     this.labelEl = labelEl;
     this.targetEl = targetEl;
 
+    // Camada dos rótulos de mob: filha do mesmo overlay do `bot-label` — o
+    // canvas (e o container) troca entre viewer/editor, o overlay não.
+    this.mobLayer = document.createElement("div");
+    this.mobLayer.className = "mob-layer";
+    (labelEl.parentElement ?? container).appendChild(this.mobLayer);
+
     this.scene = new THREE.Scene();
-    this.fog = new THREE.Fog(SKY_HORIZON, FOG_NEAR_BASE, FOG_FAR_BASE);
+    this.fog = new THREE.Fog(SKY_DAY.horizon, FOG_NEAR_BASE, FOG_FAR_BASE);
     this.scene.fog = this.fog;
 
     // `far` acompanha o `maxDistance` do OrbitControls: com o zoom livre
@@ -606,12 +827,17 @@ export class Viewer3D {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     // O domo cobre a tela; isto é o fundo de segurança (o que aparece antes do
     // primeiro frame), por isso a cor do horizonte.
-    this.renderer.setClearColor(SKY_HORIZON, 1);
+    this.renderer.setClearColor(SKY_DAY.horizon, 1);
     container.appendChild(this.renderer.domElement);
 
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.08;
+    // Inércia curta: soltando o mouse, a órbita para em ~0,4 s em vez de
+    // continuar girando por segundos.
+    this.controls.dampingFactor = 0.22;
+    // Rotação por arrasto um pouco menos sensível — um arrasto curto não
+    // joga a câmera pro outro lado do bot.
+    this.controls.rotateSpeed = 0.8;
     // Zoom livre na prática: antes travava em 8–400 blocos (não dava pra
     // chegar perto de um bloco pra inspecionar nem ver o relevo de longe).
     this.controls.minDistance = 1.5;
@@ -645,10 +871,15 @@ export class Viewer3D {
       this.hoverHelper.visible = false;
     });
 
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-    const sun = new THREE.DirectionalLight(0xffffff, 0.5);
-    sun.position.set(80, 120, 40);
-    this.scene.add(sun);
+    // Luzes do ciclo dia/noite — posição/intensidade/cor reais em
+    // `updateDayNight` (o construtor só deixa a cena num dia neutro).
+    this.ambientLight = new THREE.AmbientLight(0xffffff, AMBIENT_DAY);
+    this.scene.add(this.ambientLight);
+    this.sunLight = new THREE.DirectionalLight(0xffffff, 0.5);
+    this.sunLight.position.set(80, 120, 40);
+    this.scene.add(this.sunLight);
+    this.moonLight = new THREE.DirectionalLight(MOON_COLOR, 0);
+    this.scene.add(this.moonLight);
 
     this.sky = this.buildSky();
     this.scene.add(this.sky);
@@ -736,15 +967,6 @@ export class Viewer3D {
     const canvas = document.createElement("canvas");
     canvas.width = 2;
     canvas.height = 256;
-    const ctx = canvas.getContext("2d")!;
-    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
-    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
-    gradient.addColorStop(0, SKY_ZENITH);
-    gradient.addColorStop(0.55, SKY_MID);
-    gradient.addColorStop(1, SKY_HORIZON);
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
     const texture = new THREE.CanvasTexture(canvas);
     texture.colorSpace = THREE.SRGBColorSpace;
     const sky = new THREE.Mesh(
@@ -758,7 +980,27 @@ export class Viewer3D {
       })
     );
     sky.frustumCulled = false; // está sempre na câmera — nunca cullar
+    this.skyCanvas = canvas;
+    this.skyTexture = texture;
+    // Estado inicial (dia claro); `updateDayNight` repinta conforme a hora.
+    this.paintSky(SKY_DAY_ZENITH, SKY_DAY_MID, SKY_DAY_HORIZON);
     return sky;
+  }
+
+  /** Redesenha o gradiente do domo (2×256) e reenvia pra GPU. Só é chamado a
+   * cada `SKY_REPAINT_MS` — o ciclo é lento e o domo não precisa de 60fps. */
+  private paintSky(zenith: THREE.Color, mid: THREE.Color, horizon: THREE.Color) {
+    const canvas = this.skyCanvas;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx || !this.skyTexture) return;
+    // FlipY padrão do CanvasTexture: o topo da imagem cai no topo da esfera.
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    gradient.addColorStop(0, `#${zenith.getHexString()}`);
+    gradient.addColorStop(0.55, `#${mid.getHexString()}`);
+    gradient.addColorStop(1, `#${horizon.getHexString()}`);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    this.skyTexture.needsUpdate = true;
   }
 
   /** Chave numérica (x,z): o mundo do Minecraft cabe em |x|,|z| < 30M, então
@@ -869,8 +1111,14 @@ export class Viewer3D {
         // imagem (igual ao canvas), e é assim que o mapa é montado aqui.
         texture.flipY = false;
         texture.magFilter = THREE.NearestFilter;
-        texture.minFilter = THREE.NearestFilter;
-        texture.generateMipmaps = false;
+        // Mipmaps com folga no atlas (ver `texture_atlas.rs`): sem mipmap,
+        // cada bloco distante amostra um texel diferente do vizinho e o
+        // terreno ganha uma grade/"separação" visível de longe; com ele, as
+        // faces convergem pro mesmo tom médio. `NearestMipmapLinear` mantém o
+        // pixel nítido de perto e só mistura entre níveis na minificação.
+        texture.minFilter = THREE.NearestMipmapLinearFilter;
+        texture.generateMipmaps = true;
+        texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
         texture.colorSpace = THREE.SRGBColorSpace;
         texture.needsUpdate = true;
 
@@ -924,8 +1172,11 @@ export class Viewer3D {
     // é como a tabela de UVs das faces foi montada.
     texture.flipY = false;
     texture.magFilter = THREE.NearestFilter;
-    texture.minFilter = THREE.NearestFilter;
-    texture.generateMipmaps = false;
+    // Tile avulso (frames de fluido): pode ter mipmap sem risco de folga —
+    // não há tile vizinho pra vazar.
+    texture.minFilter = THREE.NearestMipmapLinearFilter;
+    texture.generateMipmaps = true;
+    texture.anisotropy = Math.min(4, this.renderer.capabilities.getMaxAnisotropy());
     texture.colorSpace = THREE.SRGBColorSpace;
     return texture;
   }
@@ -1006,11 +1257,32 @@ export class Viewer3D {
     return resolved;
   }
 
-  /** Tint por vértice: só o topo da grama e as folhagens que vêm cinza no
-   * jar; o resto é branco (textura já colorida). */
-  private faceTint(blockName: string, face: BlockFace): number {
-    if (blockName === "grass_block") return face === "top" ? GRASS_TINT : 0xffffff;
+  /** Cor (`0xRRGGBB`) de uma face do bloco como o jogo resolve: texturas
+   * cinzas (grama, folhagem) levam o tint de bioma da coluna quando o chunk
+   * trouxe os tints (payload v3) — senão o fallback fixo aproximado. O resto
+   * sai branco (a textura já é colorida). */
+  private faceTint(blockName: string, face: BlockFace, column: number, tints: ChunkTints | null): number {
+    const kind = BLOCK_TINT_KIND[blockName];
+    if (kind === "grass") {
+      // No grass_block o lado é terra + overlay (camada própria, tingida em
+      // `buildChunkMesh`); aqui só o topo leva tint.
+      if (blockName === "grass_block" && face !== "top") return 0xffffff;
+      return this.grassTintAt(column, tints);
+    }
+    if (kind === "foliage") return this.foliageTintAt(column, tints);
     return BLOCK_TINTS[blockName] ?? 0xffffff;
+  }
+
+  private grassTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.grass[column] : GRASS_TINT;
+  }
+
+  private foliageTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.foliage[column] : FOLIAGE_TINT;
+  }
+
+  private waterTintAt(column: number, tints: ChunkTints | null): number {
+    return tints ? tints.water[column] : WATER_TINT;
   }
 
   private buildMaterials() {
@@ -1041,7 +1313,10 @@ export class Viewer3D {
     const water = kind === "water";
     const material = new THREE.MeshStandardMaterial({
       map: frames[0] ?? null,
-      color: water ? WATER_TINT : 0xffffff,
+      // O tint da água é por coluna (bioma, ver `meshFluidFace`) e chega por
+      // vértice; lava não tem tint (branco).
+      color: 0xffffff,
+      vertexColors: true,
       roughness: water ? 0.35 : 0.6,
       metalness: 0,
       // Água é translúcida e não escreve no z-buffer (como no jogo); lava é
@@ -1191,7 +1466,8 @@ export class Viewer3D {
 
   /** Adiciona um quad (2 triângulos) de uma face com UVs já flat (8 números),
    * sem alocar nada por face. `low`/`high` recortam a altura local (0..1) —
-   * usado pra superfície rebaixada de fluido. */
+   * usado pra superfície rebaixada de fluido. `color` é `0xRRGGBB` e `offset`
+   * desloca o quad ao longo da normal da face (camada de overlay). */
   private pushQuadFlat(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1201,15 +1477,22 @@ export class Viewer3D {
     low: number,
     high: number,
     uv: readonly number[],
-    r: number,
-    g: number,
-    b: number
+    color: number,
+    offset = 0
   ) {
     const face = FACES[faceIndex];
+    const [r, g, b] = this.linearColor(color);
+    const offsetX = face.dir[0] * offset;
+    const offsetY = face.dir[1] * offset;
+    const offsetZ = face.dir[2] * offset;
     const base = buffers.positions.length / 3;
     for (let i = 0; i < 4; i++) {
       const corner = face.corners[i];
-      buffers.positions.push(x + corner[0], y + (corner[1] === 1 ? high : low), z + corner[2]);
+      buffers.positions.push(
+        x + corner[0] + offsetX,
+        y + (corner[1] === 1 ? high : low) + offsetY,
+        z + corner[2] + offsetZ
+      );
       buffers.normals.push(face.dir[0], face.dir[1], face.dir[2]);
       buffers.uvs.push(uv[i * 2], uv[i * 2 + 1]);
       buffers.colors.push(r, g, b);
@@ -1217,17 +1500,38 @@ export class Viewer3D {
     buffers.indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
   }
 
-  /** UVs (flat, já no espaço do atlas) + tint linear de uma face do bloco,
-   * com cache por (bloco, face). `null` = face sem textura resolvida, pulada
-   * sem quebrar o chunk. */
-  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+  /** Componentes lineares de uma cor `0xRRGGBB`: o `THREE.Color` converte
+   * sRGB→linear no `setHex`, e o meshing não pode pagar essa conversão por
+   * face — o cache guarda o conjunto de cores em uso (com os tints de bioma
+   * são algumas centenas). */
+  private linearColor(hex: number): readonly [number, number, number] {
+    let linear = this.linearColorCache.get(hex);
+    if (!linear) {
+      this.scratchColor.setHex(hex);
+      const components: [number, number, number] = [
+        this.scratchColor.r,
+        this.scratchColor.g,
+        this.scratchColor.b,
+      ];
+      this.linearColorCache.set(hex, components);
+      linear = components;
+    }
+    return linear;
+  }
+
+  /** UVs (flat, já no espaço do atlas) de uma face do bloco, com cache por
+   * (bloco, face). `null` = face sem textura resolvida, pulada sem quebrar o
+   * chunk. `requireKnown` = só aceita textura real do atlas (usado pela
+   * camada de overlay do grass_block: sem a textura, melhor não desenhar nada
+   * do que um retângulo de fallback). */
+  private cachedFaceRender(blockName: string, faceIndex: number, requireKnown: boolean): FaceRender | null {
     const key = `${blockName}|${faceIndex}`;
     if (this.faceRenderCache.has(key)) return this.faceRenderCache.get(key)!;
 
     const face = FACES[faceIndex];
     const resolved = this.faceRect(blockName, face.kind);
     let render: FaceRender | null = null;
-    if (resolved) {
+    if (resolved && (!requireKnown || resolved.known)) {
       const rect = resolved.rect;
       const uv = new Array<number>(8);
       for (let i = 0; i < 4; i++) {
@@ -1235,20 +1539,24 @@ export class Viewer3D {
         uv[i * 2] = rect.u0 + u * (rect.u1 - rect.u0);
         uv[i * 2 + 1] = rect.v0 + v * (rect.v1 - rect.v0);
       }
-      // Sem textura real (bloco de mod, atlas degradado): cinza neutro em vez
-      // da textura de outro bloco.
-      this.scratchColor.setHex(
-        resolved.known ? this.faceTint(blockName, face.kind) : COLOR_UNKNOWN_BLOCK
-      );
-      render = { uv, r: this.scratchColor.r, g: this.scratchColor.g, b: this.scratchColor.b };
+      render = { uv, known: resolved.known };
     }
     this.faceRenderCache.set(key, render);
     return render;
   }
 
+  private faceRender(blockName: string, faceIndex: number): FaceRender | null {
+    return this.cachedFaceRender(blockName, faceIndex, false);
+  }
+
+  private grassOverlayRender(faceIndex: number): FaceRender | null {
+    return this.cachedFaceRender(GRASS_SIDE_OVERLAY, faceIndex, true);
+  }
+
   /** Uma face visível de fluido: mesma culling dos sólidos, mas face entre o
    * mesmo fluido só aparece quando o vizinho é mais raso (degrau d'água), e
-   * a altura sai do nível em vez de 0..1. */
+   * a altura sai do nível em vez de 0..1. `color` = tint do bioma (água) ou
+   * branco (lava). */
   private meshFluidFace(
     buffers: MeshBuffers,
     faceIndex: number,
@@ -1257,7 +1565,8 @@ export class Viewer3D {
     z: number,
     entry: PaletteEntry,
     neighbor: PaletteEntry | null,
-    flow: THREE.Vector3 | null
+    flow: THREE.Vector3 | null,
+    color: number
   ) {
     const ownHeight = fluidHeight(entry.level);
     let low = 0;
@@ -1282,9 +1591,7 @@ export class Viewer3D {
       low,
       high,
       FLUID_ROTATED_UV[faceIndex][rotation],
-      1,
-      1,
-      1
+      color
     );
   }
 
@@ -1305,8 +1612,14 @@ export class Viewer3D {
   /** Tint das faces com `tintindex >= 0` de um modelo real — mesma
    * aproximação fixa do caminho de cubo (ver `BLOCK_TINTS`); planta sem
    * entrada cai na cor de grama, que é o que o jogo faz por biome. */
-  private modelTint(block: string): number {
-    return BLOCK_TINTS[block] ?? GRASS_TINT;
+  /** Tint de uma face com `tintindex` de um modelo real: a cor de bioma da
+   * coluna quando o jogo usaria uma (grama/folhagem), senão a cor fixa —
+   * planta sem entrada no mapa cai na cor de grama, como no jogo. */
+  private modelFaceTint(blockName: string, column: number, tints: ChunkTints | null): number {
+    const kind = BLOCK_TINT_KIND[blockName];
+    if (kind === "grass") return this.grassTintAt(column, tints);
+    if (kind === "foliage") return this.foliageTintAt(column, tints);
+    return BLOCK_TINTS[blockName] ?? this.grassTintAt(column, tints);
   }
 
   /** Emite as faces de um modelo real (posições já vêm em 1/16 de pixel e
@@ -1319,15 +1632,14 @@ export class Viewer3D {
     x: number,
     y: number,
     z: number,
-    entry: PaletteEntry,
     geos: number[],
+    tintHex: number,
     blockAt: (x: number, y: number, z: number) => PaletteEntry | null
   ) {
     const models = this.blockModels!;
     const atlas = this.atlasUvByName;
     if (!atlas) return;
 
-    const tintHex = this.modelTint(entry.block);
     this.scratchColor.setHex(tintHex);
     const tintedR = this.scratchColor.r;
     const tintedG = this.scratchColor.g;
@@ -1441,13 +1753,17 @@ export class Viewer3D {
             const x = chunk.x * 16 + lx;
             const y = sectionY * 16 + ly;
             const z = chunk.z * 16 + lz;
+            // Coluna do chunk (ordem dos tints, `x + z*16`): de onde sai a cor
+            // de bioma da grama/folhagem/água.
+            const column = (lz << 4) | lx;
             const isFluid = (entry.flags & VOXEL_FLAG_FLUID) !== 0;
             if (!isFluid) {
               // Bloco com modelo real assado (tocha, cogumelo, escada...)
               // desenha as faces de verdade em vez do cubo cheio.
               const modelGeos = this.modelGeosFor(entry);
               if (modelGeos) {
-                this.meshModel(buffered("opaque"), x, y, z, entry, modelGeos, blockAt);
+                const modelTintHex = this.modelFaceTint(entry.block, column, chunk.tints);
+                this.meshModel(buffered("opaque"), x, y, z, modelGeos, modelTintHex, blockAt);
                 continue;
               }
             }
@@ -1465,7 +1781,8 @@ export class Viewer3D {
                   flow = this.fluidFlowVector(x, y, z, entry);
                   flowNeeded = false;
                 }
-                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow);
+                const fluidColor = entry.block === "water" ? this.waterTintAt(column, chunk.tints) : 0xffffff;
+                this.meshFluidFace(buffered(fluidBucket), f, x, y, z, entry, neighbor, flow, fluidColor);
                 continue;
               }
               // Sólido: face some se o vizinho é oclusor; oclusão entre
@@ -1477,7 +1794,31 @@ export class Viewer3D {
               }
               const render = this.faceRender(entry.block, f);
               if (!render) continue;
-              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, render.r, render.g, render.b);
+              // Sem textura real (bloco de mod, atlas degradado): cinza neutro
+              // em vez da textura de outro bloco.
+              const color = render.known
+                ? this.faceTint(entry.block, face.kind, column, chunk.tints)
+                : COLOR_UNKNOWN_BLOCK;
+              this.pushQuadFlat(buffered("opaque"), f, x, y, z, 0, 1, render.uv, color);
+              // Segunda camada do lado do grass_block no modelo vanilla:
+              // cinza no arquivo, tingida com a cor de grama do bioma.
+              if (entry.block === "grass_block" && face.kind === "side") {
+                const overlay = this.grassOverlayRender(f);
+                if (overlay) {
+                  this.pushQuadFlat(
+                    buffered("opaque"),
+                    f,
+                    x,
+                    y,
+                    z,
+                    0,
+                    1,
+                    overlay.uv,
+                    this.grassTintAt(column, chunk.tints),
+                    GRASS_SIDE_OVERLAY_OFFSET
+                  );
+                }
+              }
             }
           }
         }
@@ -1507,7 +1848,7 @@ export class Viewer3D {
     this.chunkMeshes.set(key, meshes);
   }
 
-  /** Monta no máximo `MESH_BUDGET_MS` de malhas por frame. Um backfill (ou o
+  /** Monta no máximo `meshBudgetMs` de malhas por frame. Um backfill (ou o
    * mundo persistido abrindo) enfileira centenas de chunks de uma vez;
    * montar tudo num tick só derrubava o fps, então a fila anda em pedaços —
    * o resto aparece nos frames seguintes, começando pelos mais próximos do
@@ -1521,7 +1862,7 @@ export class Viewer3D {
       this.queuedChunks.delete(key);
       const chunk = this.chunks.get(key);
       if (chunk && this.atlasUvByName) this.buildChunkMesh(chunk);
-    } while (this.meshQueue.length > 0 && performance.now() - start < MESH_BUDGET_MS);
+    } while (this.meshQueue.length > 0 && performance.now() - start < this.meshBudgetMs);
   }
 
   private disposeChunkMeshes(key: number) {
@@ -1549,6 +1890,8 @@ export class Viewer3D {
   setBotPose(pose: BotPose | null) {
     if (!pose) {
       this.targetBotPos = null;
+      this.followSpeed = 0;
+      this.lastPoseAtMs = 0;
       this.botMarker.visible = false;
       this.labelEl.style.display = "none";
       this.playerModel.resetWalk();
@@ -1573,6 +1916,18 @@ export class Viewer3D {
       this.playerModel.resetWalk();
     }
 
+    // Velocidade constante pra cobrir a distância no intervalo real entre
+    // poses: o boneco anda no ritmo do bot e chega exato antes da próxima.
+    // Sem isso (regime exponencial antigo) o follow nunca fechava a conta e
+    // continuava deslizando por cima do alvo depois que o bot parava.
+    const now = performance.now();
+    const interval =
+      this.lastPoseAtMs > 0
+        ? Math.max((now - this.lastPoseAtMs) / 1000, 0.05)
+        : BOT_FOLLOW_INTERVAL_FALLBACK;
+    this.lastPoseAtMs = now;
+    this.followSpeed = Math.min(target.distanceTo(this.botMarker.position) / interval, BOT_FOLLOW_MAX_SPEED);
+
     this.targetBotPos = target;
     this.botMarker.visible = true;
     this.labelEl.textContent = `${pose.x}, ${pose.y}, ${pose.z}`;
@@ -1584,12 +1939,96 @@ export class Viewer3D {
     this.playerModel.setSkin(skin);
   }
 
-  /** Move o modelo (interpolando até o alvo) e a câmera pelo mesmo passo. */
+  /** Recebe o snapshot dos mobs vivos ao redor (comando `nearby_mobs`) e
+   * mantém um rótulo por mob — nome, categoria (hostil em vermelho), distância
+   * e vida. A lista é o estado atual, não um delta: mob que saiu do raio tem o
+   * rótulo removido aqui. É o que "identifica" o mob: o viewer ainda não
+   * desenha os modelos reais de entidade (ver "Known gaps"), então o marcador
+   * é a informação honesta que temos — nome, tipo e vida vêm do jogo. */
+  setNearbyMobs(mobs: NearbyMob[]) {
+    const seen = new Set<number>();
+    for (const mob of mobs) {
+      seen.add(mob.id);
+      let marker = this.mobMarkers.get(mob.id);
+      if (!marker) {
+        const el = document.createElement("div");
+        const nameEl = document.createElement("span");
+        nameEl.className = "mob-name";
+        const metaEl = document.createElement("span");
+        metaEl.className = "mob-meta mono";
+        el.append(nameEl, metaEl);
+        this.mobLayer.appendChild(el);
+        const position = new THREE.Vector3(mob.x, mob.y, mob.z);
+        marker = { el, nameEl, metaEl, mob, target: position.clone(), position };
+        this.mobMarkers.set(mob.id, marker);
+      }
+      marker.mob = mob;
+      marker.target.set(mob.x, mob.y, mob.z);
+      // A classe carrega a categoria (hostil = perigo no CSS); reaplicar
+      // inteira mantém a cor certa mesmo se o mob mudar de categoria.
+      marker.el.className = `mob-label mob-${mob.category}`;
+      // Nome do jogo (pode ter nome customizado de name tag): textContent,
+      // nunca innerHTML.
+      marker.nameEl.textContent = mob.name;
+      marker.metaEl.textContent = `${mob.distance.toFixed(0)} m · ${Math.round(mob.health)}/${Math.round(
+        mob.max_health
+      )}`;
+    }
+    for (const [id, marker] of this.mobMarkers) {
+      if (seen.has(id)) continue;
+      marker.el.remove();
+      this.mobMarkers.delete(id);
+    }
+  }
+
+  /** Interpola a posição desenhada dos mobs até o alvo do último snapshot —
+   * mesma ideia do `updateBotMarker`, numa cadência mais lenta (mob anda
+   * menos que o bot correndo) e com encaixe direto em salto grande. */
+  private updateMobs(dt: number) {
+    if (this.mobMarkers.size === 0) return;
+    const step = 1 - Math.exp(-MOB_FOLLOW_RATE * dt);
+    for (const marker of this.mobMarkers.values()) {
+      if (marker.position.distanceTo(marker.target) > MOB_TELEPORT_DISTANCE) {
+        marker.position.copy(marker.target);
+        continue;
+      }
+      marker.position.lerp(marker.target, step);
+    }
+  }
+
+  /** Projeta cada rótulo de mob na tela, acima da hitbox dele (galinha e
+   * enderman não têm a mesma altura) — mesmo padrão do rótulo do bot, um por
+   * mob. Atrás da câmera, some. */
+  private updateMobLabels() {
+    if (this.mobMarkers.size === 0) return;
+    const width = this.container.clientWidth;
+    const height = this.container.clientHeight;
+    if (width === 0 || height === 0) return;
+    for (const marker of this.mobMarkers.values()) {
+      const vector = this.mobScratch
+        .copy(marker.position)
+        .setY(marker.position.y + marker.mob.height + MOB_LABEL_GAP)
+        .project(this.camera);
+      if (vector.z > 1) {
+        marker.el.style.display = "none";
+        continue;
+      }
+      marker.el.style.display = "flex";
+      marker.el.style.left = `${(vector.x * 0.5 + 0.5) * width}px`;
+      marker.el.style.top = `${(-vector.y * 0.5 + 0.5) * height}px`;
+    }
+  }
+
+  /** Move o modelo (em velocidade constante até o alvo) e a câmera pelo mesmo
+   * passo. Quando o resto cabe no passo do frame, `step` já é o resto exato —
+   * o boneco chega e para junto com o bot, sem sobra pra deslizar depois. */
   private updateBotMarker(dt: number) {
     if (!this.targetBotPos) return;
 
     const step = this.targetBotPos.clone().sub(this.botMarker.position);
-    step.multiplyScalar(1 - Math.exp(-BOT_FOLLOW_RATE * dt));
+    const distance = step.length();
+    const maxStep = this.followSpeed * dt;
+    if (distance > maxStep) step.multiplyScalar(maxStep / distance);
     this.botMarker.position.add(step);
     this.camera.position.add(step);
     this.controls.target.add(step);
@@ -1788,13 +2227,17 @@ export class Viewer3D {
 
     this.camera.getWorldDirection(this.moveForward);
     this.moveForward.y = 0;
-    if (this.moveForward.lengthSq() < 1e-6) {
-      // Olhando reto pra baixo/cima não existe "frente" no plano horizontal;
-      // o eixo local -Y da câmera (o "para cima" da tela) é horizontal nesse
-      // caso e serve de frente — sem isso o vetor seria zero e normalizar
-      // daria NaN.
-      this.moveForward.set(0, -1, 0).applyQuaternion(this.camera.quaternion);
+    if (this.moveForward.lengthSq() < 0.01) {
+      // Câmera quase na vertical (olhando reto pra baixo/cima): a projeção
+      // "para frente" degenera e fica instável. Usa o "para cima da tela" —
+      // o +Y local da câmera, que deitado no chão aponta pra longe de quem
+      // olha. O código antigo usava o -Y (o "para baixo" da tela), e era
+      // exatamente isso que invertia o W/S quando se olhava pra baixo. O
+      // fallback final só cobre a câmera cravada na vertical, caso em que o
+      // +Y também degenera.
+      this.moveForward.set(0, 1, 0).applyQuaternion(this.camera.quaternion);
       this.moveForward.y = 0;
+      if (this.moveForward.lengthSq() < 1e-6) this.moveForward.set(0, 0, -1);
     }
     this.moveForward.normalize();
     // right = (-fz, 0, fx) — o eixo +X da câmera projetado no chão.
@@ -1817,17 +2260,78 @@ export class Viewer3D {
   /** O domo é centrado na câmera (não no alvo): o horizonte do gradiente fica
    * sempre na linha do olhar, e o domo nunca "fica pra trás" quando a câmera
    * se afasta do bot. */
+  /** Hora real do mundo (ticks 0..23999) reportada pelo addon — ver
+   * `main.ts`/`addon_socket.rs`. `null` (sem jogo) **não** zera a hora local:
+   * a cena congela na última hora real, em vez de inventar um ciclo; sem
+   * nenhuma mensagem ainda, vale o meio-dia fixo (`DEFAULT_DAY_TIME`). */
+  setWorldTime(dayTime: number | null) {
+    if (dayTime === null) {
+      this.worldTimeLive = false;
+      return;
+    }
+    this.worldTime = ((dayTime % TICKS_PER_DAY) + TICKS_PER_DAY) % TICKS_PER_DAY;
+    this.worldTimeLive = true;
+  }
+
+  /** Move sol, lua, luz ambiente e o gradiente do céu conforme a hora do
+   * mundo. Com `worldTimeLive`, roda a cada frame (a hora local avança em
+   * `animate`); sem jogo, aplica a hora congelada uma vez e para. */
+  private updateDayNight(now: number) {
+    if (!this.worldTimeLive && this.lastSkyPaintMs !== -Infinity) return;
+
+    const time = this.worldTime ?? DEFAULT_DAY_TIME;
+    const phase = (time / TICKS_PER_DAY) * Math.PI * 2;
+    const elevation = Math.sin(phase); // -1 = meia-noite, +1 = meio-dia
+    const daylight = smoothstep(-0.12, 0.28, elevation);
+
+    // Sol nasce no leste (+X) e se põe no oeste, como no jogo.
+    this.sunLight.position.set(
+      Math.cos(phase) * SUN_DISTANCE,
+      elevation * SUN_DISTANCE,
+      SUN_DISTANCE * 0.25
+    );
+    this.sunLight.intensity = 0.5 * daylight;
+    this.sunLight.color.copy(SUN_COLOR_LOW_C).lerp(SUN_COLOR_HIGH_C, daylight);
+
+    // Lua fica do lado oposto e só rende à noite.
+    this.moonLight.position.set(
+      -Math.cos(phase) * SUN_DISTANCE,
+      -elevation * SUN_DISTANCE,
+      -SUN_DISTANCE * 0.25
+    );
+    this.moonLight.intensity = MOON_INTENSITY * (1 - daylight);
+
+    this.ambientLight.intensity = AMBIENT_NIGHT + (AMBIENT_DAY - AMBIENT_NIGHT) * daylight;
+    this.ambientLight.color.copy(AMBIENT_NIGHT_COLOR).lerp(AMBIENT_DAY_COLOR, daylight);
+
+    if (now - this.lastSkyPaintMs < SKY_REPAINT_MS) return;
+    this.lastSkyPaintMs = now;
+    // Nascer/pôr do sol deixa o horizonte quente — pico quando o sol raspa o
+    // horizonte (elevação perto de zero).
+    const twilight = Math.max(0, 1 - Math.abs(elevation) / 0.3);
+    const zenith = this.dayNightA.copy(SKY_NIGHT_ZENITH).lerp(SKY_DAY_ZENITH, daylight);
+    const mid = this.dayNightB.copy(SKY_NIGHT_MID).lerp(SKY_DAY_MID, daylight);
+    const horizon = this.dayNightC
+      .copy(SKY_NIGHT_HORIZON)
+      .lerp(SKY_DAY_HORIZON, daylight)
+      .lerp(SKY_TWILIGHT_COLOR, twilight * 0.65);
+    this.paintSky(zenith, mid, horizon);
+    this.fog.color.copy(horizon);
+    this.renderer.setClearColor(horizon, 1);
+  }
+
   private updateSky() {
     this.sky.position.copy(this.camera.position);
   }
 
   /** O fog acompanha a distância câmera→alvo: mantém o gradiente de
    * profundidade no enquadramento normal, mas não deixa o terreno distante
-   * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). */
+   * "sumir" no fundo quando o usuário afasta o zoom (visão de mundo). O piso
+   * das duas pontas é a preferência da aba Config (`fogFar`). */
   private updateFog() {
     const distance = this.camera.position.distanceTo(this.controls.target);
-    this.fog.near = Math.max(FOG_NEAR_BASE, distance * 0.85);
-    this.fog.far = Math.max(FOG_FAR_BASE, distance * 3);
+    this.fog.near = Math.max(this.fogFar * FOG_NEAR_RATIO, distance * 0.85);
+    this.fog.far = Math.max(this.fogFar, distance * 3);
   }
 
   /** Troca o frame das texturas animadas de fluido (água/lava). */
@@ -2243,9 +2747,15 @@ export class Viewer3D {
     this.queuedChunks.clear();
     this.botMarker.visible = false;
     this.labelEl.style.display = "none";
+    // Mobs são do mundo daquela conexão — sem addon online o snapshot deixa
+    // de existir no Rust e os rótulos não podem ficar congelados no mapa.
+    for (const marker of this.mobMarkers.values()) marker.el.remove();
+    this.mobMarkers.clear();
     this.clearEdits();
     this.clearSelection();
     this.targetBotPos = null;
+    this.followSpeed = 0;
+    this.lastPoseAtMs = 0;
     this.playerModel.resetWalk();
     this.setTarget(null);
     for (const [id, mesh] of this.instructionMarkers) {
@@ -2255,6 +2765,19 @@ export class Viewer3D {
     // Uma nova conexão tenta o atlas de novo (ex: a versão do jogo foi
     // instalada nesse meio tempo) — a falha anterior não é definitiva.
     this.atlasUnavailable = false;
+  }
+
+  /** Aplica as preferências da aba Config (`settings_get`): fog, orçamento de
+   * malha por frame, teto de pixel ratio e teto de FPS. Os valores já chegam
+   * presos na faixa pelo backend (`settings.rs`) — aqui é só aplicar no
+   * renderer. */
+  applySettings(settings: ViewerSettings) {
+    this.fogFar = settings.fogFar;
+    this.meshBudgetMs = settings.meshBudgetMs;
+    this.maxPixelRatio = settings.maxPixelRatio;
+    this.fpsCap = settings.fpsCap;
+    this.updateFog();
+    this.resize(); // o teto de pixel ratio mudou
   }
 
   resize() {
@@ -2277,20 +2800,32 @@ export class Viewer3D {
     // tamanho certo — foi exatamente o bug relatado ("visualização
     // erradíssima", rótulo de coordenada em lugar diferente do marcador).
     this.renderer.setSize(width, height, false);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, this.maxPixelRatio));
   }
 
   private animate = () => {
     requestAnimationFrame(this.animate);
+    const now = performance.now();
+    // Teto de FPS da aba Config: um viewer parado não precisa queimar GPU a
+    // 144 fps. `- 1` de tolerância pra um rAF que oscila décimos de ms não
+    // pular dois frames seguidos (60 caindo pra 30 por jitter do timer).
+    if (this.fpsCap > 0 && now - this.lastRenderMs < 1000 / this.fpsCap - 1) return;
+    this.lastRenderMs = now;
     // Delta-time com teto de 100ms: se a janela ficar em segundo plano (o
     // rAF pausa) e voltar, o primeiro frame não pode dar um salto gigante.
-    const now = performance.now();
     const dt = Math.min((now - this.lastFrameMs) / 1000, 0.1);
     this.lastFrameMs = now;
 
     this.applyMovement(dt);
     this.updateBotMarker(dt);
+    this.updateMobs(dt);
     this.controls.update();
+    // A hora local anda 20 ticks/s enquanto o addon reporta a hora real — é
+    // isso que deixa o ciclo contínuo em vez de pular 1x/s no polling.
+    if (this.worldTimeLive && this.worldTime !== null) {
+      this.worldTime = (this.worldTime + dt * TICKS_PER_SECOND) % TICKS_PER_DAY;
+    }
+    this.updateDayNight(now);
     this.updateSky();
     this.updateFog();
     this.updateAnimation(now);
@@ -2298,6 +2833,7 @@ export class Viewer3D {
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
     this.updateTargetPosition();
+    this.updateMobLabels();
   };
 
   /** Mantém o popup do alvo grudado no bloco clicado (mesma projeção do
