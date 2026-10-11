@@ -153,7 +153,9 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   day/night cycle (`setWorldTime`/`updateDayNight`) follows the addon's real `world_time`, moving
   sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. With the
   window unfocused (the app behind the game) the `unfocused_fps` Config setting lowers the render rate
-  **and pauses `drainMeshQueue`** — the WebKit process is the biggest CPU consumer on a weak machine
+  **and drains the mesh queue with a much smaller budget** (`UNFOCUSED_MESH_BUDGET_MS`, 2 ms per frame
+  instead of the full one — zero would let the queue and the decoded chunks grow without bound while
+  the game runs) — the WebKit process is the biggest CPU consumer on a weak machine
   (measured ~75–85% next to a running game); refocusing renders the next frame immediately and the
   mesh queue resumes with its normal budget. Mobs
   (`setNearbyMobs`) get a real model from `entity_models.ts` when the kind is supported and the
