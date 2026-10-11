@@ -335,6 +335,28 @@
                     <span class="config-value mono" data-setting-value="fps_cap">—</span>
                   </div>
                 </div>
+
+                <div class="config-row">
+                  <div class="config-info">
+                    <span class="config-label">FPS com a janela sem foco</span>
+                    <span class="config-detail">
+                      Ritmo do viewer quando o app está atrás de outra janela (ex: o jogo). Nesse
+                      estado ele também para de montar malhas de chunk, que é o gasto real de CPU —
+                      "sem economia" volta ao ritmo normal.
+                    </span>
+                  </div>
+                  <div class="config-control">
+                    <select class="config-select mono" data-setting="unfocused_fps" disabled>
+                      <option value="0">sem economia</option>
+                      <option value="3">3 fps</option>
+                      <option value="5">5 fps</option>
+                      <option value="10">10 fps</option>
+                      <option value="15">15 fps</option>
+                      <option value="30">30 fps</option>
+                    </select>
+                    <span class="config-value mono" data-setting-value="unfocused_fps">—</span>
+                  </div>
+                </div>
               </section>
 
               <section class="config-section">

@@ -342,6 +342,12 @@ export const NEARBY_CHUNK_LIMIT = 4096;
  * drenada em pedaços por frame. */
 const MESH_BUDGET_MS = 8;
 
+/** Orçamento de malha por frame com a janela sem foco (modo econômico). Não é
+ * zero: a fila e os chunks decodificados cresceriam sem limite enquanto o jogo
+ * roda atrás — 2ms por frame num viewer a 5 fps é ~1% de CPU e mantém o mundo
+ * quase em dia. Ver `animate`. */
+const UNFOCUSED_MESH_BUDGET_MS = 2;
+
 /** Raio (em chunks) da janela de terreno **mantida desenhada** ao redor das
  * âncoras (bot e alvo da câmera). O mundo explorado é cumulativo e cresce sem
  * limite: sem uma janela, todo chunk já visto ficaria na cena pra sempre e o
@@ -437,6 +443,8 @@ export interface ViewerSettings {
   maxPixelRatio: number;
   /** Teto de FPS — 0 = sem limite (vsync). */
   fpsCap: number;
+  /** Teto de FPS com a janela sem foco (0 = sem economia) — ver `animate`. */
+  unfocusedFps: number;
 }
 
 /** Uma edição da camada de pintura: `block = null` = quebrar (vira ar). O
@@ -764,6 +772,12 @@ export class Viewer3D {
   private meshBudgetMs = MESH_BUDGET_MS;
   private maxPixelRatio = 2;
   private fpsCap = 0;
+  /** Teto de FPS quando a janela do app está sem foco (0 = sem economia) —
+   * ver `animate`. No mesmo estado o viewer para de montar malhas. */
+  private unfocusedFps = 0;
+  /** Foco real da janela (eventos `focus`/`blur` do DOM): é o estado "app
+   * atrás do jogo". */
+  private windowFocused = true;
   private lastRenderMs = 0;
   /** Raio (chunks) da janela de terreno mantida desenhada — derivado de
    * `fogFar`, ver `updateKeepRadius`. */
@@ -1027,6 +1041,11 @@ export class Viewer3D {
     window.addEventListener("keydown", this.handleKeyDown);
     window.addEventListener("keyup", this.handleKeyUp);
     window.addEventListener("blur", this.clearKeys);
+    // Modo econômico (aba Config): com a janela sem foco — o caso de usar o
+    // app atrás do jogo numa máquina fraca — o viewer baixa o ritmo e para de
+    // montar malhas; ver `unfocusedFps`/`animate`.
+    window.addEventListener("focus", this.handleWindowFocus);
+    window.addEventListener("blur", this.handleWindowBlur);
 
     // Clique parado no terreno escolhe o destino; arrastar orbita (o
     // OrbitControls escuta os mesmos eventos, então nada de preventDefault
@@ -2457,13 +2476,15 @@ export class Viewer3D {
     this.chunkMeshes.set(key, meshes);
   }
 
-  /** Monta no máximo `meshBudgetMs` de malhas por frame. Um backfill (ou o
+  /** Monta no máximo `budgetMs` de malhas por frame (padrão: o orçamento da
+   * aba Config; o modo econômico passa um menor — ver `animate`). Um backfill
+   * (ou o
    * mundo persistido abrindo) enfileira centenas de chunks de uma vez;
    * montar tudo num tick só derrubava o fps, então a fila anda em pedaços —
    * o resto aparece nos frames seguintes, começando pelos mais próximos do
    * bot (a fila é alimentada na ordem que o backend manda, já por
    * distância). */
-  private drainMeshQueue() {
+  private drainMeshQueue(budgetMs: number = this.meshBudgetMs) {
     if (this.meshQueue.length === 0) return;
     const start = performance.now();
     do {
@@ -2474,7 +2495,7 @@ export class Viewer3D {
       // sólida por bloco. A guarda só pelo atlas deixava todo chunk preso na
       // fila e o mundo não aparecia quando o jar estava ausente.
       if (chunk && (this.atlasUvByName || this.atlasUnavailable)) this.buildChunkMesh(chunk);
-    } while (this.meshQueue.length > 0 && performance.now() - start < this.meshBudgetMs);
+    } while (this.meshQueue.length > 0 && performance.now() - start < budgetMs);
   }
 
   private disposeChunkMeshes(key: number) {
@@ -2968,6 +2989,18 @@ export class Viewer3D {
     this.keysDown.clear();
     this.turboKey = false;
     this.preciseKey = false;
+  };
+
+  /** Ganhou foco: volta a renderizar na hora (sem esperar o cap do modo
+   * econômico) e a fila de malhas volta a andar no `animate`. */
+  private handleWindowFocus = () => {
+    this.windowFocused = true;
+    this.lastRenderMs = -Infinity;
+  };
+
+  /** Perdeu o foco — app atrás do jogo, por exemplo. */
+  private handleWindowBlur = () => {
+    this.windowFocused = false;
   };
 
   /** Voar pela cena com WASD/setas (relativo à direção horizontal da câmera),
@@ -3616,6 +3649,7 @@ export class Viewer3D {
     this.meshBudgetMs = settings.meshBudgetMs;
     this.maxPixelRatio = settings.maxPixelRatio;
     this.fpsCap = settings.fpsCap;
+    this.unfocusedFps = settings.unfocusedFps;
     this.updateKeepRadius();
     this.updateFog();
     this.resize(); // o teto de pixel ratio mudou
@@ -3650,7 +3684,15 @@ export class Viewer3D {
     // Teto de FPS da aba Config: um viewer parado não precisa queimar GPU a
     // 144 fps. `- 1` de tolerância pra um rAF que oscila décimos de ms não
     // pular dois frames seguidos (60 caindo pra 30 por jitter do timer).
-    if (this.fpsCap > 0 && now - this.lastRenderMs < 1000 / this.fpsCap - 1) return;
+    //
+    // Modo econômico: sem foco na janela (app atrás do jogo) vale o
+    // `unfocusedFps` e a montagem de malhas para de rodar — o gasto real de
+    // CPU no WebKit é justamente meshing + desenho contínuo, e o usuário não
+    // está olhando a cena. Ao voltar o foco, `handleWindowFocus` libera o
+    // próximo frame e a fila de malhas retoma com o orçamento normal.
+    const unfocused = this.unfocusedFps > 0 && !this.windowFocused;
+    const cap = unfocused ? this.unfocusedFps : this.fpsCap;
+    if (cap > 0 && now - this.lastRenderMs < 1000 / cap - 1) return;
     this.lastRenderMs = now;
     // Delta-time com teto de 100ms: se a janela ficar em segundo plano (o
     // rAF pausa) e voltar, o primeiro frame não pode dar um salto gigante.
@@ -3672,7 +3714,10 @@ export class Viewer3D {
     this.updateFog();
     this.updateAnimation(now);
     this.sweepChunkWindow(now);
-    this.drainMeshQueue();
+    // Sem foco, montar malha é o gasto de CPU que o modo econômico evita — mas
+    // drenar com um orçamento pequeno (em vez de parar) impede a fila e os
+    // chunks decodificados de crescerem sem limite enquanto o jogo roda.
+    this.drainMeshQueue(unfocused ? UNFOCUSED_MESH_BUDGET_MS : this.meshBudgetMs);
     this.renderer.render(this.scene, this.camera);
     this.updateLabelPosition();
     this.updateTargetPosition();

@@ -30,6 +30,12 @@ pub(crate) struct Settings {
     pub(crate) max_pixel_ratio: f32,
     /// Teto de FPS do viewer — 0 = sem limite (vsync do sistema).
     pub(crate) fps_cap: u32,
+    /// Teto de FPS do viewer quando a **janela do app não está em foco** (ex:
+    /// você está jogando e o app ficou atrás). Nesse estado o viewer também
+    /// para de montar malhas de chunk, que é o gasto real de CPU — o ritmo
+    /// baixo só mantém a cena viva pra uma olhada rápida. `0` = sem economia
+    /// (comportamento de antes: renderiza igual em foco ou não).
+    pub(crate) unfocused_fps: u32,
     /// Intervalo do polling de estado (fila, vitais, mundo), em ms.
     pub(crate) state_interval_ms: u32,
     /// Intervalo do polling da pose do jogador, em ms.
@@ -53,6 +59,7 @@ impl Default for Settings {
             mesh_budget_ms: 8.0,
             max_pixel_ratio: 2.0,
             fps_cap: 0,
+            unfocused_fps: 5,
             state_interval_ms: 1000,
             pose_interval_ms: 250,
             chunks_per_refresh: 16,
@@ -84,6 +91,7 @@ impl Settings {
         self.mesh_budget_ms = clamp_f32(self.mesh_budget_ms, 2.0, 20.0, defaults.mesh_budget_ms);
         self.max_pixel_ratio = clamp_f32(self.max_pixel_ratio, 1.0, 2.0, defaults.max_pixel_ratio);
         self.fps_cap = self.fps_cap.clamp(0, 240);
+        self.unfocused_fps = self.unfocused_fps.clamp(0, 60);
         self.state_interval_ms = self.state_interval_ms.clamp(250, 10_000);
         self.pose_interval_ms = self.pose_interval_ms.clamp(100, 5_000);
         self.chunks_per_refresh = self.chunks_per_refresh.clamp(1, 64);
@@ -155,6 +163,7 @@ mod tests {
             mesh_budget_ms: 12.0,
             max_pixel_ratio: 1.5,
             fps_cap: 60,
+            unfocused_fps: 15,
             state_interval_ms: 2000,
             pose_interval_ms: 500,
             chunks_per_refresh: 32,
@@ -195,6 +204,7 @@ mod tests {
                 "mesh_budget_ms": 9999.0,
                 "max_pixel_ratio": 0.1,
                 "fps_cap": 100000,
+                "unfocused_fps": 1000,
                 "state_interval_ms": 1,
                 "pose_interval_ms": 999999,
                 "chunks_per_refresh": 0
@@ -207,6 +217,7 @@ mod tests {
         assert_eq!(loaded.mesh_budget_ms, 20.0);
         assert_eq!(loaded.max_pixel_ratio, 1.0);
         assert_eq!(loaded.fps_cap, 240);
+        assert_eq!(loaded.unfocused_fps, 60);
         assert_eq!(loaded.state_interval_ms, 250);
         assert_eq!(loaded.pose_interval_ms, 5000);
         assert_eq!(loaded.chunks_per_refresh, 1);

@@ -127,7 +127,8 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   one-shot call. Player pose is polled separately (`refreshPose`, default 250ms = the addon's
   `position` cadence) so the model walks smoothly instead of jumping once a second. Both intervals
   come from the Config tab and are applied by recreating the timers (`restartPolling`) — a preference
-  change must not require an app restart.
+  change must not require an app restart. `unfocused_fps` is the viewer's economy mode (see the
+  viewer bullet): 0 disables it.
 - **Config tab** (`view-config` in `index.html`) — the controls are markup in `index.html` but their
   values always come from the backend (`settings_get`; commands `settings_set`/`settings_reset`), and
   they stay disabled until it answers: no defaults duplicated in the frontend. `applySettings` fans a
@@ -150,7 +151,11 @@ cd src-tauri && cargo test   # world_cache (payload round-trip) + texture_atlas 
   (`world_chunks_near`, anchored on the bot/last known position and on the camera target, which also
   covers browsing the cached world). The
   day/night cycle (`setWorldTime`/`updateDayNight`) follows the addon's real `world_time`, moving
-  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. Mobs
+  sun/moon/ambient and the sky gradient, and freezes at the last known time without the game. With the
+  window unfocused (the app behind the game) the `unfocused_fps` Config setting lowers the render rate
+  **and pauses `drainMeshQueue`** — the WebKit process is the biggest CPU consumer on a weak machine
+  (measured ~75–85% next to a running game); refocusing renders the next frame immediately and the
+  mesh queue resumes with its normal budget. Mobs
   (`setNearbyMobs`) get a real model from `entity_models.ts` when the kind is supported and the
   entity textures loaded (`setEntityTextures`, one attempt like the atlas), placed/oriented by the
   addon's pose and animated with the same 20 Hz walk cycle; the projected label stays on top and is
