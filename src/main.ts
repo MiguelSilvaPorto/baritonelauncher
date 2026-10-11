@@ -936,6 +936,7 @@ interface Settings {
   mesh_budget_ms: number;
   max_pixel_ratio: number;
   fps_cap: number;
+  unfocused_fps: number;
   state_interval_ms: number;
   pose_interval_ms: number;
   chunks_per_refresh: number;
@@ -959,6 +960,7 @@ const CONFIG_VALUE_FORMAT: Record<keyof Settings, (value: number | string) => st
   mesh_budget_ms: (v) => `${decimal(Number(v))} ms`,
   max_pixel_ratio: (v) => `${decimal(Number(v))}×`,
   fps_cap: (v) => (Number(v) === 0 ? "sem limite" : `${v} fps`),
+  unfocused_fps: (v) => (Number(v) === 0 ? "sem economia" : `${v} fps`),
   state_interval_ms: (v) => `${v} ms`,
   pose_interval_ms: (v) => `${v} ms`,
   chunks_per_refresh: (v) => `${v} chunks`,
@@ -1016,6 +1018,7 @@ function applySettings(next: Settings) {
     meshBudgetMs: next.mesh_budget_ms,
     maxPixelRatio: next.max_pixel_ratio,
     fpsCap: next.fps_cap,
+    unfocusedFps: next.unfocused_fps,
   });
   if (intervalsChanged) restartPolling();
   renderConfig();
