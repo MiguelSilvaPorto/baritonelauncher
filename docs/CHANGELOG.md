@@ -266,9 +266,11 @@ Notable user-facing changes to **Baritone Orchestrator** are documented here. Th
 - **Modo econômico do viewer (FPS com a janela sem foco)**: o viewer renderizava a 60 fps mesmo com o
   app atrás do jogo, e o WebKit era o maior consumidor de CPU da máquina (medido: ~75–85% num
   i3-8130U com o Minecraft aberto). Agora, quando a janela perde o foco, o viewer baixa para o teto
-  configurável (`unfocused_fps`, padrão **5 fps**; 0 = sem economia) **e para de montar malhas de
-  chunk** — que é o gasto real de CPU. Ao voltar o foco, o próximo frame sai na hora e a fila de
-  malhas retoma com o orçamento normal. É uma preferência da aba Config, como as demais.
+  configurável (`unfocused_fps`, padrão **5 fps**; 0 = sem economia) **e reduz a montagem de malhas a
+  2 ms por frame** (em vez do orçamento cheio) — sem isso, a fila e os chunks decodificados cresceriam
+  sem limite enquanto o jogo roda, e 2 ms a 5 fps custa ~1% de CPU. Ao voltar o foco, o próximo frame
+  sai na hora e a fila de malhas retoma com o orçamento normal. É uma preferência da aba Config, como
+  as demais.
 - **Modelos reais dos mobs no viewer 3D**: o viewer identificava cada mob só com um rótulo; agora ele
   desenha o modelo de verdade da entidade, com a geometria e as animações portadas das classes de
   modelo do próprio jogo (mesmas caixas, UVs, pivôs e contas de caminhada/cabeça/asas) e as texturas
